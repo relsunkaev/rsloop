@@ -1,0 +1,12 @@
+target/
+.venv/
+dist/
+build/
+*.so
+*.dylib
+*.pyd
+*.dSYM/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+profiling/out/

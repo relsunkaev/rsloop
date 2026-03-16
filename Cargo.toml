@@ -1,0 +1,21 @@
+[package]
+name = "kioto"
+version = "0.1.0"
+edition = "2021"
+description = "Tokio-backed asyncio bridge and event-loop scaffold for Python"
+license = "MIT"
+
+[lib]
+name = "_kioto"
+crate-type = ["cdylib"]
+
+[dependencies]
+bytes = "1"
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+libc = "0.2"
+mio = { version = "1", features = ["os-ext", "os-poll"] }
+parking_lot = "0.12"
+pyo3 = { version = "0.28.2", features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.28.0", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }

@@ -1,0 +1,211 @@
+{
+  "environment": {
+    "python": "3.14.3 (main, Mar 13 2026, 10:14:06) [Clang 17.0.0 (clang-1700.6.3.2)]",
+    "platform": "macOS-26.3-arm64-arm-64bit-Mach-O",
+    "processor": "arm",
+    "pid": 59167
+  },
+  "baseline": "uvloop",
+  "results": [
+    {
+      "loop": "asyncio",
+      "benchmark": "call_soon",
+      "category": "scheduler",
+      "description": "Single-thread ready-queue churn via loop.call_soon()",
+      "iterations": 100000,
+      "repeats": 1,
+      "unit": "callbacks",
+      "samples": [
+        0.04645095800515264
+      ],
+      "median": 0.04645095800515264,
+      "mean": 0.04645095800515264,
+      "minimum": 0.04645095800515264,
+      "ns_per_unit": 464.5095800515264
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "call_soon",
+      "category": "scheduler",
+      "description": "Single-thread ready-queue churn via loop.call_soon()",
+      "iterations": 100000,
+      "repeats": 1,
+      "unit": "callbacks",
+      "samples": [
+        0.01612558402121067
+      ],
+      "median": 0.01612558402121067,
+      "mean": 0.01612558402121067,
+      "minimum": 0.01612558402121067,
+      "ns_per_unit": 161.2558402121067
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "call_soon",
+      "category": "scheduler",
+      "description": "Single-thread ready-queue churn via loop.call_soon()",
+      "iterations": 100000,
+      "repeats": 1,
+      "unit": "callbacks",
+      "samples": [
+        0.01781795799615793
+      ],
+      "median": 0.01781795799615793,
+      "mean": 0.01781795799615793,
+      "minimum": 0.01781795799615793,
+      "ns_per_unit": 178.1795799615793
+    },
+    {
+      "loop": "asyncio",
+      "benchmark": "tcp_echo_1b",
+      "category": "stream",
+      "description": "Single TCP stream echo using asyncio streams with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 1,
+      "unit": "roundtrips",
+      "samples": [
+        0.504510124999797
+      ],
+      "median": 0.504510124999797,
+      "mean": 0.504510124999797,
+      "minimum": 0.504510124999797,
+      "ns_per_unit": 50451.0124999797
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "tcp_echo_1b",
+      "category": "stream",
+      "description": "Single TCP stream echo using asyncio streams with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 1,
+      "unit": "roundtrips",
+      "samples": [
+        0.226458958000876
+      ],
+      "median": 0.226458958000876,
+      "mean": 0.226458958000876,
+      "minimum": 0.226458958000876,
+      "ns_per_unit": 22645.8958000876
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "tcp_echo_1b",
+      "category": "stream",
+      "description": "Single TCP stream echo using asyncio streams with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 1,
+      "unit": "roundtrips",
+      "samples": [
+        0.24462237500119954
+      ],
+      "median": 0.24462237500119954,
+      "mean": 0.24462237500119954,
+      "minimum": 0.24462237500119954,
+      "ns_per_unit": 24462.237500119954
+    },
+    {
+      "loop": "asyncio",
+      "benchmark": "tcp_sock_1b",
+      "category": "raw-socket",
+      "description": "TCP echo through loop.sock_* helpers with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 1,
+      "unit": "roundtrips",
+      "samples": [
+        0.632457458996214
+      ],
+      "median": 0.632457458996214,
+      "mean": 0.632457458996214,
+      "minimum": 0.632457458996214,
+      "ns_per_unit": 63245.74589962139
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "tcp_sock_1b",
+      "category": "raw-socket",
+      "description": "TCP echo through loop.sock_* helpers with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 1,
+      "unit": "roundtrips",
+      "samples": [
+        0.28743395901983604
+      ],
+      "median": 0.28743395901983604,
+      "mean": 0.28743395901983604,
+      "minimum": 0.28743395901983604,
+      "ns_per_unit": 28743.395901983607
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "tcp_sock_1b",
+      "category": "raw-socket",
+      "description": "TCP echo through loop.sock_* helpers with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 1,
+      "unit": "roundtrips",
+      "samples": [
+        0.31158275000052527
+      ],
+      "median": 0.31158275000052527,
+      "mean": 0.31158275000052527,
+      "minimum": 0.31158275000052527,
+      "ns_per_unit": 31158.275000052523
+    }
+  ],
+  "comparisons": [
+    {
+      "benchmark": "call_soon",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 2.880575236472286
+    },
+    {
+      "benchmark": "call_soon",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.1049496236986647
+    },
+    {
+      "benchmark": "call_soon",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    },
+    {
+      "benchmark": "tcp_echo_1b",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 2.2278214536244816
+    },
+    {
+      "benchmark": "tcp_echo_1b",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0802062199732159
+    },
+    {
+      "benchmark": "tcp_echo_1b",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    },
+    {
+      "benchmark": "tcp_sock_1b",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 2.2003574704705215
+    },
+    {
+      "benchmark": "tcp_sock_1b",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0840150936341613
+    },
+    {
+      "benchmark": "tcp_sock_1b",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    }
+  ]
+}
