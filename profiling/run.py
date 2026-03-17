@@ -79,6 +79,11 @@ def main() -> None:
         action="store_true",
         help="Pass --main-thread-only to samply to reduce profile size",
     )
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        help="Open the generated profile after recording",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -110,12 +115,17 @@ def main() -> None:
 
     tool = ensure_tool("samply")
     out = base.with_suffix(".json.gz")
-    cmd = [tool, "record", "--save-only", "--rate", str(args.rate), "-o", str(out)]
+    cmd = [tool, "record", "--rate", str(args.rate), "-o", str(out)]
+    if not args.open:
+        cmd.append("--save-only")
     if args.main_thread_only:
         cmd.append("--main-thread-only")
     cmd.extend(["--", str(python), *benchmark_args])
     run_subprocess(cmd, env)
     print(f"wrote {out}")
+    if args.open:
+        load_cmd = [tool, "load", str(out)]
+        run_subprocess(load_cmd, env)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,8 @@ Run from the repo root:
 ```
 
 Artifacts are written to `profiling/out/` with timestamped names.
+`samply` records to disk by default and does not open a browser.
+Pass `--open` if you want the Firefox Profiler UI to launch after capture.
 
 ## Outputs
 
@@ -62,6 +64,12 @@ samply load profiling/out/<file>.json.gz
 ```
 
 Or upload manually at https://profiler.firefox.com/
+
+Open directly from the runner:
+
+```bash
+.venv/bin/python profiling/run.py --tool samply --loop kioto --benchmark tcp_echo --open
+```
 
 ## Recommended workflow
 
