@@ -251,7 +251,8 @@ unsafe fn run_fastcall(
         let callback_ptr = *args.add(callback_index);
         let callback = Bound::from_borrowed_ptr(py, callback_ptr);
 
-        if api_ref.debug.load(Ordering::Acquire) {
+        let debug = api_ref.debug.load(Ordering::Acquire);
+        if debug {
             if matches!(mode, FastcallMode::CallSoon | FastcallMode::CallAt) {
                 api_ref.loop_obj.bind(py).call_method0("_check_thread")?;
             }
@@ -270,7 +271,7 @@ unsafe fn run_fastcall(
             api_ref.loop_obj.clone_ref(py),
             context,
             when,
-            api_ref.debug.load(Ordering::Acquire),
+            debug,
         )?;
 
         let scheduler = api_ref.scheduler.bind(py).borrow();

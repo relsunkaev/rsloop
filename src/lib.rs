@@ -11,8 +11,6 @@ mod handles;
 #[cfg(unix)]
 mod loop_api;
 #[cfg(unix)]
-mod stream_transport;
-#[cfg(unix)]
 mod poller;
 #[cfg(unix)]
 mod scheduler;
@@ -21,17 +19,9 @@ mod socket_registry;
 #[cfg(unix)]
 mod socket_state;
 #[cfg(unix)]
-mod server_driver;
-#[cfg(unix)]
-mod socket_driver;
-#[cfg(unix)]
-mod stream_reader;
-#[cfg(unix)]
 mod stream_registry;
 #[cfg(unix)]
-mod tcp_transport;
-#[cfg(unix)]
-mod transport_core;
+mod stream_transport;
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -42,11 +32,9 @@ use completion::CompletionPort;
 #[cfg(unix)]
 use fd_callbacks::FdCallbackRegistry;
 #[cfg(unix)]
-use handles::{make_handle, FutureHandle, Handle, ZeroArgHandle};
+use handles::{make_handle, FutureHandle, Handle, OneArgHandle, ZeroArgHandle};
 #[cfg(unix)]
 use loop_api::LoopApi;
-#[cfg(unix)]
-use stream_transport::StreamTransport;
 #[cfg(unix)]
 use poller::TokioPoller;
 #[cfg(unix)]
@@ -56,17 +44,9 @@ use socket_registry::SocketStateRegistry;
 #[cfg(unix)]
 use socket_state::SocketState;
 #[cfg(unix)]
-use server_driver::ServerDriver;
-#[cfg(unix)]
-use socket_driver::SocketDriver;
-#[cfg(unix)]
-use stream_reader::StreamReaderBridge;
-#[cfg(unix)]
 use stream_registry::StreamTransportRegistry;
 #[cfg(unix)]
-use tcp_transport::TokioTcpTransportCore;
-#[cfg(unix)]
-use transport_core::TransportWriteCore;
+use stream_transport::StreamTransport;
 
 #[pymodule]
 fn _kioto(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -88,6 +68,8 @@ fn _kioto(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(unix)]
     m.add_class::<ZeroArgHandle>()?;
     #[cfg(unix)]
+    m.add_class::<OneArgHandle>()?;
+    #[cfg(unix)]
     m.add_class::<LoopApi>()?;
     #[cfg(unix)]
     m.add_class::<StreamTransport>()?;
@@ -100,16 +82,6 @@ fn _kioto(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(unix)]
     m.add_class::<SocketState>()?;
     #[cfg(unix)]
-    m.add_class::<ServerDriver>()?;
-    #[cfg(unix)]
-    m.add_class::<SocketDriver>()?;
-    #[cfg(unix)]
-    m.add_class::<StreamReaderBridge>()?;
-    #[cfg(unix)]
     m.add_class::<StreamTransportRegistry>()?;
-    #[cfg(unix)]
-    m.add_class::<TokioTcpTransportCore>()?;
-    #[cfg(unix)]
-    m.add_class::<TransportWriteCore>()?;
     Ok(())
 }

@@ -3,56 +3,18 @@
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use bytes::Bytes;
 use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
-
-use crate::stream_transport::StreamTransport;
-use crate::stream_reader::StreamReaderBridge;
 
 pub(crate) enum Completion {
     Future {
         future: Py<PyAny>,
         payload: Py<PyAny>,
         is_err: bool,
-    },
-    Callback {
-        callback: Py<PyAny>,
-        payload: Py<PyAny>,
-    },
-    StreamRead {
-        bridge: Arc<Py<StreamReaderBridge>>,
-        data: Bytes,
-    },
-    StreamEof {
-        bridge: Arc<Py<StreamReaderBridge>>,
-    },
-    ExactRead {
-        bridge: Arc<Py<StreamReaderBridge>>,
-        future: Py<PyAny>,
-        payload: Py<PyAny>,
-        is_err: bool,
-    },
-    NativeStreamRead {
-        transport: Arc<Py<StreamTransport>>,
-        data: Bytes,
-    },
-    NativeStreamEof {
-        transport: Arc<Py<StreamTransport>>,
-    },
-    NativeExactRead {
-        transport: Arc<Py<StreamTransport>>,
-        future: Py<PyAny>,
-        payload: Py<PyAny>,
-        is_err: bool,
-    },
-    NativeReadError {
-        transport: Arc<Py<StreamTransport>>,
-        payload: Py<PyAny>,
     },
 }
 
@@ -180,97 +142,6 @@ impl CompletionPort {
                     payload,
                     is_err,
                 } => (0_u8, future, payload, is_err),
-                Completion::Callback { callback, payload } => {
-                    (1_u8, callback, payload, false)
-                }
-                Completion::StreamRead { bridge, data } => Python::attach(|py| {
-                    let target = bridge
-                        .as_ref()
-                        .bind(py)
-                        .getattr("feed_data")
-                        .expect("stream bridge feed_data");
-                    let payload = pyo3::types::PyBytes::new(py, &data).into_any().unbind();
-                    (1_u8, target.unbind(), payload, false)
-                }),
-                Completion::StreamEof { bridge } => Python::attach(|py| {
-                    let target = bridge
-                        .as_ref()
-                        .bind(py)
-                        .getattr("feed_eof")
-                        .expect("stream bridge feed_eof");
-                    (1_u8, target.unbind(), py.None(), false)
-                }),
-                Completion::ExactRead {
-                    bridge,
-                    future,
-                    payload,
-                    is_err,
-                } => Python::attach(|py| {
-                    let target = bridge
-                        .as_ref()
-                        .bind(py)
-                        .getattr("complete_exact_read")
-                        .expect("stream bridge complete_exact_read");
-                    let payload = pyo3::types::PyTuple::new(
-                        py,
-                        [
-                            future.bind(py).clone().into_any(),
-                            payload.bind(py).clone(),
-                        ],
-                    )
-                    .expect("exact read tuple")
-                    .into_any()
-                    .unbind();
-                    (2_u8, target.unbind(), payload, is_err)
-                }),
-                Completion::NativeStreamRead { transport, data } => Python::attach(|py| {
-                    let target = transport
-                        .as_ref()
-                        .bind(py)
-                        .getattr("_drain_feed_data")
-                        .expect("stream transport _drain_feed_data");
-                    let payload = pyo3::types::PyBytes::new(py, &data).into_any().unbind();
-                    (1_u8, target.unbind(), payload, false)
-                }),
-                Completion::NativeStreamEof { transport } => Python::attach(|py| {
-                    let target = transport
-                        .as_ref()
-                        .bind(py)
-                        .getattr("_drain_feed_eof")
-                        .expect("stream transport _drain_feed_eof");
-                    (1_u8, target.unbind(), py.None(), false)
-                }),
-                Completion::NativeExactRead {
-                    transport,
-                    future,
-                    payload,
-                    is_err,
-                } => Python::attach(|py| {
-                    let target = transport
-                        .as_ref()
-                        .bind(py)
-                        .getattr("_drain_complete_exact_read")
-                        .expect("stream transport _drain_complete_exact_read");
-                    let payload = pyo3::types::PyTuple::new(
-                        py,
-                        [
-                            future.bind(py).clone().into_any(),
-                            payload.bind(py).clone(),
-                        ],
-                    )
-                    .expect("exact read tuple")
-                    .into_any()
-                    .unbind();
-                    (2_u8, target.unbind(), payload, is_err)
-                }),
-                Completion::NativeReadError { transport, payload } => Python::attach(|py| {
-                    let target = transport
-                        .as_ref()
-                        .bind(py)
-                        .getattr("on_read_error")
-                        .expect("stream transport on_read_error");
-                    (1_u8, target.unbind(), payload, false)
-                }),
             })
             .collect()
     }
@@ -291,22 +162,6 @@ impl CompletionPort {
 
     pub(crate) fn has_pending_inner(&self) -> bool {
         !self.inner.rx.is_empty()
-    }
-
-    pub(crate) fn wait_and_drain_inner(
-        &self,
-        py: Python<'_>,
-        timeout: Option<f64>,
-    ) -> PyResult<Vec<Completion>> {
-        let mut drained = Vec::new();
-        self.wait_and_drain_into_inner(py, timeout, &mut drained)?;
-        Ok(drained)
-    }
-
-    pub(crate) fn drain_inner(&self) -> Vec<Completion> {
-        let mut drained = Vec::new();
-        self.drain_into_inner(&mut drained);
-        drained
     }
 
     pub(crate) fn wait_and_drain_into_inner(
@@ -330,15 +185,6 @@ impl CompletionPort {
     }
 }
 
-fn wait_and_drain_channel(
-    inner: &CompletionPortInner,
-    timeout: Option<f64>,
-) -> io::Result<Vec<Completion>> {
-    let mut drained = Vec::new();
-    wait_and_drain_channel_into(inner, timeout, &mut drained)?;
-    Ok(drained)
-}
-
 fn wait_and_drain_channel_into(
     inner: &CompletionPortInner,
     timeout: Option<f64>,
@@ -347,11 +193,10 @@ fn wait_and_drain_channel_into(
     let first = match timeout {
         None => {
             inner.direct_waiting.store(true, Ordering::Release);
-            let result = inner
-                .rx
-                .recv()
-                .map(Some)
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "completion port closed"));
+            let result =
+                inner.rx.recv().map(Some).map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "completion port closed")
+                });
             inner.direct_waiting.store(false, Ordering::Release);
             result?
         }
@@ -401,10 +246,7 @@ fn drain_ready_completions(inner: &CompletionPortInner) -> Vec<Completion> {
     drained
 }
 
-fn drain_ready_completions_into(
-    inner: &CompletionPortInner,
-    drained: &mut Vec<Completion>,
-) {
+fn drain_ready_completions_into(inner: &CompletionPortInner, drained: &mut Vec<Completion>) {
     loop {
         inner.drain_fd();
         while let Ok(completion) = inner.rx.try_recv() {
@@ -440,82 +282,6 @@ pub(crate) fn enqueue_completion(
         payload,
         is_err,
     });
-}
-
-pub(crate) fn enqueue_callback(
-    port: &CompletionPortInner,
-    callback: Py<PyAny>,
-    payload: Py<PyAny>,
-) {
-    port.enqueue(Completion::Callback { callback, payload });
-}
-
-pub(crate) fn enqueue_stream_read(
-    port: &CompletionPortInner,
-    bridge: Arc<Py<StreamReaderBridge>>,
-    data: Bytes,
-) {
-    port.enqueue(Completion::StreamRead { bridge, data });
-}
-
-pub(crate) fn enqueue_stream_eof(
-    port: &CompletionPortInner,
-    bridge: Arc<Py<StreamReaderBridge>>,
-) {
-    port.enqueue(Completion::StreamEof { bridge });
-}
-
-pub(crate) fn enqueue_exact_read(
-    port: &CompletionPortInner,
-    bridge: Arc<Py<StreamReaderBridge>>,
-    future: Py<PyAny>,
-    payload: Py<PyAny>,
-    is_err: bool,
-) {
-    port.enqueue(Completion::ExactRead {
-        bridge,
-        future,
-        payload,
-        is_err,
-    });
-}
-
-pub(crate) fn enqueue_native_stream_read(
-    port: &CompletionPortInner,
-    transport: Arc<Py<StreamTransport>>,
-    data: Bytes,
-) {
-    port.enqueue(Completion::NativeStreamRead { transport, data });
-}
-
-pub(crate) fn enqueue_native_stream_eof(
-    port: &CompletionPortInner,
-    transport: Arc<Py<StreamTransport>>,
-) {
-    port.enqueue(Completion::NativeStreamEof { transport });
-}
-
-pub(crate) fn enqueue_native_exact_read(
-    port: &CompletionPortInner,
-    transport: Arc<Py<StreamTransport>>,
-    future: Py<PyAny>,
-    payload: Py<PyAny>,
-    is_err: bool,
-) {
-    port.enqueue(Completion::NativeExactRead {
-        transport,
-        future,
-        payload,
-        is_err,
-    });
-}
-
-pub(crate) fn enqueue_native_read_error(
-    port: &CompletionPortInner,
-    transport: Arc<Py<StreamTransport>>,
-    payload: Py<PyAny>,
-) {
-    port.enqueue(Completion::NativeReadError { transport, payload });
 }
 
 fn create_pipe() -> io::Result<(RawFd, RawFd)> {

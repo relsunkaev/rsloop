@@ -11,6 +11,9 @@ use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAny, PyByteArray, PyBytes, PyDict};
 
+use crate::poller::TokioPoller;
+use crate::stream_registry::StreamTransportRegistry;
+
 const DEFAULT_STREAM_READ_SIZE: usize = 64 * 1024;
 const NATIVE_READEXACTLY_LIMIT: usize = 16 * 1024;
 const WRITE_HIGH_WATER: usize = 64 * 1024;
@@ -22,7 +25,7 @@ struct PendingRead {
 }
 
 struct PendingWrite {
-    data: Vec<u8>,
+    data: Py<PyBytes>,
     sent: usize,
 }
 
@@ -32,15 +35,18 @@ pub struct StreamTransport {
     fd: RawFd,
     protocol: Py<PyAny>,
     loop_obj: Py<PyAny>,
+    poller: Py<TokioPoller>,
+    registry: Py<StreamTransportRegistry>,
+    transports: Py<PyDict>,
     extra: Py<PyAny>,
     reader: Option<Py<PyAny>>,
     reader_readexactly: Option<Py<PyAny>>,
+    close_waiter: Option<Py<PyAny>>,
     drain_fallback: Option<Py<PyAny>>,
     ready_drain: Option<Py<PyAny>>,
     buffer: Option<Py<PyByteArray>>,
     limit: usize,
     pending_read: Option<PendingRead>,
-    read_size: usize,
     read_buffer: Vec<u8>,
     write_queue: VecDeque<PendingWrite>,
     pending_write_bytes: usize,
@@ -58,12 +64,15 @@ pub struct StreamTransport {
 #[pymethods]
 impl StreamTransport {
     #[new]
-    #[pyo3(signature = (sock, protocol, loop_obj, extra=None, reader=None, read_size=DEFAULT_STREAM_READ_SIZE))]
+    #[pyo3(signature = (sock, protocol, loop_obj, poller, registry, transports, extra=None, reader=None, read_size=DEFAULT_STREAM_READ_SIZE))]
     fn new(
         py: Python<'_>,
         sock: Py<PyAny>,
         protocol: Py<PyAny>,
         loop_obj: Py<PyAny>,
+        poller: Py<TokioPoller>,
+        registry: Py<StreamTransportRegistry>,
+        transports: Py<PyDict>,
         extra: Option<Py<PyAny>>,
         reader: Option<Py<PyAny>>,
         read_size: usize,
@@ -73,32 +82,37 @@ impl StreamTransport {
             None => PyDict::new(py).into_any().unbind(),
         };
         let fd = sock.bind(py).call_method0("fileno")?.extract::<i32>()? as RawFd;
-        let (buffer, reader_readexactly, limit) = if let Some(reader_ref) = reader.as_ref() {
-            let reader_ref = reader_ref.bind(py);
-            let buffer = reader_ref
-                .getattr("_buffer")?
-                .cast_into::<PyByteArray>()?
-                .unbind();
-            let reader_readexactly = reader_ref.getattr("readexactly")?.unbind();
-            let limit = reader_ref.getattr("_limit")?.extract()?;
-            (Some(buffer), Some(reader_readexactly), limit)
-        } else {
-            (None, None, 64 * 1024)
-        };
+        let (buffer, reader_readexactly, close_waiter, limit) =
+            if let Some(reader_ref) = reader.as_ref() {
+                let reader_ref = reader_ref.bind(py);
+                let buffer = reader_ref
+                    .getattr("_buffer")?
+                    .cast_into::<PyByteArray>()?
+                    .unbind();
+                let reader_readexactly = reader_ref.getattr("readexactly")?.unbind();
+                let close_waiter = protocol.bind(py).getattr("_closed").ok().map(Bound::unbind);
+                let limit = reader_ref.getattr("_limit")?.extract()?;
+                (Some(buffer), Some(reader_readexactly), close_waiter, limit)
+            } else {
+                (None, None, None, 64 * 1024)
+            };
         Ok(Self {
             sock,
             fd,
             protocol,
             loop_obj,
+            poller,
+            registry,
+            transports,
             extra,
             reader,
             reader_readexactly,
+            close_waiter,
             drain_fallback: None,
             ready_drain: None,
             buffer,
             limit,
             pending_read: None,
-            read_size: read_size.max(1),
             read_buffer: vec![0_u8; read_size.max(1)],
             write_queue: VecDeque::new(),
             pending_write_bytes: 0,
@@ -117,13 +131,15 @@ impl StreamTransport {
     fn activate(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
         {
             let transport = slf.borrow(py);
-            let transports = transport.loop_obj.bind(py).getattr("_transports")?;
-            transports.set_item(transport.fd, slf.bind(py))?;
             transport
-                .loop_obj
+                .transports
                 .bind(py)
-                .getattr("_stream_registry")?
-                .call_method1("register", (transport.fd, slf.bind(py)))?;
+                .set_item(transport.fd, slf.bind(py))?;
+            transport
+                .registry
+                .bind(py)
+                .borrow_mut()
+                .register_inner(transport.fd, slf.clone_ref(py));
         }
         let mut transport = slf.borrow_mut(py);
         transport.sync_interest(py)
@@ -133,18 +149,68 @@ impl StreamTransport {
         create_bound_readexactly(slf.py(), slf.as_any().as_unbound())
     }
 
+    fn bind_write(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        create_bound_write(slf.py(), slf.as_any().as_unbound())
+    }
+
+    fn bind_close(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        create_bound_close(slf.py(), slf.as_any().as_unbound())
+    }
+
     fn bind_drain(slf: Py<Self>, py: Python<'_>, fallback: Py<PyAny>) -> PyResult<Py<PyAny>> {
         slf.borrow_mut(py).drain_fallback = Some(fallback);
         create_bound_drain(py, slf.bind(py).as_any().as_unbound())
     }
 
+    fn bind_wait_closed(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        create_bound_wait_closed(slf.py(), slf.as_any().as_unbound())
+    }
+
+    fn drain_fast(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        if let Some(reader_obj) = self.reader.as_ref().map(|reader| reader.clone_ref(py)) {
+            let reader = reader_obj.bind(py);
+            if let Some(exc) = current_exception(&reader)? {
+                return Err(PyErr::from_value(exc.into_bound(py).into_any()));
+            }
+        }
+
+        if !self.closing && !self.protocol_paused && self.pending_write_bytes == 0 {
+            if let Some(ready) = self.ready_drain.as_ref() {
+                return Ok(Some(ready.clone_ref(py)));
+            }
+            let future = self
+                .loop_obj
+                .bind(py)
+                .call_method0("create_future")?
+                .unbind();
+            future.bind(py).call_method1("set_result", (py.None(),))?;
+            self.ready_drain = Some(future.clone_ref(py));
+            return Ok(Some(future));
+        }
+
+        Ok(None)
+    }
+
+    fn wait_closed_fast(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if let Some(waiter) = self.close_waiter.as_ref() {
+            return Ok(waiter.clone_ref(py));
+        }
+        let future = self
+            .loop_obj
+            .bind(py)
+            .call_method0("create_future")?
+            .unbind();
+        future.bind(py).call_method1("set_result", (py.None(),))?;
+        Ok(future)
+    }
+
     fn write(&mut self, py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
         self.ensure_can_write()?;
         if let Ok(bytes) = data.cast::<PyBytes>() {
-            self.write_bytes_inner(py, bytes.as_bytes())?;
+            self.write_bytes_object_inner(py, &bytes)?;
         } else {
-            let bytes = data.extract::<Vec<u8>>()?;
-            self.write_bytes_inner(py, &bytes)?;
+            let bytes = coerce_bytes(py, &data)?;
+            self.write_bytes_object_inner(py, &bytes.bind(py))?;
         }
         Ok(())
     }
@@ -251,6 +317,16 @@ impl StreamTransport {
         transport.on_writable(py)
     }
 
+    pub(crate) fn on_events(&mut self, py: Python<'_>, mask: u8) -> PyResult<()> {
+        if mask & 0x01 != 0 {
+            self.on_readable(py)?;
+        }
+        if !self.closed && mask & 0x02 != 0 {
+            self.on_writable(py)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn on_read_error(&mut self, py: Python<'_>, exc: Py<PyAny>) -> PyResult<()> {
         self.finish_close(py, Some(exc))
     }
@@ -262,12 +338,27 @@ impl StreamTransport {
             return Err(PyRuntimeError::new_err("stream transport is closing"));
         }
         if self.eof_requested {
-            return Err(PyRuntimeError::new_err("Cannot call write() after write_eof()"));
+            return Err(PyRuntimeError::new_err(
+                "Cannot call write() after write_eof()",
+            ));
         }
         Ok(())
     }
 
-    fn write_bytes_inner(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
+    fn write_bytes_object_inner(
+        &mut self,
+        py: Python<'_>,
+        data: &Bound<'_, PyBytes>,
+    ) -> PyResult<()> {
+        self.write_bytes_inner(py, data.as_bytes(), Some(data))
+    }
+
+    fn write_bytes_inner(
+        &mut self,
+        py: Python<'_>,
+        data: &[u8],
+        owned: Option<&Bound<'_, PyBytes>>,
+    ) -> PyResult<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -276,20 +367,24 @@ impl StreamTransport {
             match try_send_bytes(self.fd, data) {
                 Ok(sent) if sent == data.len() => return Ok(()),
                 Ok(sent) => {
-                    self.queue_write(&data[sent..]);
+                    self.queue_write(py, data, sent, owned)?;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.queue_write(data);
+                    self.queue_write(py, data, 0, owned)?;
                 }
                 Err(err) => {
                     return self.finish_close(
                         py,
-                        Some(PyRuntimeError::new_err(err.to_string()).into_value(py).into_any()),
+                        Some(
+                            PyRuntimeError::new_err(err.to_string())
+                                .into_value(py)
+                                .into_any(),
+                        ),
                     );
                 }
             }
         } else {
-            self.queue_write(data);
+            self.queue_write(py, data, 0, owned)?;
         }
 
         self.sync_interest(py)?;
@@ -297,12 +392,22 @@ impl StreamTransport {
         Ok(())
     }
 
-    fn queue_write(&mut self, data: &[u8]) {
-        self.pending_write_bytes += data.len();
-        self.write_queue.push_back(PendingWrite {
-            data: data.to_vec(),
-            sent: 0,
-        });
+    fn queue_write(
+        &mut self,
+        py: Python<'_>,
+        data: &[u8],
+        sent: usize,
+        owned: Option<&Bound<'_, PyBytes>>,
+    ) -> PyResult<()> {
+        let data = match owned {
+            Some(bytes) => bytes.clone().unbind(),
+            None => PyBytes::new(py, data).unbind(),
+        };
+        let len = data.bind(py).as_bytes().len();
+        let sent = sent.min(len);
+        self.pending_write_bytes += len.saturating_sub(sent);
+        self.write_queue.push_back(PendingWrite { data, sent });
+        Ok(())
     }
 
     pub(crate) fn on_readable(&mut self, py: Python<'_>) -> PyResult<()> {
@@ -310,7 +415,10 @@ impl StreamTransport {
             return Ok(());
         }
         if env::var_os("KIOTO_TRACE_STREAM").is_some() {
-            eprintln!("stream-transport readable fd={} closing={} paused={}", self.fd, self.closing, self.read_paused);
+            eprintln!(
+                "stream-transport readable fd={} closing={} paused={}",
+                self.fd, self.closing, self.read_paused
+            );
         }
         loop {
             match recv_into(self.fd, &mut self.read_buffer) {
@@ -338,7 +446,11 @@ impl StreamTransport {
                 Err(err) => {
                     return self.finish_close(
                         py,
-                        Some(PyRuntimeError::new_err(err.to_string()).into_value(py).into_any()),
+                        Some(
+                            PyRuntimeError::new_err(err.to_string())
+                                .into_value(py)
+                                .into_any(),
+                        ),
                     );
                 }
             }
@@ -347,10 +459,15 @@ impl StreamTransport {
 
     pub(crate) fn on_writable(&mut self, py: Python<'_>) -> PyResult<()> {
         if env::var_os("KIOTO_TRACE_STREAM").is_some() {
-            eprintln!("stream-transport writable fd={} queued={}", self.fd, self.pending_write_bytes);
+            eprintln!(
+                "stream-transport writable fd={} queued={}",
+                self.fd, self.pending_write_bytes
+            );
         }
         while let Some(write) = self.write_queue.front_mut() {
-            match try_send_bytes(self.fd, &write.data[write.sent..]) {
+            let write_data = write.data.bind(py);
+            let write_bytes = write_data.as_bytes();
+            match try_send_bytes(self.fd, &write_bytes[write.sent..]) {
                 Ok(0) => break,
                 Ok(sent) => {
                     if env::var_os("KIOTO_TRACE_STREAM").is_some() {
@@ -358,7 +475,7 @@ impl StreamTransport {
                     }
                     write.sent += sent;
                     self.pending_write_bytes = self.pending_write_bytes.saturating_sub(sent);
-                    if write.sent == write.data.len() {
+                    if write.sent == write_bytes.len() {
                         self.write_queue.pop_front();
                     }
                 }
@@ -366,7 +483,11 @@ impl StreamTransport {
                 Err(err) => {
                     return self.finish_close(
                         py,
-                        Some(PyRuntimeError::new_err(err.to_string()).into_value(py).into_any()),
+                        Some(
+                            PyRuntimeError::new_err(err.to_string())
+                                .into_value(py)
+                                .into_any(),
+                        ),
                     );
                 }
             }
@@ -404,20 +525,23 @@ impl StreamTransport {
         }
         self.closed = true;
         self.closing = true;
-        self.loop_obj
+        self.registry
             .bind(py)
-            .getattr("_stream_registry")?
-            .call_method1("unregister", (self.fd,))?;
+            .borrow_mut()
+            .unregister_inner(self.fd);
         self.disable_interest(py)?;
         self.pending_write_bytes = 0;
         self.write_queue.clear();
-        self.loop_obj
-            .bind(py)
-            .getattr("_transports")?
-            .call_method1("pop", (self.fd, py.None()))?;
+        self.transports.bind(py).del_item(self.fd).ok();
         match exc.as_ref() {
-            Some(exc) => self.protocol.bind(py).call_method1("connection_lost", (exc.bind(py),))?,
-            None => self.protocol.bind(py).call_method1("connection_lost", (py.None(),))?,
+            Some(exc) => self
+                .protocol
+                .bind(py)
+                .call_method1("connection_lost", (exc.bind(py),))?,
+            None => self
+                .protocol
+                .bind(py)
+                .call_method1("connection_lost", (py.None(),))?,
         };
         self.connection_lost_sent = true;
         self.sock.bind(py).call_method0("close")?;
@@ -440,20 +564,20 @@ impl StreamTransport {
             !self.closed && (self.pending_write_bytes != 0 || (self.closing && !self.closed));
         self.reader_registered = readable;
         self.writer_registered = writable;
-        self.loop_obj
+        self.poller
             .bind(py)
-            .getattr("_poller")?
-            .call_method1("set_interest", (self.fd, readable, writable))?;
+            .borrow()
+            .set_interest_inner(self.fd, readable, writable)?;
         Ok(())
     }
 
     fn disable_interest(&mut self, py: Python<'_>) -> PyResult<()> {
         self.reader_registered = false;
         self.writer_registered = false;
-        self.loop_obj
+        self.poller
             .bind(py)
-            .getattr("_poller")?
-            .call_method1("set_interest", (self.fd, false, false))?;
+            .borrow()
+            .set_interest_inner(self.fd, false, false)?;
         Ok(())
     }
 
@@ -475,49 +599,6 @@ impl StreamTransport {
         Ok(())
     }
 
-    pub(crate) fn feed_data_inner(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
-        let Some(reader_obj) = self.reader.as_ref().map(|reader| reader.clone_ref(py)) else {
-            return Ok(());
-        };
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        let reader = reader_obj.bind(py);
-        let buffer_obj = self
-            .buffer
-            .as_ref()
-            .expect("stream transport buffer")
-            .clone_ref(py);
-        let buffer = buffer_obj.bind(py);
-        append_to_bytearray(buffer.as_ptr(), data)?;
-        if !self.try_finish_pending_read(py, &reader)? {
-            wake_waiter(py, &reader)?;
-        }
-
-        let reader_transport = reader.getattr("_transport")?;
-        if reader_transport.is_none() || reader.getattr("_paused")?.is_truthy()? {
-            return Ok(());
-        }
-
-        let buffered = unsafe { ffi::PyByteArray_Size(buffer.as_ptr()) };
-        if buffered <= (2 * self.limit) as isize {
-            return Ok(());
-        }
-
-        match self.pause_reading(py) {
-            Ok(_) => {
-                reader.setattr("_paused", true)?;
-                Ok(())
-            }
-            Err(err) if err.is_instance_of::<PyNotImplementedError>(py) => {
-                reader.setattr("_transport", py.None())?;
-                Ok(())
-            }
-            Err(err) => Err(err),
-        }
-    }
-
     fn feed_read_buffer_inner(&mut self, py: Python<'_>, size: usize) -> PyResult<()> {
         let Some(reader_obj) = self.reader.as_ref().map(|reader| reader.clone_ref(py)) else {
             return Ok(());
@@ -527,6 +608,9 @@ impl StreamTransport {
         }
 
         let reader = reader_obj.bind(py);
+        if self.try_finish_pending_read_from_chunk(py, &reader, size)? {
+            return Ok(());
+        }
         let buffer_obj = self
             .buffer
             .as_ref()
@@ -561,6 +645,53 @@ impl StreamTransport {
         }
     }
 
+    fn try_finish_pending_read_from_chunk(
+        &mut self,
+        py: Python<'_>,
+        reader: &Bound<'_, PyAny>,
+        size: usize,
+    ) -> PyResult<bool> {
+        let Some(pending) = self.pending_read.as_ref() else {
+            return Ok(false);
+        };
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("stream transport buffer")
+            .bind(py);
+        let buffered = bytearray_len(buffer.as_ptr())?;
+        if buffered + size < pending.size {
+            return Ok(false);
+        }
+
+        let pending = self.pending_read.take().expect("pending read present");
+        let needed_from_chunk = pending.size.saturating_sub(buffered);
+        let payload = if buffered == 0 && needed_from_chunk == size {
+            PyBytes::new(py, &self.read_buffer[..size]).into_any().unbind()
+        } else {
+            join_buffered_prefix_and_chunk(
+                py,
+                buffer.as_ptr(),
+                buffered,
+                &self.read_buffer[..needed_from_chunk],
+                pending.size,
+            )?
+        };
+        reader.setattr("_waiter", py.None())?;
+        if !future_done(py, &pending.future)? {
+            pending
+                .future
+                .bind(py)
+                .call_method1("set_result", (payload,))?;
+        }
+
+        if needed_from_chunk != size || buffered != 0 {
+            replace_bytearray(buffer.as_ptr(), &self.read_buffer[needed_from_chunk..size])?;
+        }
+        maybe_resume_transport(reader)?;
+        Ok(true)
+    }
+
     pub(crate) fn feed_eof_inner(&mut self, py: Python<'_>) -> PyResult<()> {
         let Some(reader_obj) = self.reader.as_ref().map(|reader| reader.clone_ref(py)) else {
             return Ok(());
@@ -569,41 +700,6 @@ impl StreamTransport {
         reader.setattr("_eof", true)?;
         self.fail_pending_read_eof(py, &reader)?;
         wake_waiter(py, &reader)
-    }
-
-    pub(crate) fn complete_exact_read_inner(
-        &mut self,
-        py: Python<'_>,
-        future: Py<PyAny>,
-        payload: Py<PyAny>,
-        is_err: bool,
-    ) -> PyResult<()> {
-        let Some(reader_obj) = self.reader.as_ref().map(|reader| reader.clone_ref(py)) else {
-            return Ok(());
-        };
-        let reader = reader_obj.bind(py);
-        clear_waiter(&reader, py)?;
-        if self
-            .pending_read
-            .as_ref()
-            .map(|pending| pending.future.is(&future))
-            .unwrap_or(false)
-        {
-            self.pending_read = None;
-        }
-
-        if future_done(py, &future)? {
-            return Ok(());
-        }
-        if is_err {
-            future
-                .bind(py)
-                .call_method1("set_exception", (payload.bind(py),))?;
-            return Ok(());
-        }
-        future.bind(py).call_method1("set_result", (payload.bind(py),))?;
-        maybe_resume_transport(&reader)?;
-        Ok(())
     }
 
     fn readexactly_inner(&mut self, py: Python<'_>, size: usize) -> PyResult<Py<PyAny>> {
@@ -652,10 +748,16 @@ impl StreamTransport {
 
         if reader.getattr("_paused")?.is_truthy()? {
             reader.setattr("_paused", false)?;
-            reader.getattr("_transport")?.call_method0("resume_reading")?;
+            reader
+                .getattr("_transport")?
+                .call_method0("resume_reading")?;
         }
 
-        let future = self.loop_obj.bind(py).call_method0("create_future")?.unbind();
+        let future = self
+            .loop_obj
+            .bind(py)
+            .call_method0("create_future")?
+            .unbind();
         reader.setattr("_waiter", future.bind(py))?;
         self.pending_read = Some(PendingRead {
             size,
@@ -665,6 +767,10 @@ impl StreamTransport {
     }
 
     fn drain_inner(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if let Some(ready) = self.drain_fast(py)? {
+            return Ok(ready);
+        }
+
         if let Some(reader_obj) = self.reader.as_ref().map(|reader| reader.clone_ref(py)) {
             let reader = reader_obj.bind(py);
             if let Some(exc) = current_exception(&reader)? {
@@ -672,18 +778,12 @@ impl StreamTransport {
             }
         }
 
-        if !self.closing && !self.protocol_paused && self.pending_write_bytes == 0 {
-            if let Some(ready) = self.ready_drain.as_ref() {
-                return Ok(ready.clone_ref(py));
-            }
-            let future = self.loop_obj.bind(py).call_method0("create_future")?.unbind();
-            future.bind(py).call_method1("set_result", (py.None(),))?;
-            self.ready_drain = Some(future.clone_ref(py));
-            return Ok(future);
-        }
-
         let Some(fallback) = self.drain_fallback.as_ref() else {
-            let future = self.loop_obj.bind(py).call_method0("create_future")?.unbind();
+            let future = self
+                .loop_obj
+                .bind(py)
+                .call_method0("create_future")?
+                .unbind();
             future.bind(py).call_method1("set_result", (py.None(),))?;
             return Ok(future);
         };
@@ -719,12 +819,9 @@ impl StreamTransport {
                 .as_ptr(),
             pending.size,
         )?;
-        clear_waiter(reader, py)?;
+        reader.setattr("_waiter", py.None())?;
         if !future_done(py, &pending.future)? {
-            pending
-                .future
-                .bind(py)
-                .call_method1("set_result", (data.bind(py),))?;
+            pending.future.bind(py).call_method1("set_result", (data,))?;
         }
         maybe_resume_transport(reader)?;
         Ok(true)
@@ -733,15 +830,11 @@ impl StreamTransport {
     fn fail_pending_read_eof(
         &mut self,
         py: Python<'_>,
-        reader: &Bound<'_, PyAny>,
+        _reader: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let Some(pending) = self.pending_read.take() else {
             return Ok(());
         };
-        clear_waiter(reader, py)?;
-        if future_done(py, &pending.future)? {
-            return Ok(());
-        }
         let partial = consume_all(
             py,
             self.buffer
@@ -751,10 +844,13 @@ impl StreamTransport {
                 .as_ptr(),
         )?;
         let exc = incomplete_read_error(py, partial, pending.size)?;
-        pending
-            .future
-            .bind(py)
-            .call_method1("set_exception", (exc.bind(py),))?;
+        _reader.setattr("_waiter", py.None())?;
+        if !future_done(py, &pending.future)? {
+            pending
+                .future
+                .bind(py)
+                .call_method1("set_exception", (exc,))?;
+        }
         Ok(())
     }
 }
@@ -781,6 +877,33 @@ static DRAIN_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
     ml_doc: c"Native drain fast path backed by the Kioto stream transport.".as_ptr(),
 });
 
+static WRITE_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
+    ml_name: c"write".as_ptr(),
+    ml_meth: ffi::PyMethodDefPointer {
+        PyCFunction: stream_transport_write_c,
+    },
+    ml_flags: ffi::METH_O,
+    ml_doc: c"Native write fast path backed by the Kioto stream transport.".as_ptr(),
+});
+
+static CLOSE_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
+    ml_name: c"close".as_ptr(),
+    ml_meth: ffi::PyMethodDefPointer {
+        PyCFunction: stream_transport_close_c,
+    },
+    ml_flags: ffi::METH_NOARGS,
+    ml_doc: c"Native close fast path backed by the Kioto stream transport.".as_ptr(),
+});
+
+static WAIT_CLOSED_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
+    ml_name: c"wait_closed".as_ptr(),
+    ml_meth: ffi::PyMethodDefPointer {
+        PyCFunction: stream_transport_wait_closed_c,
+    },
+    ml_flags: ffi::METH_NOARGS,
+    ml_doc: c"Native wait_closed fast path backed by the Kioto stream transport.".as_ptr(),
+});
+
 fn create_bound_readexactly(py: Python<'_>, slf: &Py<PyAny>) -> PyResult<Py<PyAny>> {
     unsafe {
         let func = ffi::PyCFunction_NewEx(
@@ -803,16 +926,47 @@ fn create_bound_drain(py: Python<'_>, slf: &Py<PyAny>) -> PyResult<Py<PyAny>> {
     }
 }
 
+fn create_bound_write(py: Python<'_>, slf: &Py<PyAny>) -> PyResult<Py<PyAny>> {
+    unsafe {
+        let func = ffi::PyCFunction_NewEx(
+            &WRITE_DEF.0 as *const ffi::PyMethodDef as *mut ffi::PyMethodDef,
+            slf.as_ptr(),
+            std::ptr::null_mut(),
+        );
+        Ok(Bound::<PyAny>::from_owned_ptr_or_err(py, func)?.unbind())
+    }
+}
+
+fn create_bound_close(py: Python<'_>, slf: &Py<PyAny>) -> PyResult<Py<PyAny>> {
+    unsafe {
+        let func = ffi::PyCFunction_NewEx(
+            &CLOSE_DEF.0 as *const ffi::PyMethodDef as *mut ffi::PyMethodDef,
+            slf.as_ptr(),
+            std::ptr::null_mut(),
+        );
+        Ok(Bound::<PyAny>::from_owned_ptr_or_err(py, func)?.unbind())
+    }
+}
+
+fn create_bound_wait_closed(py: Python<'_>, slf: &Py<PyAny>) -> PyResult<Py<PyAny>> {
+    unsafe {
+        let func = ffi::PyCFunction_NewEx(
+            &WAIT_CLOSED_DEF.0 as *const ffi::PyMethodDef as *mut ffi::PyMethodDef,
+            slf.as_ptr(),
+            std::ptr::null_mut(),
+        );
+        Ok(Bound::<PyAny>::from_owned_ptr_or_err(py, func)?.unbind())
+    }
+}
+
 unsafe extern "C" fn stream_transport_readexactly_c(
     slf: *mut ffi::PyObject,
     arg: *mut ffi::PyObject,
 ) -> *mut ffi::PyObject {
     let py = Python::assume_attached();
     let result = (|| -> PyResult<Py<PyAny>> {
-        let transport = Bound::from_borrowed_ptr(py, slf)
-            .cast_into_unchecked::<StreamTransport>()
-            .unbind();
-        let mut transport_ref = transport.borrow_mut(py);
+        let transport = Bound::from_borrowed_ptr(py, slf).cast_into_unchecked::<StreamTransport>();
+        let mut transport_ref = transport.borrow_mut();
         let size = Bound::<PyAny>::from_borrowed_ptr(py, arg).extract::<isize>()?;
         if size < 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -837,11 +991,86 @@ unsafe extern "C" fn stream_transport_drain_c(
 ) -> *mut ffi::PyObject {
     let py = Python::assume_attached();
     let result = (|| -> PyResult<Py<PyAny>> {
-        let transport = Bound::from_borrowed_ptr(py, slf)
-            .cast_into_unchecked::<StreamTransport>()
-            .unbind();
-        let mut transport_ref = transport.borrow_mut(py);
+        let transport = Bound::from_borrowed_ptr(py, slf).cast_into_unchecked::<StreamTransport>();
+        let mut transport_ref = transport.borrow_mut();
         transport_ref.drain_inner(py)
+    })();
+
+    match result {
+        Ok(obj) => obj.into_ptr(),
+        Err(err) => {
+            err.restore(py);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+unsafe extern "C" fn stream_transport_write_c(
+    slf: *mut ffi::PyObject,
+    arg: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    let py = Python::assume_attached();
+    let result = (|| -> PyResult<Py<PyAny>> {
+        let transport = Bound::from_borrowed_ptr(py, slf).cast_into_unchecked::<StreamTransport>();
+        let mut transport_ref = transport.borrow_mut();
+        if ffi::PyBytes_Check(arg) != 0 {
+            transport_ref.ensure_can_write()?;
+            let data = Bound::<PyAny>::from_borrowed_ptr(py, arg).cast_into_unchecked::<PyBytes>();
+            transport_ref.write_bytes_object_inner(py, &data)?;
+            return Ok(py.None());
+        }
+        let data = Bound::<PyAny>::from_borrowed_ptr(py, arg);
+        transport_ref.write(py, data)?;
+        Ok(py.None())
+    })();
+
+    match result {
+        Ok(obj) => obj.into_ptr(),
+        Err(err) => {
+            err.restore(py);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+unsafe extern "C" fn stream_transport_close_c(
+    slf: *mut ffi::PyObject,
+    _args: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    let py = Python::assume_attached();
+    let result = (|| -> PyResult<Py<PyAny>> {
+        let transport = Bound::from_borrowed_ptr(py, slf).cast_into_unchecked::<StreamTransport>();
+        StreamTransport::close(transport.unbind(), py)?;
+        Ok(py.None())
+    })();
+
+    match result {
+        Ok(obj) => obj.into_ptr(),
+        Err(err) => {
+            err.restore(py);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+unsafe extern "C" fn stream_transport_wait_closed_c(
+    slf: *mut ffi::PyObject,
+    _args: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    let py = Python::assume_attached();
+    let result = (|| -> PyResult<Py<PyAny>> {
+        let transport = Bound::from_borrowed_ptr(py, slf).cast_into_unchecked::<StreamTransport>();
+        let transport_ref = transport.borrow();
+        if let Some(waiter) = transport_ref.close_waiter.as_ref() {
+            return Ok(waiter.clone_ref(py));
+        }
+        let future = transport_ref
+            .loop_obj
+            .bind(py)
+            .call_method0("create_future")?
+            .unbind();
+        future.bind(py).call_method1("set_result", (py.None(),))?;
+        Ok(future)
     })();
 
     match result {
@@ -912,6 +1141,23 @@ fn append_to_bytearray(bytearray: *mut ffi::PyObject, data: &[u8]) -> PyResult<(
     Ok(())
 }
 
+fn replace_bytearray(bytearray: *mut ffi::PyObject, data: &[u8]) -> PyResult<()> {
+    unsafe {
+        if ffi::PyByteArray_Resize(bytearray, data.len() as isize) != 0 {
+            return Err(PyErr::fetch(Python::assume_attached()));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let dest = ffi::PyByteArray_AsString(bytearray) as *mut u8;
+        if dest.is_null() {
+            return Err(PyErr::fetch(Python::assume_attached()));
+        }
+        ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
+    }
+    Ok(())
+}
+
 fn bytearray_len(bytearray: *mut ffi::PyObject) -> PyResult<usize> {
     let len = unsafe { ffi::PyByteArray_Size(bytearray) };
     if len < 0 {
@@ -925,7 +1171,11 @@ fn try_consume_exact(bytearray: *mut ffi::PyObject, size: usize) -> PyResult<boo
     Ok(len >= size as isize)
 }
 
-fn consume_exact(py: Python<'_>, bytearray: *mut ffi::PyObject, size: usize) -> PyResult<Py<PyAny>> {
+fn consume_exact(
+    py: Python<'_>,
+    bytearray: *mut ffi::PyObject,
+    size: usize,
+) -> PyResult<Py<PyAny>> {
     unsafe {
         let len = ffi::PyByteArray_Size(bytearray);
         if len < size as isize {
@@ -962,14 +1212,58 @@ fn consume_all(py: Python<'_>, bytearray: *mut ffi::PyObject) -> PyResult<Py<PyA
         if src.is_null() {
             return Err(PyErr::fetch(py));
         }
-        let data = PyBytes::new(py, std::slice::from_raw_parts(src.cast_const(), len as usize))
-            .into_any()
-            .unbind();
+        let data = PyBytes::new(
+            py,
+            std::slice::from_raw_parts(src.cast_const(), len as usize),
+        )
+        .into_any()
+        .unbind();
         if ffi::PyByteArray_Resize(bytearray, 0) != 0 {
             return Err(PyErr::fetch(py));
         }
         Ok(data)
     }
+}
+
+fn join_buffered_prefix_and_chunk(
+    py: Python<'_>,
+    bytearray: *mut ffi::PyObject,
+    buffered: usize,
+    chunk: &[u8],
+    total: usize,
+) -> PyResult<Py<PyAny>> {
+    unsafe {
+        let object = ffi::PyBytes_FromStringAndSize(std::ptr::null(), total as ffi::Py_ssize_t);
+        let bytes =
+            Bound::<PyAny>::from_owned_ptr_or_err(py, object)?.cast_into_unchecked::<PyBytes>();
+        let dest = ffi::PyBytes_AsString(bytes.as_ptr()) as *mut u8;
+        if dest.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        if buffered != 0 {
+            let src = ffi::PyByteArray_AsString(bytearray) as *const u8;
+            if src.is_null() {
+                return Err(PyErr::fetch(py));
+            }
+            ptr::copy_nonoverlapping(src, dest, buffered);
+        }
+        if !chunk.is_empty() {
+            ptr::copy_nonoverlapping(chunk.as_ptr(), dest.add(buffered), chunk.len());
+        }
+        Ok(bytes.into_any().unbind())
+    }
+}
+
+fn coerce_bytes(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyBytes>> {
+    static BYTES_TYPE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    let bytes_type = BYTES_TYPE.get_or_try_init(py, || -> PyResult<_> {
+        Ok(py.import("builtins")?.getattr("bytes")?.unbind())
+    })?;
+    Ok(bytes_type
+        .bind(py)
+        .call1((data,))?
+        .cast_into::<PyBytes>()?
+        .unbind())
 }
 
 fn ready_future_result(
@@ -992,7 +1286,11 @@ fn ready_future_exception(
     Ok(future.unbind())
 }
 
-fn incomplete_read_error(py: Python<'_>, partial: Py<PyAny>, expected: usize) -> PyResult<Py<PyAny>> {
+fn incomplete_read_error(
+    py: Python<'_>,
+    partial: Py<PyAny>,
+    expected: usize,
+) -> PyResult<Py<PyAny>> {
     static INCOMPLETE_READ_ERROR: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
     let cls = INCOMPLETE_READ_ERROR.get_or_try_init(py, || -> PyResult<_> {
         Ok(py
@@ -1010,6 +1308,10 @@ fn current_exception(reader: &Bound<'_, PyAny>) -> PyResult<Option<Py<PyAny>>> {
     } else {
         Ok(Some(exc.unbind()))
     }
+}
+
+fn future_done(py: Python<'_>, future: &Py<PyAny>) -> PyResult<bool> {
+    future.bind(py).call_method0("done")?.is_truthy()
 }
 
 fn wake_waiter(py: Python<'_>, reader: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -1035,9 +1337,21 @@ fn maybe_resume_transport(reader: &Bound<'_, PyAny>) -> PyResult<()> {
     Ok(())
 }
 
-fn future_done(py: Python<'_>, future: &Py<PyAny>) -> PyResult<bool> {
-    if future.bind(py).call_method0("cancelled")?.is_truthy()? {
-        return Ok(true);
+fn cancelled_error(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    static CANCELLED_ERROR: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    let cls = CANCELLED_ERROR.get_or_try_init(py, || -> PyResult<_> {
+        Ok(py
+            .import("asyncio.exceptions")?
+            .getattr("CancelledError")?
+            .unbind())
+    })?;
+    Ok(cls.bind(py).call0()?.unbind())
+}
+
+fn normalize_exception(py: Python<'_>, exception: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    if exception.bind(py).is_instance_of::<pyo3::types::PyType>() {
+        Ok(exception.bind(py).call0()?.unbind())
+    } else {
+        Ok(exception)
     }
-    future.bind(py).call_method0("done")?.is_truthy()
 }

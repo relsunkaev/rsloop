@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::os::fd::RawFd;
+
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -82,7 +83,12 @@ impl FdCallbackRegistry {
             let states = self.states.read();
             events
                 .into_iter()
-                .filter_map(|(fd, mask)| states.get(&(fd as RawFd)).cloned().map(|entry| (fd as RawFd, mask, entry)))
+                .filter_map(|(fd, mask)| {
+                    states
+                        .get(&(fd as RawFd))
+                        .cloned()
+                        .map(|entry| (fd as RawFd, mask, entry))
+                })
                 .collect()
         };
         let mut empty_fds = Vec::new();

@@ -56,7 +56,10 @@ impl PollerState {
 
     fn set_interest(&mut self, fd: RawFd, mask: u8) -> io::Result<()> {
         if self.closed {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "poller is closed"));
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "poller is closed",
+            ));
         }
 
         if mask == 0 {
@@ -186,12 +189,16 @@ impl TokioPoller {
 }
 
 impl TokioPoller {
-    pub(crate) fn select_inner(
+    pub(crate) fn set_interest_inner(
         &self,
-        py: Python<'_>,
-        timeout: Option<f64>,
-    ) -> PyResult<Vec<(i32, u8)>> {
-        self.select(py, timeout)
+        fd: RawFd,
+        readable: bool,
+        writable: bool,
+    ) -> PyResult<()> {
+        self.state
+            .lock()
+            .set_interest(fd, interest_mask(readable, writable))
+            .map_err(PyOSError::new_err)
     }
 
     pub(crate) fn select_inner_into(
@@ -207,25 +214,6 @@ impl TokioPoller {
     pub(crate) fn is_only_registered_fd(&self, fd: i32) -> bool {
         let state = self.state.lock();
         state.registrations.len() == 1 && state.registrations.contains_key(&(fd as RawFd))
-    }
-
-    pub(crate) fn is_only_registered_fds(&self, fd: i32, extra_fd: Option<i32>) -> bool {
-        let state = self.state.lock();
-        match extra_fd {
-            Some(extra_fd) => {
-                if !(state.registrations.len() == 1 || state.registrations.len() == 2) {
-                    return false;
-                }
-                state.registrations.contains_key(&(fd as RawFd))
-                    && state
-                        .registrations
-                        .keys()
-                        .all(|registered| *registered == fd as RawFd || *registered == extra_fd as RawFd)
-            }
-            None => {
-                state.registrations.len() == 1 && state.registrations.contains_key(&(fd as RawFd))
-            }
-        }
     }
 }
 
