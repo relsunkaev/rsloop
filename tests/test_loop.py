@@ -101,6 +101,24 @@ class KiotoLoopTests(unittest.TestCase):
 
         self.run_async(main())
 
+    def test_socket_recv_into(self) -> None:
+        async def main() -> None:
+            loop = asyncio.get_running_loop()
+            reader_sock, writer_sock = socket.socketpair()
+            reader_sock.setblocking(False)
+            writer_sock.setblocking(False)
+
+            try:
+                payload = bytearray(b"-----")
+                await loop.sock_sendall(writer_sock, b"hello")
+                self.assertEqual(await loop.sock_recv_into(reader_sock, payload), 5)
+                self.assertEqual(payload, bytearray(b"hello"))
+            finally:
+                reader_sock.close()
+                writer_sock.close()
+
+        self.run_async(main())
+
     def test_tcp_socket_helpers_repeated_roundtrip(self) -> None:
         async def main() -> None:
             loop = asyncio.get_running_loop()
@@ -213,6 +231,40 @@ class KiotoLoopTests(unittest.TestCase):
                 await server.wait_closed()
 
         self.run_async(main())
+
+    def test_tcp_server_runner_shutdown_regression(self) -> None:
+        async def handle(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            try:
+                while True:
+                    payload = await reader.readexactly(1)
+                    writer.write(payload)
+                    await writer.drain()
+            except asyncio.IncompleteReadError:
+                pass
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        async def main() -> None:
+            server = await asyncio.start_server(handle, "127.0.0.1", 0)
+            addr = server.sockets[0].getsockname()
+
+            try:
+                reader, writer = await asyncio.open_connection(*addr[:2])
+                for _ in range(256):
+                    writer.write(b"x")
+                    await writer.drain()
+                    self.assertEqual(await reader.readexactly(1), b"x")
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        for _ in range(2):
+            self.run_async(main())
 
     def test_tokio_bridge(self) -> None:
         async def python_work() -> str:
