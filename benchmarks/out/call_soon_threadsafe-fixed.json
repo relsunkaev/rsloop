@@ -1,0 +1,28 @@
+{
+  "environment": {
+    "python": "3.14.3 (main, Mar 13 2026, 10:14:06) [Clang 17.0.0 (clang-1700.6.3.2)]",
+    "platform": "macOS-26.3-arm64-arm-64bit-Mach-O",
+    "processor": "arm",
+    "pid": 74367
+  },
+  "baseline": "uvloop",
+  "results": [
+    {
+      "loop": "kioto",
+      "benchmark": "call_soon_threadsafe",
+      "category": "scheduler",
+      "description": "Cross-thread scheduling through loop.call_soon_threadsafe()",
+      "iterations": 50000,
+      "repeats": 1,
+      "unit": "callbacks",
+      "samples": [
+        0.01262950000091223
+      ],
+      "median": 0.01262950000091223,
+      "mean": 0.01262950000091223,
+      "minimum": 0.01262950000091223,
+      "ns_per_unit": 252.5900000182446
+    }
+  ],
+  "comparisons": []
+}

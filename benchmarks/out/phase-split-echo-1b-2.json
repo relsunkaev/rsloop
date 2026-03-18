@@ -1,0 +1,91 @@
+{
+  "environment": {
+    "python": "3.14.3 (main, Mar 13 2026, 10:14:06) [Clang 17.0.0 (clang-1700.6.3.2)]",
+    "platform": "macOS-26.3-arm64-arm-64bit-Mach-O",
+    "processor": "arm",
+    "pid": 53921
+  },
+  "baseline": "uvloop",
+  "results": [
+    {
+      "loop": "asyncio",
+      "benchmark": "tcp_echo_1b",
+      "category": "stream",
+      "description": "Single TCP stream echo using asyncio streams with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 5,
+      "unit": "roundtrips",
+      "samples": [
+        0.546455750001769,
+        0.5505189579998842,
+        0.5788045000008424,
+        0.5525410840054974,
+        0.5490310829991358
+      ],
+      "median": 0.5505189579998842,
+      "mean": 0.5554702750014258,
+      "minimum": 0.546455750001769,
+      "ns_per_unit": 55051.895799988415
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "tcp_echo_1b",
+      "category": "stream",
+      "description": "Single TCP stream echo using asyncio streams with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 5,
+      "unit": "roundtrips",
+      "samples": [
+        0.2386166249998496,
+        0.2529271660023369,
+        0.24263950000022305,
+        0.24100695900415303,
+        0.2528709589969367
+      ],
+      "median": 0.24263950000022305,
+      "mean": 0.24561224180069985,
+      "minimum": 0.2386166249998496,
+      "ns_per_unit": 24263.950000022305
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "tcp_echo_1b",
+      "category": "stream",
+      "description": "Single TCP stream echo using asyncio streams with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 5,
+      "unit": "roundtrips",
+      "samples": [
+        0.2299863749940414,
+        0.23016787500091596,
+        0.22839683400525246,
+        0.2507259999983944,
+        0.23261504199763294
+      ],
+      "median": 0.23016787500091596,
+      "mean": 0.23437842519924743,
+      "minimum": 0.22839683400525246,
+      "ns_per_unit": 23016.787500091596
+    }
+  ],
+  "comparisons": [
+    {
+      "benchmark": "tcp_echo_1b",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 2.268876081591736
+    },
+    {
+      "benchmark": "tcp_echo_1b",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 0.9486001866996279
+    },
+    {
+      "benchmark": "tcp_echo_1b",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    }
+  ]
+}

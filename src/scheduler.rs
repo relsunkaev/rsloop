@@ -78,6 +78,7 @@ struct PhaseStats {
     completions: Duration,
     timers: Duration,
     ready: Duration,
+    writes: Duration,
 }
 
 #[pymethods]
@@ -278,7 +279,7 @@ impl Scheduler {
 
         if profiling {
             eprintln!(
-                "kioto scheduler phases iterations={} direct_waits={} poll_waits={} completion_items={} ready_handles={} select={:.6}s fd_dispatch={:.6}s completions={:.6}s timers={:.6}s ready={:.6}s",
+                "kioto scheduler phases iterations={} direct_waits={} poll_waits={} completion_items={} ready_handles={} select={:.6}s fd_dispatch={:.6}s completions={:.6}s timers={:.6}s ready={:.6}s writes={:.6}s",
                 stats.iterations,
                 stats.direct_waits,
                 stats.poll_waits,
@@ -289,6 +290,7 @@ impl Scheduler {
                 stats.completions.as_secs_f64(),
                 stats.timers.as_secs_f64(),
                 stats.ready.as_secs_f64(),
+                stats.writes.as_secs_f64(),
             );
         }
 
@@ -492,6 +494,14 @@ impl Scheduler {
         self.run_ready_inner(py, &loop_obj, debug, slow_callback_duration, ready_batch)?;
         if let Some(stats) = stats.as_deref_mut() {
             stats.ready += ready_started.map(|started| started.elapsed()).unwrap_or_default();
+        }
+
+        if let Some(registry) = stream_registry {
+            let started = stats.as_ref().map(|_| Instant::now());
+            registry.bind(py).borrow().flush_write_queue(py)?;
+            if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
+                stats.writes += started.elapsed();
+            }
         }
 
         Ok(())

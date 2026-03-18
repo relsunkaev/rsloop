@@ -15,6 +15,7 @@ const SEGMENT_MASK: usize = SEGMENT_SIZE - 1;
 #[pyclass(module = "kioto._kioto", unsendable)]
 pub struct StreamTransportRegistry {
     segments: RefCell<Vec<Option<Box<[Option<Py<StreamTransport>>]>>>>,
+    write_queue: RefCell<Vec<(RawFd, u64)>>,
 }
 
 #[pymethods]
@@ -23,6 +24,7 @@ impl StreamTransportRegistry {
     fn new() -> Self {
         Self {
             segments: RefCell::new(Vec::new()),
+            write_queue: RefCell::new(Vec::new()),
         }
     }
 
@@ -36,6 +38,7 @@ impl StreamTransportRegistry {
 
     fn clear(&self) {
         self.segments.borrow_mut().clear();
+        self.write_queue.borrow_mut().clear();
     }
 }
 
@@ -51,6 +54,33 @@ impl StreamTransportRegistry {
         let mut stream = bound.borrow_mut();
         stream.on_events(py, mask)?;
         Ok(true)
+    }
+
+    pub(crate) fn queue_write_phase(&self, fd: RawFd, token: u64) {
+        self.write_queue.borrow_mut().push((fd, token));
+    }
+
+    pub(crate) fn flush_write_queue(&self, py: Python<'_>) -> PyResult<()> {
+        loop {
+            let drained = {
+                let mut queued = self.write_queue.borrow_mut();
+                if queued.is_empty() {
+                    return Ok(());
+                }
+                std::mem::take(&mut *queued)
+            };
+            for (fd, token) in drained {
+                let Some(transport) = self.get(py, fd) else {
+                    continue;
+                };
+                let mut transport = transport.bind(py).borrow_mut();
+                if transport.stream_token != token {
+                    continue;
+                }
+                transport.write_queued = false;
+                transport.flush_write_phase(py)?;
+            }
+        }
     }
 
     pub(crate) fn register_inner(&self, fd: RawFd, transport: Py<StreamTransport>) {

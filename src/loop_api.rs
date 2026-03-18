@@ -351,6 +351,15 @@ unsafe fn run_fastcall(
             } else {
                 api_ref.push_timer_fallback(handle.clone_ref(py), when);
             }
+        } else if matches!(mode, FastcallMode::CallSoonThreadsafe)
+            && std::thread::current().id() != api_ref.owner_thread_id
+        {
+            api_ref
+                .scheduler
+                .bind(py)
+                .borrow()
+                .push_ready_threadsafe_inner(handle.clone_ref(py));
+            let _ = api_ref.wake_loop();
         } else if let Ok(scheduler) = api_ref.scheduler.bind(py).try_borrow() {
             scheduler.push_ready_inner(handle.clone_ref(py));
         } else {

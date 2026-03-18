@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::os::fd::RawFd;
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
 
 use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError};
 use pyo3::ffi;
@@ -17,9 +17,11 @@ use crate::stream_registry::StreamTransportRegistry;
 
 const DEFAULT_STREAM_READ_SIZE: usize = 64 * 1024;
 const NATIVE_READEXACTLY_LIMIT: usize = 16 * 1024;
+const DIRECT_WRITE_LIMIT: usize = 64;
 const WRITE_HIGH_WATER: usize = 64 * 1024;
 const WRITE_LOW_WATER: usize = 16 * 1024;
 static TRACE_STREAM: OnceLock<bool> = OnceLock::new();
+static STREAM_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 struct PendingRead {
     size: usize,
@@ -27,12 +29,13 @@ struct PendingRead {
 }
 
 struct PendingWrite {
-    data: Vec<u8>,
+    data: Py<PyBytes>,
     sent: usize,
 }
 
 #[pyclass(module = "kioto._kioto")]
 pub struct StreamTransport {
+    pub(crate) stream_token: u64,
     sock: Py<PyAny>,
     fd: RawFd,
     protocol: Py<PyAny>,
@@ -61,6 +64,7 @@ pub struct StreamTransport {
     eof_sent: bool,
     protocol_paused: bool,
     connection_lost_sent: bool,
+    pub(crate) write_queued: bool,
 }
 
 #[pymethods]
@@ -99,6 +103,7 @@ impl StreamTransport {
                 (None, None, None, 64 * 1024)
             };
         Ok(Self {
+            stream_token: STREAM_TOKEN.fetch_add(1, Ordering::Relaxed),
             sock,
             fd,
             protocol,
@@ -127,6 +132,7 @@ impl StreamTransport {
             eof_sent: false,
             protocol_paused: false,
             connection_lost_sent: false,
+            write_queued: false,
         })
     }
 
@@ -348,21 +354,16 @@ impl StreamTransport {
     }
 
     fn write_bytes_object_inner(&mut self, py: Python<'_>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
-        self.write_bytes_inner(py, data.as_bytes())
-    }
-
-    fn write_bytes_inner(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        if self.write_queue.is_empty() && !self.writer_registered {
-            match try_send_bytes(self.fd, data) {
-                Ok(sent) if sent == data.len() => return Ok(()),
+        let bytes = data.as_bytes();
+        if self.write_queue.is_empty() && !self.writer_registered && bytes.len() <= DIRECT_WRITE_LIMIT {
+            match try_send_bytes(self.fd, bytes) {
+                Ok(sent) if sent == bytes.len() => return Ok(()),
                 Ok(sent) => {
-                    self.queue_write(data, sent)?;
+                    let tail = PyBytes::new(py, &bytes[sent..]).unbind();
+                    self.queue_write_bytes(py, tail, sent)?;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.queue_write(data, 0)?;
+                    self.queue_write_bytes(py, data.clone().unbind(), 0)?;
                 }
                 Err(err) => {
                     return self.finish_close(
@@ -376,17 +377,62 @@ impl StreamTransport {
                 }
             }
         } else {
-            self.queue_write(data, 0)?;
+            self.queue_write_bytes(py, data.clone().unbind(), 0)?;
         }
-
         self.sync_interest(py)?;
+        self.schedule_write_phase(py)?;
         self.maybe_pause_protocol(py)?;
         Ok(())
     }
 
-    fn queue_write(&mut self, bytes: &[u8], sent: usize) -> PyResult<()> {
-        let data = bytes.to_vec();
-        let len = data.len();
+    fn write_bytes_inner(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if self.write_queue.is_empty() && !self.writer_registered && data.len() <= DIRECT_WRITE_LIMIT {
+            match try_send_bytes(self.fd, data) {
+                Ok(sent) if sent == data.len() => return Ok(()),
+                Ok(sent) => {
+                    self.queue_write_bytes(py, PyBytes::new(py, &data[sent..]).unbind(), sent)?;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.queue_write_bytes(py, PyBytes::new(py, data).unbind(), 0)?;
+                }
+                Err(err) => {
+                    return self.finish_close(
+                        py,
+                        Some(
+                            PyRuntimeError::new_err(err.to_string())
+                                .into_value(py)
+                                .into_any(),
+                        ),
+                    );
+                }
+            }
+        } else {
+            self.queue_write_bytes(py, PyBytes::new(py, data).unbind(), 0)?;
+        }
+
+        self.sync_interest(py)?;
+        self.schedule_write_phase(py)?;
+        self.maybe_pause_protocol(py)?;
+        Ok(())
+    }
+
+    fn schedule_write_phase(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.write_queued || self.pending_write_bytes == 0 {
+            return Ok(());
+        }
+        self.write_queued = true;
+        self.registry
+            .bind(py)
+            .borrow()
+            .queue_write_phase(self.fd, self.stream_token);
+        Ok(())
+    }
+
+    fn queue_write_bytes(&mut self, py: Python<'_>, data: Py<PyBytes>, sent: usize) -> PyResult<()> {
+        let len = data.bind(py).as_bytes().len();
         let sent = sent.min(len);
         self.pending_write_bytes += len.saturating_sub(sent);
         self.write_queue.push_back(PendingWrite { data, sent });
@@ -441,6 +487,10 @@ impl StreamTransport {
     }
 
     pub(crate) fn on_writable(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.schedule_write_phase(py)
+    }
+
+    pub(crate) fn flush_write_phase(&mut self, py: Python<'_>) -> PyResult<()> {
         if trace_stream_enabled() {
             eprintln!(
                 "stream-transport writable fd={} queued={}",
@@ -448,7 +498,9 @@ impl StreamTransport {
             );
         }
         while let Some(write) = self.write_queue.front_mut() {
-            let write_bytes = &write.data[write.sent..];
+            let data = write.data.bind(py);
+            let len = data.as_bytes().len();
+            let write_bytes = &data.as_bytes()[write.sent..];
             match try_send_bytes(self.fd, write_bytes) {
                 Ok(0) => break,
                 Ok(sent) => {
@@ -457,7 +509,7 @@ impl StreamTransport {
                     }
                     write.sent += sent;
                     self.pending_write_bytes = self.pending_write_bytes.saturating_sub(sent);
-                    if write.sent == write.data.len() {
+                    if write.sent == len {
                         self.write_queue.pop_front();
                     }
                 }
@@ -507,6 +559,7 @@ impl StreamTransport {
         }
         self.closed = true;
         self.closing = true;
+        self.write_queued = false;
         self.registry
             .bind(py)
             .borrow()

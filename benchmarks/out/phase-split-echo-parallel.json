@@ -1,0 +1,91 @@
+{
+  "environment": {
+    "python": "3.14.3 (main, Mar 13 2026, 10:14:06) [Clang 17.0.0 (clang-1700.6.3.2)]",
+    "platform": "macOS-26.3-arm64-arm-64bit-Mach-O",
+    "processor": "arm",
+    "pid": 51026
+  },
+  "baseline": "uvloop",
+  "results": [
+    {
+      "loop": "asyncio",
+      "benchmark": "tcp_echo_parallel",
+      "category": "stream",
+      "description": "32 concurrent stream clients with 64-byte echo payloads",
+      "iterations": 16384,
+      "repeats": 5,
+      "unit": "messages",
+      "samples": [
+        0.26510654100275133,
+        0.24885966700094286,
+        0.2533168750014738,
+        0.26696500000252854,
+        0.2648987919965293
+      ],
+      "median": 0.2648987919965293,
+      "mean": 0.2598293750008452,
+      "minimum": 0.24885966700094286,
+      "ns_per_unit": 16168.139159944418
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "tcp_echo_parallel",
+      "category": "stream",
+      "description": "32 concurrent stream clients with 64-byte echo payloads",
+      "iterations": 16384,
+      "repeats": 5,
+      "unit": "messages",
+      "samples": [
+        0.15940787499857834,
+        0.16844800000399118,
+        0.18495604200143134,
+        0.18558108300203457,
+        0.16192729199974565
+      ],
+      "median": 0.16844800000399118,
+      "mean": 0.1720640584011562,
+      "minimum": 0.15940787499857834,
+      "ns_per_unit": 10281.250000243603
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "tcp_echo_parallel",
+      "category": "stream",
+      "description": "32 concurrent stream clients with 64-byte echo payloads",
+      "iterations": 16384,
+      "repeats": 5,
+      "unit": "messages",
+      "samples": [
+        0.1999845419995836,
+        0.19929820799734443,
+        0.19860716700350167,
+        0.2150678749967483,
+        0.20890116600639885
+      ],
+      "median": 0.1999845419995836,
+      "mean": 0.20437179160071536,
+      "minimum": 0.19860716700350167,
+      "ns_per_unit": 12206.087768529273
+    }
+  ],
+  "comparisons": [
+    {
+      "benchmark": "tcp_echo_parallel",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.5725849638479106
+    },
+    {
+      "benchmark": "tcp_echo_parallel",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.1872182631722858
+    },
+    {
+      "benchmark": "tcp_echo_parallel",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    }
+  ]
+}
