@@ -51,8 +51,7 @@ impl Ord for TimerEntry {
 
 #[pyclass(module = "kioto._kioto")]
 pub struct Scheduler {
-    ready_local: Mutex<Vec<Py<PyAny>>>,
-    ready_local_len: AtomicUsize,
+    ready_local: Vec<Py<PyAny>>,
     ready_remote: SegQueue<Py<PyAny>>,
     ready_remote_len: AtomicUsize,
     timers: Mutex<BinaryHeap<TimerEntry>>,
@@ -85,8 +84,7 @@ impl Scheduler {
     #[new]
     fn new() -> Self {
         Self {
-            ready_local: Mutex::new(Vec::new()),
-            ready_local_len: AtomicUsize::new(0),
+            ready_local: Vec::new(),
             ready_remote: SegQueue::new(),
             ready_remote_len: AtomicUsize::new(0),
             timers: Mutex::new(BinaryHeap::new()),
@@ -96,7 +94,7 @@ impl Scheduler {
         }
     }
 
-    fn push_ready(&self, handle: Py<PyAny>) {
+    fn push_ready(&mut self, handle: Py<PyAny>) {
         self.push_ready_inner(handle);
     }
 
@@ -109,24 +107,16 @@ impl Scheduler {
     }
 
     fn has_ready(&self) -> bool {
-        self.ready_remote_len.load(AtomicOrdering::Acquire) != 0
-            || self.ready_local_len.load(AtomicOrdering::Acquire) != 0
+        self.ready_remote_len.load(AtomicOrdering::Acquire) != 0 || !self.ready_local.is_empty()
     }
 
-    fn pop_ready(&self) -> Vec<Py<PyAny>> {
-        if self.ready_remote_len.load(AtomicOrdering::Acquire) == 0
-            && self.ready_local_len.load(AtomicOrdering::Acquire) == 0
-        {
+    fn pop_ready(&mut self) -> Vec<Py<PyAny>> {
+        if self.ready_remote_len.load(AtomicOrdering::Acquire) == 0 && self.ready_local.is_empty() {
             return Vec::new();
         }
         let mut batch = Vec::new();
-        {
-            let mut ready_local = self.ready_local.lock();
-            if !ready_local.is_empty() {
-                batch = std::mem::take(&mut *ready_local);
-                self.ready_local_len
-                    .fetch_sub(batch.len(), AtomicOrdering::AcqRel);
-            }
+        if !self.ready_local.is_empty() {
+            batch = std::mem::take(&mut self.ready_local);
         }
         let mut drained_remote = 0usize;
         while let Some(handle) = self.ready_remote.pop() {
@@ -163,9 +153,8 @@ impl Scheduler {
         self.next_timer_inner(py)
     }
 
-    fn clear(&self, py: Python<'_>) -> PyResult<()> {
-        self.ready_local.lock().clear();
-        self.ready_local_len.store(0, AtomicOrdering::Release);
+    fn clear(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.ready_local.clear();
         while self.ready_remote.pop().is_some() {}
         self.ready_remote_len.store(0, AtomicOrdering::Release);
         let mut timers = self.timers.lock();
@@ -183,7 +172,7 @@ impl Scheduler {
 
     #[pyo3(signature = (loop_obj, poller, completion_port, stream_registry, socket_registry, stopping, clock_resolution, debug, slow_callback_duration))]
     fn run_once(
-        &self,
+        &mut self,
         py: Python<'_>,
         loop_obj: Py<PyAny>,
         poller: PyRef<'_, TokioPoller>,
@@ -199,7 +188,7 @@ impl Scheduler {
         let mut completions = Vec::new();
         let mut fd_events = Vec::new();
         let mut generic_fd_events = Vec::new();
-        let mut stream_fd_events = Vec::new();
+        let mut _stream_fd_events = Vec::new();
         let mut ready_batch = Vec::new();
         self.run_once_inner(
             py,
@@ -218,14 +207,14 @@ impl Scheduler {
             &mut fd_events,
             &mut ready_batch,
             &mut generic_fd_events,
-            &mut stream_fd_events,
+            &mut _stream_fd_events,
             None,
         )
     }
 
     #[pyo3(signature = (loop_obj, poller, completion_port, stream_registry, socket_registry, clock_resolution, debug, slow_callback_duration))]
     fn run_forever_native(
-        &self,
+        &mut self,
         py: Python<'_>,
         loop_obj: Py<PyAny>,
         poller: PyRef<'_, TokioPoller>,
@@ -244,7 +233,7 @@ impl Scheduler {
         let mut completions = Vec::new();
         let mut fd_events = Vec::new();
         let mut generic_fd_events = Vec::new();
-        let mut stream_fd_events = Vec::new();
+        let mut _stream_fd_events = Vec::new();
         let mut ready_batch = Vec::new();
         let profiling = env::var_os("KIOTO_PROFILE_SCHED").is_some();
         let mut stats = PhaseStats::default();
@@ -267,7 +256,7 @@ impl Scheduler {
                 &mut fd_events,
                 &mut ready_batch,
                 &mut generic_fd_events,
-                &mut stream_fd_events,
+                &mut _stream_fd_events,
                 profiling.then_some(&mut stats),
             )?;
             if self.stopping.load(AtomicOrdering::Acquire) != 0 {
@@ -297,7 +286,7 @@ impl Scheduler {
 
 impl Scheduler {
     fn run_once_inner(
-        &self,
+        &mut self,
         py: Python<'_>,
         loop_obj: &Py<PyAny>,
         poller: &TokioPoller,
@@ -314,7 +303,7 @@ impl Scheduler {
         fd_events: &mut Vec<(i32, u8)>,
         ready_batch: &mut Vec<Py<PyAny>>,
         generic_fd_events: &mut Vec<(i32, u8)>,
-        stream_fd_events: &mut Vec<(i32, u8)>,
+        _stream_fd_events: &mut Vec<(i32, u8)>,
         stats: Option<&mut PhaseStats>,
     ) -> PyResult<()> {
         let mut stats = stats;
@@ -372,19 +361,21 @@ impl Scheduler {
         if !fd_events.is_empty() {
             let started = stats.as_ref().map(|_| Instant::now());
             if let Some(registry) = stream_registry {
-                registry
-                    .bind(py)
-                    .borrow()
-                    .dispatch_inner(py, fd_events, stream_fd_events)?;
-                if let Some(socket_registry) = socket_registry {
-                    socket_registry.bind(py).borrow().dispatch_inner(
-                        py,
-                        stream_fd_events,
-                        generic_fd_events,
-                    )?;
-                } else {
-                    generic_fd_events.clear();
-                    generic_fd_events.extend_from_slice(stream_fd_events);
+                let stream_registry = registry.bind(py);
+                let stream_registry = stream_registry.borrow();
+                let socket_registry = socket_registry.map(|registry| registry.bind(py));
+                let socket_registry = socket_registry.as_ref().map(|registry| registry.borrow());
+                generic_fd_events.clear();
+                for (fd, mask) in fd_events.iter().copied() {
+                    if stream_registry.dispatch_one(py, fd, mask)? {
+                        continue;
+                    }
+                    if let Some(socket_registry) = socket_registry.as_ref() {
+                        if socket_registry.dispatch_one(py, fd, mask)? {
+                            continue;
+                        }
+                    }
+                    generic_fd_events.push((fd, mask));
                 }
                 if !generic_fd_events.is_empty() {
                     loop_obj
@@ -392,10 +383,14 @@ impl Scheduler {
                         .call_method1("_process_fd_events", (&*generic_fd_events,))?;
                 }
             } else if let Some(socket_registry) = socket_registry {
-                socket_registry
-                    .bind(py)
-                    .borrow()
-                    .dispatch_inner(py, fd_events, generic_fd_events)?;
+                let socket_registry = socket_registry.bind(py);
+                let socket_registry = socket_registry.borrow();
+                generic_fd_events.clear();
+                for (fd, mask) in fd_events.iter().copied() {
+                    if !socket_registry.dispatch_one(py, fd, mask)? {
+                        generic_fd_events.push((fd, mask));
+                    }
+                }
                 if !generic_fd_events.is_empty() {
                     loop_obj
                         .bind(py)
@@ -432,10 +427,9 @@ impl Scheduler {
         }
         let ready_started = stats.as_ref().map(|_| Instant::now());
         if let Some(stats) = stats.as_deref_mut() {
-                stats.ready_handles +=
-                ready_batch.len() as u64
-                    + self.ready_remote_len.load(AtomicOrdering::Acquire) as u64
-                    + self.ready_local_len.load(AtomicOrdering::Acquire) as u64;
+            stats.ready_handles += ready_batch.len() as u64
+                + self.ready_remote_len.load(AtomicOrdering::Acquire) as u64
+                + self.ready_local.len() as u64;
         }
         self.run_ready_inner(py, &loop_obj, debug, slow_callback_duration, ready_batch)?;
         if let (Some(stats), Some(started)) = (stats.as_deref_mut(), ready_started) {
@@ -444,9 +438,8 @@ impl Scheduler {
 
         Ok(())
     }
-    pub(crate) fn push_ready_inner(&self, handle: Py<PyAny>) {
-        self.ready_local.lock().push(handle);
-        self.ready_local_len.fetch_add(1, AtomicOrdering::AcqRel);
+    pub(crate) fn push_ready_inner(&mut self, handle: Py<PyAny>) {
+        self.ready_local.push(handle);
     }
 
     pub(crate) fn push_ready_threadsafe_inner(&self, handle: Py<PyAny>) {
@@ -480,7 +473,7 @@ impl Scheduler {
         Ok(None)
     }
 
-    fn promote_due_inner(&self, py: Python<'_>, now: f64) -> PyResult<()> {
+    fn promote_due_inner(&mut self, py: Python<'_>, now: f64) -> PyResult<()> {
         let mut due = Vec::new();
         {
             let mut timers = self.timers.lock();
@@ -498,36 +491,27 @@ impl Scheduler {
         }
 
         if !due.is_empty() {
-            self.ready_local_len
-                .fetch_add(due.len(), AtomicOrdering::AcqRel);
-            self.ready_local.lock().extend(due);
+            self.ready_local.extend(due);
         }
 
         Ok(())
     }
 
     fn run_ready_inner(
-        &self,
+        &mut self,
         py: Python<'_>,
         loop_obj: &Py<PyAny>,
         debug: bool,
         slow_callback_duration: f64,
         ready_batch: &mut Vec<Py<PyAny>>,
     ) -> PyResult<()> {
-        if self.ready_remote_len.load(AtomicOrdering::Acquire) == 0
-            && self.ready_local_len.load(AtomicOrdering::Acquire) == 0
-        {
+        if self.ready_remote_len.load(AtomicOrdering::Acquire) == 0 && self.ready_local.is_empty() {
             return Ok(());
         }
         ready_batch.clear();
-        {
-            let mut ready_local = self.ready_local.lock();
-            if !ready_local.is_empty() {
-                let drained = std::mem::take(&mut *ready_local);
-                self.ready_local_len
-                    .fetch_sub(drained.len(), AtomicOrdering::AcqRel);
-                ready_batch.extend(drained);
-            }
+        if !self.ready_local.is_empty() {
+            let drained = std::mem::take(&mut self.ready_local);
+            ready_batch.extend(drained);
         }
         let mut drained_remote = 0usize;
         while let Some(handle) = self.ready_remote.pop() {

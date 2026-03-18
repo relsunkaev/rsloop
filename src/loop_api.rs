@@ -84,7 +84,7 @@ impl LoopApi {
         )?;
         self.scheduler
             .bind(py)
-            .borrow()
+            .borrow_mut()
             .push_ready_inner(handle.clone_ref(py));
         Ok(handle)
     }
@@ -274,7 +274,7 @@ unsafe fn run_fastcall(
             debug,
         )?;
 
-        let scheduler = api_ref.scheduler.bind(py).borrow();
+        let mut scheduler = api_ref.scheduler.bind(py).borrow_mut();
         if let Some(when) = when {
             scheduler.push_timer_inner(handle.clone_ref(py), when);
         } else {

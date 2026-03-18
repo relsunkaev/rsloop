@@ -39,6 +39,24 @@ impl StreamTransportRegistry {
 }
 
 impl StreamTransportRegistry {
+    pub(crate) fn dispatch_one(
+        &self,
+        py: Python<'_>,
+        fd: i32,
+        mask: u8,
+    ) -> PyResult<bool> {
+        let Some(transport) = self.get(fd as RawFd) else {
+            return Ok(false);
+        };
+        if env::var_os("KIOTO_TRACE_STREAM").is_some() {
+            eprintln!("stream-registry dispatch mask={mask}");
+        }
+        let bound = transport.bind(py);
+        let mut stream = bound.borrow_mut();
+        stream.on_events(py, mask)?;
+        Ok(true)
+    }
+
     pub(crate) fn register_inner(&mut self, fd: RawFd, transport: Py<StreamTransport>) {
         let index = fd as usize;
         let segment = self.segment_mut(index);
@@ -62,16 +80,9 @@ impl StreamTransportRegistry {
     ) -> PyResult<()> {
         remaining.clear();
         for (fd, mask) in events {
-            if let Some(transport) = self.get(*fd as RawFd) {
-                if env::var_os("KIOTO_TRACE_STREAM").is_some() {
-                    eprintln!("stream-registry dispatch mask={mask}");
-                }
-                let bound = transport.bind(py);
-                let mut stream = bound.borrow_mut();
-                stream.on_events(py, *mask)?;
-                continue;
+            if !self.dispatch_one(py, *fd, *mask)? {
+                remaining.push((*fd, *mask));
             }
-            remaining.push((*fd, *mask));
         }
         Ok(())
     }

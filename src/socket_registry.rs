@@ -38,6 +38,27 @@ impl SocketStateRegistry {
 }
 
 impl SocketStateRegistry {
+    pub(crate) fn dispatch_one(
+        &self,
+        py: Python<'_>,
+        fd: i32,
+        mask: u8,
+    ) -> PyResult<bool> {
+        let Some(state) = self.get(fd as RawFd) else {
+            return Ok(false);
+        };
+        let bound = state.bind(py);
+        if mask & 0x01 != 0 {
+            let mut state = bound.borrow_mut();
+            state.on_readable(py)?;
+        }
+        if mask & 0x02 != 0 {
+            let mut state = bound.borrow_mut();
+            state.on_writable(py)?;
+        }
+        Ok(true)
+    }
+
     pub(crate) fn register_inner(&mut self, fd: RawFd, state: Py<SocketState>) {
         let index = fd as usize;
         let segment = self.segment_mut(index);
@@ -61,19 +82,9 @@ impl SocketStateRegistry {
     ) -> PyResult<()> {
         remaining.clear();
         for (fd, mask) in events {
-            if let Some(state) = self.get(*fd as RawFd) {
-                let bound = state.bind(py);
-                if mask & 0x01 != 0 {
-                    let mut state = bound.borrow_mut();
-                    state.on_readable(py)?;
-                }
-                if mask & 0x02 != 0 {
-                    let mut state = bound.borrow_mut();
-                    state.on_writable(py)?;
-                }
-                continue;
+            if !self.dispatch_one(py, *fd, *mask)? {
+                remaining.push((*fd, *mask));
             }
-            remaining.push((*fd, *mask));
         }
         Ok(())
     }
