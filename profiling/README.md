@@ -36,6 +36,8 @@ Run from the repo root:
 Artifacts are written to `profiling/out/` with timestamped names.
 `samply` records to disk by default and does not open a browser.
 Pass `--open` if you want the Firefox Profiler UI to launch after capture.
+When opening, the runner defaults to `127.0.0.1:43000` and you can override that
+with `--address` / `--port`.
 
 ## Outputs
 
@@ -69,6 +71,7 @@ Open directly from the runner:
 
 ```bash
 .venv/bin/python profiling/run.py --tool samply --loop kioto --benchmark tcp_echo --open
+.venv/bin/python profiling/run.py --tool samply --loop kioto --benchmark tcp_echo --open --port 43123
 ```
 
 ## Recommended workflow

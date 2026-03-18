@@ -75,6 +75,17 @@ def main() -> None:
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--rate", type=int, default=1000, help="Sampling rate for samply")
     parser.add_argument(
+        "--address",
+        default="127.0.0.1",
+        help="Address for samply's local web server when opening profiles",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=43000,
+        help="Port for samply's local web server when opening profiles",
+    )
+    parser.add_argument(
         "--main-thread-only",
         action="store_true",
         help="Pass --main-thread-only to samply to reduce profile size",
@@ -115,7 +126,18 @@ def main() -> None:
 
     tool = ensure_tool("samply")
     out = base.with_suffix(".json.gz")
-    cmd = [tool, "record", "--rate", str(args.rate), "-o", str(out)]
+    cmd = [
+        tool,
+        "record",
+        "--rate",
+        str(args.rate),
+        "--address",
+        args.address,
+        "--port",
+        str(args.port),
+        "-o",
+        str(out),
+    ]
     if not args.open:
         cmd.append("--save-only")
     if args.main_thread_only:
@@ -124,7 +146,15 @@ def main() -> None:
     run_subprocess(cmd, env)
     print(f"wrote {out}")
     if args.open:
-        load_cmd = [tool, "load", str(out)]
+        load_cmd = [
+            tool,
+            "load",
+            "--address",
+            args.address,
+            "--port",
+            str(args.port),
+            str(out),
+        ]
         run_subprocess(load_cmd, env)
 
 
