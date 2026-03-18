@@ -355,43 +355,18 @@ impl StreamTransport {
         if data.is_empty() {
             return Ok(());
         }
-
-        if self.write_queue.is_empty() && !self.writer_registered {
-            match try_send_bytes(self.fd, data) {
-                Ok(sent) if sent == data.len() => return Ok(()),
-                Ok(sent) => {
-                    self.queue_write(data, sent)?;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.queue_write(data, 0)?;
-                }
-                Err(err) => {
-                    return self.finish_close(
-                        py,
-                        Some(
-                            PyRuntimeError::new_err(err.to_string())
-                                .into_value(py)
-                                .into_any(),
-                        ),
-                    );
-                }
-            }
-        } else {
-            self.queue_write(data, 0)?;
-        }
-
+        self.queue_write(data, 0);
         self.sync_interest(py)?;
         self.maybe_pause_protocol(py)?;
         Ok(())
     }
 
-    fn queue_write(&mut self, data: &[u8], sent: usize) -> PyResult<()> {
+    fn queue_write(&mut self, data: &[u8], sent: usize) {
         let data = data.to_vec();
         let len = data.len();
         let sent = sent.min(len);
         self.pending_write_bytes += len.saturating_sub(sent);
         self.write_queue.push_back(PendingWrite { data, sent });
-        Ok(())
     }
 
     pub(crate) fn on_readable(&mut self, py: Python<'_>) -> PyResult<()> {
