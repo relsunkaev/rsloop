@@ -51,9 +51,9 @@ pub struct StreamTransport {
     pending_read: Option<PendingRead>,
     read_buffer: Vec<u8>,
     write_queue: VecDeque<PendingWrite>,
-    pending_write_bytes: usize,
+    pub(crate) pending_write_bytes: usize,
     closing: bool,
-    closed: bool,
+    pub(crate) closed: bool,
     read_paused: bool,
     reader_registered: bool,
     writer_registered: bool,
@@ -355,18 +355,42 @@ impl StreamTransport {
         if data.is_empty() {
             return Ok(());
         }
-        self.queue_write(data, 0);
+        if self.write_queue.is_empty() && !self.writer_registered {
+            match try_send_bytes(self.fd, data) {
+                Ok(sent) if sent == data.len() => return Ok(()),
+                Ok(sent) => {
+                    self.queue_write(data, sent)?;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.queue_write(data, 0)?;
+                }
+                Err(err) => {
+                    return self.finish_close(
+                        py,
+                        Some(
+                            PyRuntimeError::new_err(err.to_string())
+                                .into_value(py)
+                                .into_any(),
+                        ),
+                    );
+                }
+            }
+        } else {
+            self.queue_write(data, 0)?;
+        }
+
         self.sync_interest(py)?;
         self.maybe_pause_protocol(py)?;
         Ok(())
     }
 
-    fn queue_write(&mut self, data: &[u8], sent: usize) {
-        let data = data.to_vec();
+    fn queue_write(&mut self, bytes: &[u8], sent: usize) -> PyResult<()> {
+        let data = bytes.to_vec();
         let len = data.len();
         let sent = sent.min(len);
         self.pending_write_bytes += len.saturating_sub(sent);
         self.write_queue.push_back(PendingWrite { data, sent });
+        Ok(())
     }
 
     pub(crate) fn on_readable(&mut self, py: Python<'_>) -> PyResult<()> {
@@ -485,7 +509,7 @@ impl StreamTransport {
         self.closing = true;
         self.registry
             .bind(py)
-            .borrow_mut()
+            .borrow()
             .unregister_inner(self.fd);
         self.disable_interest(py)?;
         self.pending_write_bytes = 0;
@@ -522,6 +546,12 @@ impl StreamTransport {
             !self.closed && (self.pending_write_bytes != 0 || (self.closing && !self.closed));
         if readable == self.reader_registered && writable == self.writer_registered {
             return Ok(());
+        }
+        if trace_stream_enabled() {
+            eprintln!(
+                "stream-transport interest fd={} readable={} writable={} prev_r={} prev_w={}",
+                self.fd, readable, writable, self.reader_registered, self.writer_registered
+            );
         }
         self.reader_registered = readable;
         self.writer_registered = writable;
@@ -627,6 +657,12 @@ impl StreamTransport {
 
         let pending = self.pending_read.take().expect("pending read present");
         let needed_from_chunk = pending.size.saturating_sub(buffered);
+        if trace_stream_enabled() {
+            eprintln!(
+                "stream-transport finish chunk fd={} needed={} chunk={}",
+                self.fd, needed_from_chunk, size
+            );
+        }
         let payload = if buffered == 0 && needed_from_chunk == size {
             PyBytes::new(py, &self.read_buffer[..size]).into_any().unbind()
         } else {
@@ -771,6 +807,12 @@ impl StreamTransport {
         }
 
         let pending = self.pending_read.take().expect("pending read present");
+        if trace_stream_enabled() {
+            eprintln!(
+                "stream-transport finish exact fd={} size={}",
+                self.fd, pending.size
+            );
+        }
         let data = consume_exact(
             py,
             self.buffer

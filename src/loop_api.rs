@@ -1,8 +1,10 @@
 #![cfg(unix)]
 
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::thread::ThreadId;
 
+use crossbeam_queue::SegQueue;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -46,8 +48,14 @@ static CALL_AT_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
 pub struct LoopApi {
     loop_obj: Py<PyAny>,
     scheduler: Py<Scheduler>,
+    ready_fallback: SegQueue<Py<PyAny>>,
+    ready_fallback_len: AtomicUsize,
+    timer_fallback: SegQueue<(Py<PyAny>, f64)>,
+    timer_fallback_len: AtomicUsize,
     debug: AtomicBool,
+    stopping: AtomicBool,
     closed: AtomicBool,
+    owner_thread_id: ThreadId,
     wake_fd: AtomicI32,
     wake_pending: AtomicBool,
 }
@@ -60,8 +68,14 @@ impl LoopApi {
         Self {
             loop_obj,
             scheduler,
+            ready_fallback: SegQueue::new(),
+            ready_fallback_len: AtomicUsize::new(0),
+            timer_fallback: SegQueue::new(),
+            timer_fallback_len: AtomicUsize::new(0),
             debug: AtomicBool::new(debug),
+            stopping: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            owner_thread_id: std::thread::current().id(),
             wake_fd: AtomicI32::new(-1),
             wake_pending: AtomicBool::new(false),
         }
@@ -84,7 +98,7 @@ impl LoopApi {
         )?;
         self.scheduler
             .bind(py)
-            .borrow_mut()
+            .borrow()
             .push_ready_inner(handle.clone_ref(py));
         Ok(handle)
     }
@@ -117,8 +131,62 @@ impl LoopApi {
         self.wake_fd.store(fd, Ordering::Release);
     }
 
-    fn clear_wakeup(&self) {
+    pub(crate) fn clear_wakeup(&self) {
         self.wake_pending.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn set_stopping(&self, stopping: bool) {
+        self.stopping.store(stopping, Ordering::Release);
+    }
+
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    fn push_ready_fallback(&self, handle: Py<PyAny>) {
+        let was_empty = self.ready_fallback_len.fetch_add(1, Ordering::AcqRel) == 0;
+        self.ready_fallback.push(handle);
+        if was_empty {
+            let _ = self.wake_loop();
+        }
+    }
+
+    pub(crate) fn drain_ready_fallback(&self) -> Vec<Py<PyAny>> {
+        if self.ready_fallback_len.load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        let mut drained = Vec::new();
+        while let Some(handle) = self.ready_fallback.pop() {
+            drained.push(handle);
+        }
+        if !drained.is_empty() {
+            self.ready_fallback_len
+                .fetch_sub(drained.len(), Ordering::AcqRel);
+        }
+        drained
+    }
+
+    pub(crate) fn push_timer_fallback(&self, handle: Py<PyAny>, when: f64) {
+        let was_empty = self.timer_fallback_len.fetch_add(1, Ordering::AcqRel) == 0;
+        self.timer_fallback.push((handle, when));
+        if was_empty {
+            let _ = self.wake_loop();
+        }
+    }
+
+    pub(crate) fn drain_timer_fallback(&self) -> Vec<(Py<PyAny>, f64)> {
+        if self.timer_fallback_len.load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        let mut drained = Vec::new();
+        while let Some(entry) = self.timer_fallback.pop() {
+            drained.push(entry);
+        }
+        if !drained.is_empty() {
+            self.timer_fallback_len
+                .fetch_sub(drained.len(), Ordering::AcqRel);
+        }
+        drained
     }
 }
 
@@ -131,6 +199,9 @@ impl LoopApi {
     }
 
     fn wake_loop(&self) -> PyResult<()> {
+        if std::thread::current().id() == self.owner_thread_id {
+            return Ok(());
+        }
         let fd = self.wake_fd.load(Ordering::Acquire);
         if fd < 0 {
             let py = unsafe { Python::assume_attached() };
@@ -274,16 +345,16 @@ unsafe fn run_fastcall(
             debug,
         )?;
 
-        let mut scheduler = api_ref.scheduler.bind(py).borrow_mut();
         if let Some(when) = when {
-            scheduler.push_timer_inner(handle.clone_ref(py), when);
-        } else {
-            if matches!(mode, FastcallMode::CallSoonThreadsafe) {
-                scheduler.push_ready_threadsafe_inner(handle.clone_ref(py));
-                api_ref.wake_loop()?;
+            if let Ok(scheduler) = api_ref.scheduler.bind(py).try_borrow() {
+                scheduler.push_timer_inner(handle.clone_ref(py), when);
             } else {
-                scheduler.push_ready_inner(handle.clone_ref(py));
+                api_ref.push_timer_fallback(handle.clone_ref(py), when);
             }
+        } else if let Ok(scheduler) = api_ref.scheduler.bind(py).try_borrow() {
+            scheduler.push_ready_inner(handle.clone_ref(py));
+        } else {
+            api_ref.push_ready_fallback(handle.clone_ref(py));
         }
         Ok(handle)
     })();

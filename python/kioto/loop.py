@@ -527,7 +527,15 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
 
     def _add_callback(self, handle: _events.Handle) -> None:
         if not handle._cancelled:
-            self._scheduler.push_ready(handle)
+            try:
+                self._scheduler.push_ready(handle)
+            except RuntimeError as exc:
+                if "borrow" not in str(exc):
+                    raise
+                native_api = getattr(self, "_native_api", None)
+                if native_api is None:
+                    raise
+                native_api.push_ready_fallback(handle)
 
     def _add_callback_signalsafe(self, handle: _events.Handle) -> None:
         self._add_callback(handle)
@@ -541,7 +549,12 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
             self._check_thread()
             self._check_callback(callback, "call_soon")
         handle = _kioto.make_handle(callback, args, self, context, None)
-        self._scheduler.push_ready(handle)
+        try:
+            self._scheduler.push_ready(handle)
+        except RuntimeError as exc:
+            if "borrow" not in str(exc):
+                raise
+            self._native_api.push_ready_fallback(handle)
         return handle
 
     def _compat__call_soon(
@@ -570,7 +583,12 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
         if self._debug:
             self._check_callback(callback, "call_soon_threadsafe")
         handle = _kioto.make_handle(callback, args, self, context, None)
-        self._scheduler.push_ready(handle)
+        try:
+            self._scheduler.push_ready(handle)
+        except RuntimeError as exc:
+            if "borrow" not in str(exc):
+                raise
+            self._native_api.push_ready_fallback(handle)
         self._write_to_self()
         return handle
 
@@ -597,6 +615,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
     def _run_once(self) -> None:
         self._scheduler.run_once(
             self,
+            self._native_api,
             self._poller,
             self._kioto_completion_port,
             self._stream_registry,
@@ -609,7 +628,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
 
     def run_forever(self) -> None:
         self._run_forever_setup()
-        self._scheduler.set_stopping(False)
+        self._native_api.set_stopping(False)
         try:
             if self._native_run_forever is None:
                 while True:
@@ -619,6 +638,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
             else:
                 self._native_run_forever(
                     self,
+                    self._native_api,
                     self._poller,
                     self._kioto_completion_port,
                     self._stream_registry,
@@ -628,12 +648,12 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
                     self.slow_callback_duration,
                 )
         finally:
-            self._scheduler.set_stopping(False)
+            self._native_api.set_stopping(False)
             self._run_forever_cleanup()
 
     def stop(self) -> None:
         self._stopping = True
-        self._scheduler.set_stopping(True)
+        self._native_api.set_stopping(True)
 
     def _drain_completions(self) -> None:
         for kind, target, payload, is_err in self._kioto_completion_port.drain():

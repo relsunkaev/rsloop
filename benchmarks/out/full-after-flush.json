@@ -1,0 +1,949 @@
+{
+  "environment": {
+    "python": "3.14.3 (main, Mar 13 2026, 10:14:06) [Clang 17.0.0 (clang-1700.6.3.2)]",
+    "platform": "macOS-26.3-arm64-arm-64bit-Mach-O",
+    "processor": "arm",
+    "pid": 23861
+  },
+  "baseline": "uvloop",
+  "results": [
+    {
+      "loop": "asyncio",
+      "benchmark": "call_soon",
+      "category": "scheduler",
+      "description": "Single-thread ready-queue churn via loop.call_soon()",
+      "iterations": 100000,
+      "repeats": 3,
+      "unit": "callbacks",
+      "samples": [
+        0.04735379100020509,
+        0.047011957998620346,
+        0.0470084999979008
+      ],
+      "median": 0.047011957998620346,
+      "mean": 0.047124749665575415,
+      "minimum": 0.0470084999979008,
+      "ns_per_unit": 470.11957998620346
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "call_soon",
+      "category": "scheduler",
+      "description": "Single-thread ready-queue churn via loop.call_soon()",
+      "iterations": 100000,
+      "repeats": 3,
+      "unit": "callbacks",
+      "samples": [
+        0.025969499998609535,
+        0.02567595800064737,
+        0.026214292003714945
+      ],
+      "median": 0.025969499998609535,
+      "mean": 0.025953250000990618,
+      "minimum": 0.02567595800064737,
+      "ns_per_unit": 259.69499998609535
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "call_soon",
+      "category": "scheduler",
+      "description": "Single-thread ready-queue churn via loop.call_soon()",
+      "iterations": 100000,
+      "repeats": 3,
+      "unit": "callbacks",
+      "samples": [
+        0.025697292003314942,
+        0.025992749993747566,
+        0.025575749998097308
+      ],
+      "median": 0.025697292003314942,
+      "mean": 0.025755263998386606,
+      "minimum": 0.025575749998097308,
+      "ns_per_unit": 256.9729200331494
+    },
+    {
+      "loop": "asyncio",
+      "benchmark": "call_soon_threadsafe",
+      "category": "scheduler",
+      "description": "Cross-thread scheduling through loop.call_soon_threadsafe()",
+      "iterations": 50000,
+      "repeats": 3,
+      "unit": "callbacks",
+      "samples": [
+        0.11508899999898858,
+        0.10995795900089433,
+        0.10899537499790313
+      ],
+      "median": 0.10995795900089433,
+      "mean": 0.11134744466592868,
+      "minimum": 0.10899537499790313,
+      "ns_per_unit": 2199.1591800178867
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "call_soon_threadsafe",
+      "category": "scheduler",
+      "description": "Cross-thread scheduling through loop.call_soon_threadsafe()",
+      "iterations": 50000,
+      "repeats": 3,
+      "unit": "callbacks",
+      "samples": [
+        0.01117191599769285,
+        0.011182292000739835,
+        0.011692457999743056
+      ],
+      "median": 0.011182292000739835,
+      "mean": 0.01134888866605858,
+      "minimum": 0.01117191599769285,
+      "ns_per_unit": 223.6458400147967
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "call_soon_threadsafe",
+      "category": "scheduler",
+      "description": "Cross-thread scheduling through loop.call_soon_threadsafe()",
+      "iterations": 50000,
+      "repeats": 3,
+      "unit": "callbacks",
+      "samples": [
+        0.01461649999691872,
+        0.014568250000593252,
+        0.014622958995460067
+      ],
+      "median": 0.01461649999691872,
+      "mean": 0.014602569664324013,
+      "minimum": 0.014568250000593252,
+      "ns_per_unit": 292.3299999383744
+    },
+    {
+      "loop": "asyncio",
+      "benchmark": "sleep_zero",
+      "category": "scheduler",
+      "description": "Coroutine yield/resume churn through asyncio.sleep(0)",
+      "iterations": 20000,
+      "repeats": 3,
+      "unit": "awaits",
+      "samples": [
+        0.2768346669981838,
+        0.3111522090039216,
+        0.3000444589997642
+      ],
+      "median": 0.3000444589997642,
+      "mean": 0.2960104450006232,
+      "minimum": 0.2768346669981838,
+      "ns_per_unit": 15002.22294998821
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "sleep_zero",
+      "category": "scheduler",
+      "description": "Coroutine yield/resume churn through asyncio.sleep(0)",
+      "iterations": 20000,
+      "repeats": 3,
+      "unit": "awaits",
+      "samples": [
+        0.256995250005275,
+        0.2569484999985434,
+        0.26317720799852395
+      ],
+      "median": 0.256995250005275,
+      "mean": 0.25904031933411414,
+      "minimum": 0.2569484999985434,
+      "ns_per_unit": 12849.76250026375
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "sleep_zero",
+      "category": "scheduler",
+      "description": "Coroutine yield/resume churn through asyncio.sleep(0)",
+      "iterations": 20000,
+      "repeats": 3,
+      "unit": "awaits",
+      "samples": [
+        0.17202854100469267,
+        0.173033207996923,
+        0.17500250000011874
+      ],
+      "median": 0.173033207996923,
+      "mean": 0.17335474966724482,
+      "minimum": 0.17202854100469267,
+      "ns_per_unit": 8651.66039984615
+    },
+    {
+      "loop": "asyncio",
+      "benchmark": "timer_zero",
+      "category": "scheduler",
+      "description": "Immediate timer scheduling through loop.call_later(0, ...)",
+      "iterations": 20000,
+      "repeats": 3,
+      "unit": "timers",
+      "samples": [
+        0.030072417001065332,
+        0.02995191700028954,
+        0.03012375000253087
+      ],
+      "median": 0.030072417001065332,
+      "mean": 0.030049361334628582,
+      "minimum": 0.02995191700028954,
+      "ns_per_unit": 1503.6208500532666
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "timer_zero",
+      "category": "scheduler",
+      "description": "Immediate timer scheduling through loop.call_later(0, ...)",
+      "iterations": 20000,
+      "repeats": 3,
+      "unit": "timers",
+      "samples": [
+        0.007186124996223953,
+        0.007143499999074265,
+        0.0070212089995038696
+      ],
+      "median": 0.007143499999074265,
+      "mean": 0.007116944664934029,
+      "minimum": 0.0070212089995038696,
+      "ns_per_unit": 357.17499995371327
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "timer_zero",
+      "category": "scheduler",
+      "description": "Immediate timer scheduling through loop.call_later(0, ...)",
+      "iterations": 20000,
+      "repeats": 3,
+      "unit": "timers",
+      "samples": [
+        0.008343333000084385,
+        0.008234375003667083,
+        0.008454749993688893
+      ],
+      "median": 0.008343333000084385,
+      "mean": 0.008344152665813453,
+      "minimum": 0.008234375003667083,
+      "ns_per_unit": 417.16665000421926
+    },
+    {
+      "loop": "asyncio",
+      "benchmark": "socketpair_1b",
+      "category": "raw-socket",
+      "description": "Raw socketpair ping-pong with 1-byte payloads",
+      "iterations": 20000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.04451337499631336,
+        0.04285308399994392,
+        0.04301741599920206
+      ],
+      "median": 0.04301741599920206,
+      "mean": 0.04346129166515311,
+      "minimum": 0.04285308399994392,
+      "ns_per_unit": 2150.870799960103
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "socketpair_1b",
+      "category": "raw-socket",
+      "description": "Raw socketpair ping-pong with 1-byte payloads",
+      "iterations": 20000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.17282170800172025,
+        0.17266520900011528,
+        0.18082679199869744
+      ],
+      "median": 0.17282170800172025,
+      "mean": 0.17543790300017767,
+      "minimum": 0.17266520900011528,
+      "ns_per_unit": 8641.085400086013
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "socketpair_1b",
+      "category": "raw-socket",
+      "description": "Raw socketpair ping-pong with 1-byte payloads",
+      "iterations": 20000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.056189125003584195,
+        0.05926741699659033,
+        0.05682291700213682
+      ],
+      "median": 0.05682291700213682,
+      "mean": 0.05742648633410378,
+      "minimum": 0.056189125003584195,
+      "ns_per_unit": 2841.145850106841
+    },
+    {
+      "loop": "asyncio",
+      "benchmark": "socketpair_4k",
+      "category": "raw-socket",
+      "description": "Raw socketpair ping-pong with 4 KiB payloads",
+      "iterations": 5000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.013892499999201391,
+        0.013874750002287328,
+        0.014038999994227197
+      ],
+      "median": 0.013892499999201391,
+      "mean": 0.01393541666523864,
+      "minimum": 0.013874750002287328,
+      "ns_per_unit": 2778.499999840278
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "socketpair_4k",
+      "category": "raw-socket",
+      "description": "Raw socketpair ping-pong with 4 KiB payloads",
+      "iterations": 5000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.04785662499489263,
+        0.04859154100267915,
+        0.048748207998869475
+      ],
+      "median": 0.04859154100267915,
+      "mean": 0.048398791332147084,
+      "minimum": 0.04785662499489263,
+      "ns_per_unit": 9718.30820053583
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "socketpair_4k",
+      "category": "raw-socket",
+      "description": "Raw socketpair ping-pong with 4 KiB payloads",
+      "iterations": 5000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.01695008399838116,
+        0.016953250000369735,
+        0.01733504099684069
+      ],
+      "median": 0.016953250000369735,
+      "mean": 0.01707945833186386,
+      "minimum": 0.01695008399838116,
+      "ns_per_unit": 3390.650000073947
+    },
+    {
+      "loop": "asyncio",
+      "benchmark": "tcp_echo_1b",
+      "category": "stream",
+      "description": "Single TCP stream echo using asyncio streams with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.5519585000001825,
+        0.5588585000004969,
+        0.5737589999989723
+      ],
+      "median": 0.5588585000004969,
+      "mean": 0.5615253333332172,
+      "minimum": 0.5519585000001825,
+      "ns_per_unit": 55885.850000049686
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "tcp_echo_1b",
+      "category": "stream",
+      "description": "Single TCP stream echo using asyncio streams with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.2308287499981816,
+        0.23849462499492802,
+        0.2420512089956901
+      ],
+      "median": 0.23849462499492802,
+      "mean": 0.2371248613295999,
+      "minimum": 0.2308287499981816,
+      "ns_per_unit": 23849.4624994928
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "tcp_echo_1b",
+      "category": "stream",
+      "description": "Single TCP stream echo using asyncio streams with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.45566812500328524,
+        0.41601266599900555,
+        0.4421286249998957
+      ],
+      "median": 0.4421286249998957,
+      "mean": 0.4379364720007288,
+      "minimum": 0.41601266599900555,
+      "ns_per_unit": 44212.86249998957
+    },
+    {
+      "loop": "asyncio",
+      "benchmark": "tcp_echo_4k",
+      "category": "stream",
+      "description": "Single TCP stream echo using asyncio streams with 4 KiB payloads",
+      "iterations": 5000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.30354804199305363,
+        0.297791666998819,
+        0.3077722919988446
+      ],
+      "median": 0.30354804199305363,
+      "mean": 0.3030373336635724,
+      "minimum": 0.297791666998819,
+      "ns_per_unit": 60709.608398610726
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "tcp_echo_4k",
+      "category": "stream",
+      "description": "Single TCP stream echo using asyncio streams with 4 KiB payloads",
+      "iterations": 5000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.1210702919997857,
+        0.13055104199884227,
+        0.12429833399801282
+      ],
+      "median": 0.12429833399801282,
+      "mean": 0.12530655599888027,
+      "minimum": 0.1210702919997857,
+      "ns_per_unit": 24859.666799602564
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "tcp_echo_4k",
+      "category": "stream",
+      "description": "Single TCP stream echo using asyncio streams with 4 KiB payloads",
+      "iterations": 5000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.2154278330053785,
+        0.22116737499891315,
+        0.21748316700541181
+      ],
+      "median": 0.21748316700541181,
+      "mean": 0.21802612500323448,
+      "minimum": 0.2154278330053785,
+      "ns_per_unit": 43496.63340108236
+    },
+    {
+      "loop": "asyncio",
+      "benchmark": "tcp_echo_parallel",
+      "category": "stream",
+      "description": "32 concurrent stream clients with 64-byte echo payloads",
+      "iterations": 16384,
+      "repeats": 3,
+      "unit": "messages",
+      "samples": [
+        0.25860412499605445,
+        0.2488442079993547,
+        0.24478758400073275
+      ],
+      "median": 0.2488442079993547,
+      "mean": 0.2507453056653806,
+      "minimum": 0.24478758400073275,
+      "ns_per_unit": 15188.245117148113
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "tcp_echo_parallel",
+      "category": "stream",
+      "description": "32 concurrent stream clients with 64-byte echo payloads",
+      "iterations": 16384,
+      "repeats": 3,
+      "unit": "messages",
+      "samples": [
+        0.16473487499752082,
+        0.16711475000192877,
+        0.17989633300021524
+      ],
+      "median": 0.16711475000192877,
+      "mean": 0.17058198599988827,
+      "minimum": 0.16473487499752082,
+      "ns_per_unit": 10199.87487804741
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "tcp_echo_parallel",
+      "category": "stream",
+      "description": "32 concurrent stream clients with 64-byte echo payloads",
+      "iterations": 16384,
+      "repeats": 3,
+      "unit": "messages",
+      "samples": [
+        0.18762725000124192,
+        0.18230137499631383,
+        0.20922129200334894
+      ],
+      "median": 0.18762725000124192,
+      "mean": 0.19304997233363488,
+      "minimum": 0.18230137499631383,
+      "ns_per_unit": 11451.858520583613
+    },
+    {
+      "loop": "asyncio",
+      "benchmark": "tcp_bulk",
+      "category": "stream",
+      "description": "8 concurrent stream clients with 64 KiB echo payloads",
+      "iterations": 1024,
+      "repeats": 3,
+      "unit": "messages",
+      "samples": [
+        0.04256941699713934,
+        0.0456619159958791,
+        0.0612259580011596
+      ],
+      "median": 0.0456619159958791,
+      "mean": 0.049819096998059344,
+      "minimum": 0.04256941699713934,
+      "ns_per_unit": 44591.71483972568
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "tcp_bulk",
+      "category": "stream",
+      "description": "8 concurrent stream clients with 64 KiB echo payloads",
+      "iterations": 1024,
+      "repeats": 3,
+      "unit": "messages",
+      "samples": [
+        0.04451875000086147,
+        0.042586834002577234,
+        0.04505191600037506
+      ],
+      "median": 0.04451875000086147,
+      "mean": 0.044052500001271255,
+      "minimum": 0.042586834002577234,
+      "ns_per_unit": 43475.34179771628
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "tcp_bulk",
+      "category": "stream",
+      "description": "8 concurrent stream clients with 64 KiB echo payloads",
+      "iterations": 1024,
+      "repeats": 3,
+      "unit": "messages",
+      "samples": [
+        0.04314624999824446,
+        0.0422778330030269,
+        0.04509129100188147
+      ],
+      "median": 0.04314624999824446,
+      "mean": 0.04350512466771761,
+      "minimum": 0.0422778330030269,
+      "ns_per_unit": 42135.0097639106
+    },
+    {
+      "loop": "asyncio",
+      "benchmark": "tcp_sock_1b",
+      "category": "raw-socket",
+      "description": "TCP echo through loop.sock_* helpers with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.6249815839983057,
+        0.6303387499938253,
+        0.6319212919988786
+      ],
+      "median": 0.6303387499938253,
+      "mean": 0.6290805419970033,
+      "minimum": 0.6249815839983057,
+      "ns_per_unit": 63033.87499938253
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "tcp_sock_1b",
+      "category": "raw-socket",
+      "description": "TCP echo through loop.sock_* helpers with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.3120959580046474,
+        0.3054551250024815,
+        0.3195115420021466
+      ],
+      "median": 0.3120959580046474,
+      "mean": 0.3123542083364252,
+      "minimum": 0.3054551250024815,
+      "ns_per_unit": 31209.595800464736
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "tcp_sock_1b",
+      "category": "raw-socket",
+      "description": "TCP echo through loop.sock_* helpers with 1-byte payloads",
+      "iterations": 10000,
+      "repeats": 3,
+      "unit": "roundtrips",
+      "samples": [
+        0.4929556670031161,
+        0.4840430420008488,
+        0.5078434590031975
+      ],
+      "median": 0.4929556670031161,
+      "mean": 0.4949473893357208,
+      "minimum": 0.4840430420008488,
+      "ns_per_unit": 49295.56670031161
+    },
+    {
+      "loop": "asyncio",
+      "benchmark": "tcp_connect",
+      "category": "connection",
+      "description": "Connection open/close churn against a local server",
+      "iterations": 64,
+      "repeats": 3,
+      "unit": "connections",
+      "samples": [
+        0.011666291997244116,
+        0.011536166995938402,
+        0.011248457994952332
+      ],
+      "median": 0.011536166995938402,
+      "mean": 0.01148363899604495,
+      "minimum": 0.011248457994952332,
+      "ns_per_unit": 180252.60931153753
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "tcp_connect",
+      "category": "connection",
+      "description": "Connection open/close churn against a local server",
+      "iterations": 64,
+      "repeats": 3,
+      "unit": "connections",
+      "samples": [
+        0.011309250003250781,
+        0.01238924999779556,
+        0.010746917003416456
+      ],
+      "median": 0.011309250003250781,
+      "mean": 0.011481805668154266,
+      "minimum": 0.010746917003416456,
+      "ns_per_unit": 176707.03130079346
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "tcp_connect",
+      "category": "connection",
+      "description": "Connection open/close churn against a local server",
+      "iterations": 64,
+      "repeats": 3,
+      "unit": "connections",
+      "samples": [
+        0.007367457998043392,
+        0.010154292001971044,
+        0.008625374997791369
+      ],
+      "median": 0.008625374997791369,
+      "mean": 0.008715708332601935,
+      "minimum": 0.007367457998043392,
+      "ns_per_unit": 134771.48434049013
+    },
+    {
+      "loop": "asyncio",
+      "benchmark": "tcp_idle_fanout",
+      "category": "connection",
+      "description": "Open many idle TCP connections and tear them down",
+      "iterations": 128,
+      "repeats": 3,
+      "unit": "connections",
+      "samples": [
+        0.025166832994727883,
+        0.023283499998797197,
+        0.025126417000137735
+      ],
+      "median": 0.025126417000137735,
+      "mean": 0.02452558333122094,
+      "minimum": 0.023283499998797197,
+      "ns_per_unit": 196300.13281357606
+    },
+    {
+      "loop": "uvloop",
+      "benchmark": "tcp_idle_fanout",
+      "category": "connection",
+      "description": "Open many idle TCP connections and tear them down",
+      "iterations": 128,
+      "repeats": 3,
+      "unit": "connections",
+      "samples": [
+        0.01919445900421124,
+        0.017840458000137005,
+        0.017958374999579974
+      ],
+      "median": 0.017958374999579974,
+      "mean": 0.018331097334642738,
+      "minimum": 0.017840458000137005,
+      "ns_per_unit": 140299.80468421854
+    },
+    {
+      "loop": "kioto",
+      "benchmark": "tcp_idle_fanout",
+      "category": "connection",
+      "description": "Open many idle TCP connections and tear them down",
+      "iterations": 128,
+      "repeats": 3,
+      "unit": "connections",
+      "samples": [
+        0.01918654199835146,
+        0.016412167002272326,
+        0.017634125004406087
+      ],
+      "median": 0.017634125004406087,
+      "mean": 0.017744278001676623,
+      "minimum": 0.016412167002272326,
+      "ns_per_unit": 137766.60159692256
+    }
+  ],
+  "comparisons": [
+    {
+      "benchmark": "call_soon",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.8102758236060559
+    },
+    {
+      "benchmark": "call_soon",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 0.989518165720974
+    },
+    {
+      "benchmark": "call_soon",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    },
+    {
+      "benchmark": "call_soon_threadsafe",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 9.83322193639903
+    },
+    {
+      "benchmark": "call_soon_threadsafe",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.3071112787925474
+    },
+    {
+      "benchmark": "call_soon_threadsafe",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    },
+    {
+      "benchmark": "sleep_zero",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.1675097457778132
+    },
+    {
+      "benchmark": "sleep_zero",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 0.6732934090936364
+    },
+    {
+      "benchmark": "sleep_zero",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    },
+    {
+      "benchmark": "socketpair_1b",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 0.24891211003871033
+    },
+    {
+      "benchmark": "socketpair_1b",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 0.3287950203661406
+    },
+    {
+      "benchmark": "socketpair_1b",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    },
+    {
+      "benchmark": "socketpair_4k",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 0.28590367196700783
+    },
+    {
+      "benchmark": "socketpair_4k",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 0.3488930305675014
+    },
+    {
+      "benchmark": "socketpair_4k",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    },
+    {
+      "benchmark": "tcp_bulk",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.025678303972944
+    },
+    {
+      "benchmark": "tcp_bulk",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 0.9691702933575076
+    },
+    {
+      "benchmark": "tcp_bulk",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    },
+    {
+      "benchmark": "tcp_connect",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.02006472512522
+    },
+    {
+      "benchmark": "tcp_connect",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 0.7626832013893098
+    },
+    {
+      "benchmark": "tcp_connect",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    },
+    {
+      "benchmark": "tcp_echo_1b",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 2.343275031931566
+    },
+    {
+      "benchmark": "tcp_echo_1b",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.8538305633063985
+    },
+    {
+      "benchmark": "tcp_echo_1b",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    },
+    {
+      "benchmark": "tcp_echo_4k",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 2.442092602768968
+    },
+    {
+      "benchmark": "tcp_echo_4k",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.7496869025524409
+    },
+    {
+      "benchmark": "tcp_echo_4k",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    },
+    {
+      "benchmark": "tcp_echo_parallel",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.4890619050471765
+    },
+    {
+      "benchmark": "tcp_echo_parallel",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.1227450000617922
+    },
+    {
+      "benchmark": "tcp_echo_parallel",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    },
+    {
+      "benchmark": "tcp_idle_fanout",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.399147584384746
+    },
+    {
+      "benchmark": "tcp_idle_fanout",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 0.9819443577060023
+    },
+    {
+      "benchmark": "tcp_idle_fanout",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    },
+    {
+      "benchmark": "tcp_sock_1b",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 2.019695333524438
+    },
+    {
+      "benchmark": "tcp_sock_1b",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.579500324691086
+    },
+    {
+      "benchmark": "tcp_sock_1b",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    },
+    {
+      "benchmark": "timer_zero",
+      "loop": "asyncio",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 4.209759502339533
+    },
+    {
+      "benchmark": "timer_zero",
+      "loop": "kioto",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.1679615036278586
+    },
+    {
+      "benchmark": "timer_zero",
+      "loop": "uvloop",
+      "baseline": "uvloop",
+      "ratio_to_baseline": 1.0
+    }
+  ]
+}

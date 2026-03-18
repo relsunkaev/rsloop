@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use std::cell::RefCell;
 use std::os::fd::RawFd;
 
 use pyo3::prelude::*;
@@ -10,9 +11,9 @@ const SEGMENT_BITS: usize = 8;
 const SEGMENT_SIZE: usize = 1 << SEGMENT_BITS;
 const SEGMENT_MASK: usize = SEGMENT_SIZE - 1;
 
-#[pyclass(module = "kioto._kioto")]
+#[pyclass(module = "kioto._kioto", unsendable)]
 pub struct SocketStateRegistry {
-    segments: Vec<Option<Box<[Option<Py<SocketState>>]>>>,
+    segments: RefCell<Vec<Option<Box<[Option<Py<SocketState>>]>>>>,
 }
 
 #[pymethods]
@@ -20,31 +21,26 @@ impl SocketStateRegistry {
     #[new]
     fn new() -> Self {
         Self {
-            segments: Vec::new(),
+            segments: RefCell::new(Vec::new()),
         }
     }
 
-    fn register(&mut self, fd: i32, state: Py<SocketState>) {
+    fn register(&self, fd: i32, state: Py<SocketState>) {
         self.register_inner(fd as RawFd, state);
     }
 
-    fn unregister(&mut self, fd: i32) {
+    fn unregister(&self, fd: i32) {
         self.unregister_inner(fd as RawFd);
     }
 
-    fn clear(&mut self) {
-        self.segments.clear();
+    fn clear(&self) {
+        self.segments.borrow_mut().clear();
     }
 }
 
 impl SocketStateRegistry {
-    pub(crate) fn dispatch_one(
-        &self,
-        py: Python<'_>,
-        fd: i32,
-        mask: u8,
-    ) -> PyResult<bool> {
-        let Some(state) = self.get(fd as RawFd) else {
+    pub(crate) fn dispatch_one(&self, py: Python<'_>, fd: i32, mask: u8) -> PyResult<bool> {
+        let Some(state) = self.get(py, fd as RawFd) else {
             return Ok(false);
         };
         let bound = state.bind(py);
@@ -59,16 +55,18 @@ impl SocketStateRegistry {
         Ok(true)
     }
 
-    pub(crate) fn register_inner(&mut self, fd: RawFd, state: Py<SocketState>) {
+    pub(crate) fn register_inner(&self, fd: RawFd, state: Py<SocketState>) {
         let index = fd as usize;
-        let segment = self.segment_mut(index);
+        let mut segments = self.segments.borrow_mut();
+        let segment = Self::segment_mut(&mut segments, index);
         segment[index & SEGMENT_MASK] = Some(state);
     }
 
-    pub(crate) fn unregister_inner(&mut self, fd: RawFd) {
+    pub(crate) fn unregister_inner(&self, fd: RawFd) {
         let index = fd as usize;
         let segment_index = index >> SEGMENT_BITS;
-        let Some(Some(segment)) = self.segments.get_mut(segment_index) else {
+        let mut segments = self.segments.borrow_mut();
+        let Some(Some(segment)) = segments.get_mut(segment_index) else {
             return;
         };
         segment[index & SEGMENT_MASK] = None;
@@ -89,18 +87,22 @@ impl SocketStateRegistry {
         Ok(())
     }
 
-    fn get(&self, fd: RawFd) -> Option<&Py<SocketState>> {
+    fn get(&self, py: Python<'_>, fd: RawFd) -> Option<Py<SocketState>> {
         let index = fd as usize;
-        let segment = self.segments.get(index >> SEGMENT_BITS)?.as_ref()?;
-        segment[index & SEGMENT_MASK].as_ref()
+        let segments = self.segments.borrow();
+        let segment = segments.get(index >> SEGMENT_BITS)?.as_ref()?;
+        segment[index & SEGMENT_MASK].as_ref().map(|state| state.clone_ref(py))
     }
 
-    fn segment_mut(&mut self, index: usize) -> &mut [Option<Py<SocketState>>] {
+    fn segment_mut(
+        segments: &mut Vec<Option<Box<[Option<Py<SocketState>>]>>>,
+        index: usize,
+    ) -> &mut [Option<Py<SocketState>>] {
         let segment_index = index >> SEGMENT_BITS;
-        if segment_index >= self.segments.len() {
-            self.segments.resize_with(segment_index + 1, || None);
+        if segment_index >= segments.len() {
+            segments.resize_with(segment_index + 1, || None);
         }
-        self.segments[segment_index]
+        segments[segment_index]
             .get_or_insert_with(|| {
                 let mut segment = Vec::with_capacity(SEGMENT_SIZE);
                 segment.resize_with(SEGMENT_SIZE, || None);
