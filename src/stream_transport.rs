@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::os::fd::RawFd;
 use std::ptr;
+use std::sync::OnceLock;
 
 use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError};
 use pyo3::ffi;
@@ -18,6 +19,7 @@ const DEFAULT_STREAM_READ_SIZE: usize = 64 * 1024;
 const NATIVE_READEXACTLY_LIMIT: usize = 16 * 1024;
 const WRITE_HIGH_WATER: usize = 64 * 1024;
 const WRITE_LOW_WATER: usize = 16 * 1024;
+static TRACE_STREAM: OnceLock<bool> = OnceLock::new();
 
 struct PendingRead {
     size: usize,
@@ -25,7 +27,7 @@ struct PendingRead {
 }
 
 struct PendingWrite {
-    data: Py<PyBytes>,
+    data: Vec<u8>,
     sent: usize,
 }
 
@@ -345,20 +347,11 @@ impl StreamTransport {
         Ok(())
     }
 
-    fn write_bytes_object_inner(
-        &mut self,
-        py: Python<'_>,
-        data: &Bound<'_, PyBytes>,
-    ) -> PyResult<()> {
-        self.write_bytes_inner(py, data.as_bytes(), Some(data))
+    fn write_bytes_object_inner(&mut self, py: Python<'_>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
+        self.write_bytes_inner(py, data.as_bytes())
     }
 
-    fn write_bytes_inner(
-        &mut self,
-        py: Python<'_>,
-        data: &[u8],
-        owned: Option<&Bound<'_, PyBytes>>,
-    ) -> PyResult<()> {
+    fn write_bytes_inner(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -367,10 +360,10 @@ impl StreamTransport {
             match try_send_bytes(self.fd, data) {
                 Ok(sent) if sent == data.len() => return Ok(()),
                 Ok(sent) => {
-                    self.queue_write(py, data, sent, owned)?;
+                    self.queue_write(data, sent)?;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.queue_write(py, data, 0, owned)?;
+                    self.queue_write(data, 0)?;
                 }
                 Err(err) => {
                     return self.finish_close(
@@ -384,7 +377,7 @@ impl StreamTransport {
                 }
             }
         } else {
-            self.queue_write(py, data, 0, owned)?;
+            self.queue_write(data, 0)?;
         }
 
         self.sync_interest(py)?;
@@ -392,18 +385,9 @@ impl StreamTransport {
         Ok(())
     }
 
-    fn queue_write(
-        &mut self,
-        py: Python<'_>,
-        data: &[u8],
-        sent: usize,
-        owned: Option<&Bound<'_, PyBytes>>,
-    ) -> PyResult<()> {
-        let data = match owned {
-            Some(bytes) => bytes.clone().unbind(),
-            None => PyBytes::new(py, data).unbind(),
-        };
-        let len = data.bind(py).as_bytes().len();
+    fn queue_write(&mut self, data: &[u8], sent: usize) -> PyResult<()> {
+        let data = data.to_vec();
+        let len = data.len();
         let sent = sent.min(len);
         self.pending_write_bytes += len.saturating_sub(sent);
         self.write_queue.push_back(PendingWrite { data, sent });
@@ -414,7 +398,7 @@ impl StreamTransport {
         if self.closing || self.closed || self.read_paused {
             return Ok(());
         }
-        if env::var_os("KIOTO_TRACE_STREAM").is_some() {
+        if trace_stream_enabled() {
             eprintln!(
                 "stream-transport readable fd={} closing={} paused={}",
                 self.fd, self.closing, self.read_paused
@@ -423,7 +407,7 @@ impl StreamTransport {
         loop {
             match recv_into(self.fd, &mut self.read_buffer) {
                 Ok(0) => {
-                    if env::var_os("KIOTO_TRACE_STREAM").is_some() {
+                    if trace_stream_enabled() {
                         eprintln!("stream-transport eof fd={}", self.fd);
                     }
                     self.remove_reader(py)?;
@@ -434,7 +418,7 @@ impl StreamTransport {
                     return Ok(());
                 }
                 Ok(n) => {
-                    if env::var_os("KIOTO_TRACE_STREAM").is_some() {
+                    if trace_stream_enabled() {
                         eprintln!("stream-transport read fd={} bytes={}", self.fd, n);
                     }
                     self.feed_read_buffer_inner(py, n)?;
@@ -458,24 +442,23 @@ impl StreamTransport {
     }
 
     pub(crate) fn on_writable(&mut self, py: Python<'_>) -> PyResult<()> {
-        if env::var_os("KIOTO_TRACE_STREAM").is_some() {
+        if trace_stream_enabled() {
             eprintln!(
                 "stream-transport writable fd={} queued={}",
                 self.fd, self.pending_write_bytes
             );
         }
         while let Some(write) = self.write_queue.front_mut() {
-            let write_data = write.data.bind(py);
-            let write_bytes = write_data.as_bytes();
-            match try_send_bytes(self.fd, &write_bytes[write.sent..]) {
+            let write_bytes = &write.data[write.sent..];
+            match try_send_bytes(self.fd, write_bytes) {
                 Ok(0) => break,
                 Ok(sent) => {
-                    if env::var_os("KIOTO_TRACE_STREAM").is_some() {
+                    if trace_stream_enabled() {
                         eprintln!("stream-transport wrote fd={} bytes={}", self.fd, sent);
                     }
                     write.sent += sent;
                     self.pending_write_bytes = self.pending_write_bytes.saturating_sub(sent);
-                    if write.sent == write_bytes.len() {
+                    if write.sent == write.data.len() {
                         self.write_queue.pop_front();
                     }
                 }
@@ -562,6 +545,9 @@ impl StreamTransport {
         let readable = !self.read_paused && !self.closed && !self.closing;
         let writable =
             !self.closed && (self.pending_write_bytes != 0 || (self.closing && !self.closed));
+        if readable == self.reader_registered && writable == self.writer_registered {
+            return Ok(());
+        }
         self.reader_registered = readable;
         self.writer_registered = writable;
         self.poller
@@ -853,6 +839,10 @@ impl StreamTransport {
         }
         Ok(())
     }
+}
+
+fn trace_stream_enabled() -> bool {
+    *TRACE_STREAM.get_or_init(|| env::var_os("KIOTO_TRACE_STREAM").is_some())
 }
 
 struct SyncPyMethodDef(ffi::PyMethodDef);
