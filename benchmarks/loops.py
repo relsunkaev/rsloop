@@ -195,6 +195,14 @@ async def bench_tcp_echo_parallel(count: int) -> None:
     await tcp_stream_echo_parallel(count, clients=32, payload_size=64)
 
 
+async def bench_tcp_rpc(count: int) -> None:
+    await tcp_stream_rpc(count, request_size=64, response_size=256)
+
+
+async def bench_tcp_rpc_parallel(count: int) -> None:
+    await tcp_stream_rpc_parallel(count, clients=32, request_size=64, response_size=256)
+
+
 async def bench_tcp_bulk(count: int) -> None:
     await tcp_stream_echo_parallel(count, clients=8, payload_size=65536)
 
@@ -327,6 +335,89 @@ async def tcp_stream_echo_parallel(count: int, clients: int, payload_size: int) 
                 await writer.drain()
                 data = await reader.readexactly(payload_size)
                 if data != payload:
+                    raise RuntimeError(f"unexpected payload size={len(data)}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    try:
+        await asyncio.gather(*(client() for _ in range(clients)))
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def tcp_stream_rpc(count: int, request_size: int, response_size: int) -> None:
+    request = b"r" * request_size
+    response = b"s" * response_size
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                data = await reader.readexactly(request_size)
+                if data != request:
+                    raise RuntimeError(f"unexpected payload size={len(data)}")
+                writer.write(response)
+                await writer.drain()
+        except asyncio.IncompleteReadError:
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    try:
+        reader, writer = await asyncio.open_connection(host, port)
+        for _ in range(count):
+            writer.write(request)
+            await writer.drain()
+            data = await reader.readexactly(response_size)
+            if data != response:
+                raise RuntimeError(f"unexpected payload size={len(data)}")
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def tcp_stream_rpc_parallel(
+    count: int,
+    clients: int,
+    request_size: int,
+    response_size: int,
+) -> None:
+    request = b"r" * request_size
+    response = b"s" * response_size
+    per_client = max(1, count // clients)
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                data = await reader.readexactly(request_size)
+                if data != request:
+                    raise RuntimeError(f"unexpected payload size={len(data)}")
+                writer.write(response)
+                await writer.drain()
+        except asyncio.IncompleteReadError:
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    async def client() -> None:
+        reader, writer = await asyncio.open_connection(host, port)
+        try:
+            for _ in range(per_client):
+                writer.write(request)
+                await writer.drain()
+                data = await reader.readexactly(response_size)
+                if data != response:
                     raise RuntimeError(f"unexpected payload size={len(data)}")
         finally:
             writer.close()
@@ -472,6 +563,22 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         unit="messages",
         func=bench_tcp_echo_parallel,
     ),
+    "tcp_rpc": BenchmarkSpec(
+        name="tcp_rpc",
+        description="Single TCP request/response stream with 64-byte requests and 256-byte responses",
+        category="stream",
+        default_iterations=10_000,
+        unit="roundtrips",
+        func=bench_tcp_rpc,
+    ),
+    "tcp_rpc_parallel": BenchmarkSpec(
+        name="tcp_rpc_parallel",
+        description="32 concurrent TCP request/response clients with 64-byte requests and 256-byte responses",
+        category="stream",
+        default_iterations=16_384,
+        unit="messages",
+        func=bench_tcp_rpc_parallel,
+    ),
     "tcp_bulk": BenchmarkSpec(
         name="tcp_bulk",
         description="8 concurrent stream clients with 64 KiB echo payloads",
@@ -516,6 +623,8 @@ PROFILE_BENCHMARKS = {
         "timer_zero",
         "tcp_echo_1b",
         "tcp_echo_parallel",
+        "tcp_rpc",
+        "tcp_rpc_parallel",
         "tcp_sock_1b",
         "tcp_connect",
     ],

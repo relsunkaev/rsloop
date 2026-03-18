@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::env;
+use std::sync::OnceLock;
 use std::os::fd::RawFd;
 
 use pyo3::prelude::*;
@@ -44,10 +45,15 @@ impl StreamTransportRegistry {
 
 impl StreamTransportRegistry {
     pub(crate) fn dispatch_one(&self, py: Python<'_>, fd: i32, mask: u8) -> PyResult<bool> {
-        let Some(transport) = self.get(py, fd as RawFd) else {
+        let index = fd as usize;
+        let segments = self.segments.borrow();
+        let Some(segment) = segments.get(index >> SEGMENT_BITS).and_then(|segment| segment.as_ref()) else {
             return Ok(false);
         };
-        if env::var_os("KIOTO_TRACE_STREAM").is_some() {
+        let Some(transport) = segment[index & SEGMENT_MASK].as_ref() else {
+            return Ok(false);
+        };
+        if trace_stream_enabled() {
             eprintln!("stream-registry dispatch mask={mask}");
         }
         let bound = transport.bind(py);
@@ -70,7 +76,12 @@ impl StreamTransportRegistry {
                 std::mem::take(&mut *queued)
             };
             for (fd, token) in drained {
-                let Some(transport) = self.get(py, fd) else {
+                let index = fd as usize;
+                let segments = self.segments.borrow();
+                let Some(segment) = segments.get(index >> SEGMENT_BITS).and_then(|segment| segment.as_ref()) else {
+                    continue;
+                };
+                let Some(transport) = segment[index & SEGMENT_MASK].as_ref() else {
                     continue;
                 };
                 let mut transport = transport.bind(py).borrow_mut();
@@ -115,13 +126,6 @@ impl StreamTransportRegistry {
         Ok(())
     }
 
-    fn get(&self, py: Python<'_>, fd: RawFd) -> Option<Py<StreamTransport>> {
-        let index = fd as usize;
-        let segments = self.segments.borrow();
-        let segment = segments.get(index >> SEGMENT_BITS)?.as_ref()?;
-        segment[index & SEGMENT_MASK].as_ref().map(|transport| transport.clone_ref(py))
-    }
-
     fn segment_mut(
         segments: &mut Vec<Option<Box<[Option<Py<StreamTransport>>]>>>,
         index: usize,
@@ -138,4 +142,9 @@ impl StreamTransportRegistry {
             })
             .as_mut()
     }
+}
+
+fn trace_stream_enabled() -> bool {
+    static TRACE_STREAM: OnceLock<bool> = OnceLock::new();
+    *TRACE_STREAM.get_or_init(|| env::var_os("KIOTO_TRACE_STREAM").is_some())
 }

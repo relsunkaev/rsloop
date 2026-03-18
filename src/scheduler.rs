@@ -73,6 +73,12 @@ struct PhaseStats {
     poll_waits: u64,
     completion_items: u64,
     ready_handles: u64,
+    fd_events: u64,
+    stream_fd_hits: u64,
+    socket_fd_hits: u64,
+    generic_fd_hits: u64,
+    ready_local_items: u64,
+    ready_remote_items: u64,
     select: Duration,
     fd_dispatch: Duration,
     completions: Duration,
@@ -279,12 +285,18 @@ impl Scheduler {
 
         if profiling {
             eprintln!(
-                "kioto scheduler phases iterations={} direct_waits={} poll_waits={} completion_items={} ready_handles={} select={:.6}s fd_dispatch={:.6}s completions={:.6}s timers={:.6}s ready={:.6}s writes={:.6}s",
+                "kioto scheduler phases iterations={} direct_waits={} poll_waits={} completion_items={} ready_handles={} fd_events={} stream_fd_hits={} socket_fd_hits={} generic_fd_hits={} ready_local_items={} ready_remote_items={} select={:.6}s fd_dispatch={:.6}s completions={:.6}s timers={:.6}s ready={:.6}s writes={:.6}s",
                 stats.iterations,
                 stats.direct_waits,
                 stats.poll_waits,
                 stats.completion_items,
                 stats.ready_handles,
+                stats.fd_events,
+                stats.stream_fd_hits,
+                stats.socket_fd_hits,
+                stats.generic_fd_hits,
+                stats.ready_local_items,
+                stats.ready_remote_items,
                 stats.select.as_secs_f64(),
                 stats.fd_dispatch.as_secs_f64(),
                 stats.completions.as_secs_f64(),
@@ -400,6 +412,9 @@ impl Scheduler {
                 let socket_registry = socket_registry.as_ref().map(|registry| registry.borrow());
                 generic_fd_events.clear();
                 for (fd, mask) in fd_events.iter().copied() {
+                    if let Some(stats) = stats.as_deref_mut() {
+                        stats.fd_events += 1;
+                    }
                     if self_pipe_fd.is_some_and(|self_pipe_fd| fd == self_pipe_fd) {
                         drain_self_pipe_fd(fd)?;
                         if let Some(native_api) = native_api {
@@ -408,12 +423,21 @@ impl Scheduler {
                         continue;
                     }
                     if stream_registry.dispatch_one(py, fd, mask)? {
+                        if let Some(stats) = stats.as_deref_mut() {
+                            stats.stream_fd_hits += 1;
+                        }
                         continue;
                     }
                     if let Some(socket_registry) = socket_registry.as_ref() {
                         if socket_registry.dispatch_one(py, fd, mask)? {
+                            if let Some(stats) = stats.as_deref_mut() {
+                                stats.socket_fd_hits += 1;
+                            }
                             continue;
                         }
+                    }
+                    if let Some(stats) = stats.as_deref_mut() {
+                        stats.generic_fd_hits += 1;
                     }
                     generic_fd_events.push((fd, mask));
                 }
@@ -427,6 +451,9 @@ impl Scheduler {
                 let socket_registry = socket_registry.borrow();
                 generic_fd_events.clear();
                 for (fd, mask) in fd_events.iter().copied() {
+                    if let Some(stats) = stats.as_deref_mut() {
+                        stats.fd_events += 1;
+                    }
                     if self_pipe_fd.is_some_and(|self_pipe_fd| fd == self_pipe_fd) {
                         drain_self_pipe_fd(fd)?;
                         if let Some(native_api) = native_api {
@@ -435,7 +462,12 @@ impl Scheduler {
                         continue;
                     }
                     if !socket_registry.dispatch_one(py, fd, mask)? {
+                        if let Some(stats) = stats.as_deref_mut() {
+                            stats.generic_fd_hits += 1;
+                        }
                         generic_fd_events.push((fd, mask));
+                    } else if let Some(stats) = stats.as_deref_mut() {
+                        stats.socket_fd_hits += 1;
                     }
                 }
                 if !generic_fd_events.is_empty() {
@@ -446,12 +478,18 @@ impl Scheduler {
             } else {
                 let mut python_fd_events = Vec::new();
                 for (fd, mask) in fd_events.iter().copied() {
+                    if let Some(stats) = stats.as_deref_mut() {
+                        stats.fd_events += 1;
+                    }
                     if self_pipe_fd.is_some_and(|self_pipe_fd| fd == self_pipe_fd) {
                         drain_self_pipe_fd(fd)?;
                         if let Some(native_api) = native_api {
                             native_api.bind(py).borrow().clear_wakeup();
                         }
                         continue;
+                    }
+                    if let Some(stats) = stats.as_deref_mut() {
+                        stats.generic_fd_hits += 1;
                     }
                     python_fd_events.push((fd, mask));
                 }
@@ -491,7 +529,14 @@ impl Scheduler {
                 + self.ready_remote_len.load(AtomicOrdering::Acquire) as u64
                 + self.ready_local.lock().len() as u64;
         }
-        self.run_ready_inner(py, &loop_obj, debug, slow_callback_duration, ready_batch)?;
+        self.run_ready_inner(
+            py,
+            &loop_obj,
+            debug,
+            slow_callback_duration,
+            ready_batch,
+            stats.as_deref_mut(),
+        )?;
         if let Some(stats) = stats.as_deref_mut() {
             stats.ready += ready_started.map(|started| started.elapsed()).unwrap_or_default();
         }
@@ -572,15 +617,19 @@ impl Scheduler {
         debug: bool,
         slow_callback_duration: f64,
         ready_batch: &mut Vec<Py<PyAny>>,
+        stats: Option<&mut PhaseStats>,
     ) -> PyResult<()> {
         if self.ready_remote_len.load(AtomicOrdering::Acquire) == 0 && self.ready_local.lock().is_empty() {
             return Ok(());
         }
         ready_batch.clear();
+        let mut ready_local_items = 0usize;
+        let mut ready_remote_items = 0usize;
         {
             let mut ready_local = self.ready_local.lock();
             if !ready_local.is_empty() {
                 let drained = std::mem::take(&mut *ready_local);
+                ready_local_items = drained.len();
                 ready_batch.extend(drained);
             }
         }
@@ -589,9 +638,14 @@ impl Scheduler {
             drained_remote += 1;
             ready_batch.push(handle);
         }
+        ready_remote_items = drained_remote;
         if drained_remote != 0 {
             self.ready_remote_len
                 .fetch_sub(drained_remote, AtomicOrdering::AcqRel);
+        }
+        if let Some(stats) = stats {
+            stats.ready_local_items += ready_local_items as u64;
+            stats.ready_remote_items += ready_remote_items as u64;
         }
 
         for handle in ready_batch.drain(..) {

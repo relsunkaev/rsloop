@@ -6,7 +6,7 @@ It now covers four workload classes:
 
 - `scheduler`: callback, timer, and cross-thread scheduling churn
 - `raw-socket`: `loop.sock_*` helpers and socketpair/TCP raw I/O
-- `stream`: asyncio streams on small, large, and concurrent payloads
+- `stream`: asyncio streams on small, large, concurrent, and request/response payloads
 - `connection`: connect/close churn and idle fanout
 
 ### Useful commands
