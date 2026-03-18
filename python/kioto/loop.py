@@ -24,15 +24,13 @@ _ORIGINAL_STREAMWRITER = _streams.StreamWriter
 
 
 class KiotoStreamWriter:
-    __slots__ = ("_transport", "_protocol", "_reader", "_loop", "_complete_fut", "write", "drain", "close", "wait_closed")
+    __slots__ = ("_transport", "_protocol", "_reader", "_loop", "write", "drain", "close", "wait_closed")
 
     def __init__(self, transport: Any, protocol: Any, reader: Any, loop: asyncio.AbstractEventLoop) -> None:
         self._transport = transport
         self._protocol = protocol
         self._reader = reader
         self._loop = loop
-        self._complete_fut = loop.create_future()
-        self._complete_fut.set_result(None)
 
         bind_write = getattr(transport, "bind_write", None)
         self.write = bind_write() if bind_write is not None else self._write
@@ -601,6 +599,8 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
             self,
             self._poller,
             self._kioto_completion_port,
+            self._stream_registry,
+            self._socket_registry,
             self._stopping,
             self._clock_resolution,
             self._debug,
@@ -621,6 +621,8 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
                     self,
                     self._poller,
                     self._kioto_completion_port,
+                    self._stream_registry,
+                    self._socket_registry,
                     self._clock_resolution,
                     self._debug,
                     self.slow_callback_duration,

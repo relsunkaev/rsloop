@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyAttributeError, PyKeyboardInterrupt, PyRuntimeError, PySystemExit};
 use pyo3::ffi;
-use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAny, PyDict, PyTuple, PyType};
@@ -863,6 +862,47 @@ impl HandleArgs {
 }
 
 impl OneArgHandle {
+    pub(crate) fn create(
+        py: Python<'_>,
+        callback: Py<PyAny>,
+        arg: Py<PyAny>,
+        loop_obj: Py<PyAny>,
+        context: Option<Py<PyAny>>,
+        when: Option<f64>,
+    ) -> PyResult<Py<PyAny>> {
+        Self::create_with_debug(py, callback, arg, loop_obj, context, when, false)
+    }
+
+    pub(crate) fn create_with_debug(
+        py: Python<'_>,
+        callback: Py<PyAny>,
+        arg: Py<PyAny>,
+        loop_obj: Py<PyAny>,
+        context: Option<Py<PyAny>>,
+        when: Option<f64>,
+        debug: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let context = match context {
+            Some(context) => context,
+            None => copy_context(py)?,
+        };
+        let source_traceback = capture_source_traceback(py, &loop_obj, Some(debug))?;
+        Ok(Py::new(
+            py,
+            OneArgHandle {
+                cancelled: AtomicBool::new(false),
+                scheduled: AtomicBool::new(when.is_some()),
+                callback,
+                arg,
+                context,
+                loop_obj,
+                when,
+                source_traceback,
+            },
+        )?
+        .into_any())
+    }
+
     pub(crate) fn run_inner(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
         Self::run_bound(slf.bind(py), py)
     }
@@ -1029,6 +1069,16 @@ pub(crate) fn make_handle(
     if args.is_empty() {
         return ZeroArgHandle::create(py, callback, loop_obj, context, when);
     }
+    if args.len() == 1 {
+        return OneArgHandle::create(
+            py,
+            callback,
+            args.get_item(0)?.unbind(),
+            loop_obj,
+            context,
+            when,
+        );
+    }
     Handle::create(py, callback, args, loop_obj, context, when)
 }
 
@@ -1057,6 +1107,18 @@ pub(crate) unsafe fn make_handle_fastcall(
 
     if arg_count == 0 {
         return ZeroArgHandle::create_with_debug(py, callback, loop_obj, context, when, debug);
+    }
+    if arg_count == 1 {
+        let arg = Bound::from_borrowed_ptr(py, *args.add(0)).unbind();
+        return OneArgHandle::create_with_debug(
+            py,
+            callback,
+            arg,
+            loop_obj,
+            context,
+            when,
+            debug,
+        );
     }
     let args = HandleArgs::from_fastcall(py, args, arg_count)?;
     Handle::create_with_debug_from_args(py, callback, args, loop_obj, context, when, debug)
@@ -1256,116 +1318,62 @@ fn run_handle(
     callback: &Py<PyAny>,
     args: &HandleArgs,
 ) -> PyResult<()> {
-    let context = context.bind(py);
     let callback = callback.bind(py);
-
-    unsafe {
-        match args {
-            HandleArgs::Two([arg0, arg1]) => {
-                let arg0 = arg0.bind(py);
-                let arg1 = arg1.bind(py);
-                let mut argv = [
-                    context.as_ptr(),
-                    callback.as_ptr(),
-                    arg0.as_ptr(),
-                    arg1.as_ptr(),
-                ];
-                Bound::from_owned_ptr_or_err(
-                    py,
-                    ffi::PyObject_VectorcallMethod(
-                        intern!(py, "run").as_ptr(),
-                        argv.as_mut_ptr(),
-                        argv.len() + ffi::PY_VECTORCALL_ARGUMENTS_OFFSET,
-                        std::ptr::null_mut(),
-                    ),
-                )?;
-            }
-            HandleArgs::Tuple(args) => match args.bind(py).len() {
-                0 => {
-                    Bound::from_owned_ptr_or_err(
-                        py,
-                        ffi::PyObject_CallMethodOneArg(
-                            context.as_ptr(),
-                            intern!(py, "run").as_ptr(),
-                            callback.as_ptr(),
-                        ),
-                    )?;
-                }
-                1 => {
-                    let args = args.bind(py);
-                    let arg0 = args.get_item(0)?;
-                    let mut argv = [context.as_ptr(), callback.as_ptr(), arg0.as_ptr()];
-                    Bound::from_owned_ptr_or_err(
-                        py,
-                        ffi::PyObject_VectorcallMethod(
-                            intern!(py, "run").as_ptr(),
-                            argv.as_mut_ptr(),
-                            argv.len() + ffi::PY_VECTORCALL_ARGUMENTS_OFFSET,
-                            std::ptr::null_mut(),
-                        ),
-                    )?;
-                }
-                2 => {
-                    let args = args.bind(py);
-                    let arg0 = args.get_item(0)?;
-                    let arg1 = args.get_item(1)?;
-                    let mut argv = [
-                        context.as_ptr(),
+    with_context(py, context, || {
+        unsafe {
+            match args {
+                HandleArgs::Two([arg0, arg1]) => {
+                    let arg0 = arg0.bind(py);
+                    let arg1 = arg1.bind(py);
+                    let mut argv = [arg0.as_ptr(), arg1.as_ptr()];
+                    Ok(ffi::PyObject_Vectorcall(
                         callback.as_ptr(),
-                        arg0.as_ptr(),
-                        arg1.as_ptr(),
-                    ];
-                    Bound::from_owned_ptr_or_err(
-                        py,
-                        ffi::PyObject_VectorcallMethod(
-                            intern!(py, "run").as_ptr(),
-                            argv.as_mut_ptr(),
-                            argv.len() + ffi::PY_VECTORCALL_ARGUMENTS_OFFSET,
-                            std::ptr::null_mut(),
-                        ),
-                    )?;
+                        argv.as_mut_ptr(),
+                        argv.len(),
+                        std::ptr::null_mut(),
+                    ))
                 }
-                _ => {
-                    let args = args.bind(py);
-                    let mut argv: Vec<*mut ffi::PyObject> = Vec::with_capacity(args.len() + 2);
-                    argv.push(context.as_ptr());
-                    argv.push(callback.as_ptr());
-                    for item in args.iter() {
-                        argv.push(item.as_ptr());
+                HandleArgs::Tuple(args) => match args.bind(py).len() {
+                    0 => Ok(ffi::PyObject_CallNoArgs(callback.as_ptr())),
+                    1 => {
+                        let args = args.bind(py);
+                        let arg0 = args.get_item(0)?;
+                        Ok(ffi::PyObject_CallOneArg(callback.as_ptr(), arg0.as_ptr()))
                     }
-                    Bound::from_owned_ptr_or_err(
-                        py,
-                        ffi::PyObject_VectorcallMethod(
-                            intern!(py, "run").as_ptr(),
+                    2 => {
+                        let args = args.bind(py);
+                        let arg0 = args.get_item(0)?;
+                        let arg1 = args.get_item(1)?;
+                        let mut argv = [arg0.as_ptr(), arg1.as_ptr()];
+                        Ok(ffi::PyObject_Vectorcall(
+                            callback.as_ptr(),
                             argv.as_mut_ptr(),
-                            argv.len() + ffi::PY_VECTORCALL_ARGUMENTS_OFFSET,
+                            argv.len(),
                             std::ptr::null_mut(),
-                        ),
-                    )?;
-                }
-            },
+                        ))
+                    }
+                    _ => {
+                        let args = args.bind(py);
+                        let mut argv: Vec<*mut ffi::PyObject> = Vec::with_capacity(args.len());
+                        for item in args.iter() {
+                            argv.push(item.as_ptr());
+                        }
+                        Ok(ffi::PyObject_Vectorcall(
+                            callback.as_ptr(),
+                            argv.as_mut_ptr(),
+                            argv.len(),
+                            std::ptr::null_mut(),
+                        ))
+                    }
+                },
+            }
         }
-    }
-
-    Ok(())
+    })
 }
 
 fn run_zero_arg_handle(py: Python<'_>, context: &Py<PyAny>, callback: &Py<PyAny>) -> PyResult<()> {
-    let context = context.bind(py);
     let callback = callback.bind(py);
-
-    unsafe {
-        Bound::from_owned_ptr_or_err(
-            py,
-            ffi::PyObject_CallMethodOneArg(
-                context.as_ptr(),
-                intern!(py, "run").as_ptr(),
-                callback.as_ptr(),
-            ),
-        )?;
-    }
-
-    Ok(())
+    with_context(py, context, || unsafe { Ok(ffi::PyObject_CallNoArgs(callback.as_ptr())) })
 }
 
 pub(crate) fn run_one_arg_handle(
@@ -1374,24 +1382,11 @@ pub(crate) fn run_one_arg_handle(
     callback: &Py<PyAny>,
     arg: &Py<PyAny>,
 ) -> PyResult<()> {
-    let context = context.bind(py);
     let callback = callback.bind(py);
     let arg = arg.bind(py);
-
-    unsafe {
-        let mut argv = [context.as_ptr(), callback.as_ptr(), arg.as_ptr()];
-        Bound::from_owned_ptr_or_err(
-            py,
-            ffi::PyObject_VectorcallMethod(
-                intern!(py, "run").as_ptr(),
-                argv.as_mut_ptr(),
-                argv.len() + ffi::PY_VECTORCALL_ARGUMENTS_OFFSET,
-                std::ptr::null_mut(),
-            ),
-        )?;
-    }
-
-    Ok(())
+    with_context(py, context, || unsafe {
+        Ok(ffi::PyObject_CallOneArg(callback.as_ptr(), arg.as_ptr()))
+    })
 }
 
 pub(crate) fn run_one_arg_direct(
@@ -1410,4 +1405,29 @@ pub(crate) fn run_one_arg_direct(
     }
 
     Ok(())
+}
+
+fn with_context<F>(py: Python<'_>, context: &Py<PyAny>, f: F) -> PyResult<()>
+where
+    F: FnOnce() -> PyResult<*mut ffi::PyObject>,
+{
+    unsafe {
+        let ctx = context.as_ptr();
+        if ffi::PyContext_Enter(ctx) != 0 {
+            return Err(PyErr::fetch(py));
+        }
+
+        let call_result = f().and_then(|obj| Bound::from_owned_ptr_or_err(py, obj).map(|_| ()));
+        let exit_result = if ffi::PyContext_Exit(ctx) != 0 {
+            Err(PyErr::fetch(py))
+        } else {
+            Ok(())
+        };
+
+        match (call_result, exit_result) {
+            (Err(err), _) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
 }

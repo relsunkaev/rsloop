@@ -32,8 +32,6 @@ struct PollerState {
     poll: Poll,
     events: Events,
     registrations: HashMap<RawFd, Registration>,
-    tokens: HashMap<usize, RawFd>,
-    next_token: usize,
 }
 
 impl PollerState {
@@ -43,15 +41,7 @@ impl PollerState {
             poll: Poll::new()?,
             events: Events::with_capacity(1024),
             registrations: HashMap::new(),
-            tokens: HashMap::new(),
-            next_token: 1,
         })
-    }
-
-    fn next_token(&mut self) -> Token {
-        let token = Token(self.next_token);
-        self.next_token += 1;
-        token
     }
 
     fn set_interest(&mut self, fd: RawFd, mask: u8) -> io::Result<()> {
@@ -83,12 +73,11 @@ impl PollerState {
             }
         }
 
-        let token = self.next_token();
+        let token = token_for_fd(fd);
         let mut source = SourceFd(&fd);
         self.poll
             .registry()
             .register(&mut source, token, to_interest(mask))?;
-        self.tokens.insert(token.0, fd);
         self.registrations.insert(
             fd,
             Registration {
@@ -101,10 +90,9 @@ impl PollerState {
     }
 
     fn remove(&mut self, fd: RawFd) -> io::Result<()> {
-        let Some(registration) = self.registrations.remove(&fd) else {
+        let Some(_registration) = self.registrations.remove(&fd) else {
             return Ok(());
         };
-        self.tokens.remove(&registration.token.0);
         let mut source = SourceFd(&fd);
         match self.poll.registry().deregister(&mut source) {
             Ok(()) => Ok(()),
@@ -123,9 +111,7 @@ impl PollerState {
         ready.clear();
         ready.reserve(self.events.iter().count());
         for event in self.events.iter() {
-            let Some(fd) = self.tokens.get(&event.token().0).copied() else {
-                continue;
-            };
+            let fd = fd_for_token(event.token());
             let mut mask = 0;
             if event.is_readable() {
                 mask |= READABLE;
@@ -184,7 +170,6 @@ impl TokioPoller {
         for fd in fds {
             let _ = state.remove(fd);
         }
-        state.tokens.clear();
     }
 }
 
@@ -219,6 +204,14 @@ impl TokioPoller {
 
 fn interest_mask(readable: bool, writable: bool) -> u8 {
     (if readable { READABLE } else { 0 }) | (if writable { WRITABLE } else { 0 })
+}
+
+fn token_for_fd(fd: RawFd) -> Token {
+    Token(fd as usize)
+}
+
+fn fd_for_token(token: Token) -> RawFd {
+    token.0 as RawFd
 }
 
 fn to_interest(mask: u8) -> Interest {
