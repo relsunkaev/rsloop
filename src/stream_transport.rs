@@ -23,6 +23,7 @@ use crate::stream_registry::StreamTransportRegistry;
 const DEFAULT_STREAM_READ_SIZE: usize = 64 * 1024;
 const NATIVE_READEXACTLY_LIMIT: usize = 16 * 1024;
 const DIRECT_WRITE_LIMIT: usize = 64;
+const WRITEV_BATCH_LIMIT: usize = 8;
 const WRITE_HIGH_WATER: usize = 64 * 1024;
 const WRITE_LOW_WATER: usize = 16 * 1024;
 static TRACE_STREAM: OnceLock<bool> = OnceLock::new();
@@ -567,21 +568,13 @@ impl StreamCore {
                 self.fd, self.pending_write_bytes
             );
         }
-        while let Some(write) = self.write_queue.front_mut() {
-            let data = write.data.bind(py);
-            let len = data.as_bytes().len();
-            let write_bytes = &data.as_bytes()[write.sent..];
-            match try_send_bytes(self.fd, write_bytes) {
+        while !self.write_queue.is_empty() {
+            match self.flush_write_once(py) {
                 Ok(0) => break,
                 Ok(sent) => {
                     record_stream_profile_event("write_flush", self.fd, sent, self.pending_write_bytes);
                     if trace_stream_enabled() {
                         eprintln!("stream-transport wrote fd={} bytes={}", self.fd, sent);
-                    }
-                    write.sent += sent;
-                    self.pending_write_bytes = self.pending_write_bytes.saturating_sub(sent);
-                    if write.sent == len {
-                        self.write_queue.pop_front();
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -610,6 +603,71 @@ impl StreamCore {
         }
 
         Ok(())
+    }
+
+    fn flush_write_once(&mut self, py: Python<'_>) -> std::io::Result<usize> {
+        if self.write_queue.len() <= 1 {
+            let Some(write) = self.write_queue.front_mut() else {
+                return Ok(0);
+            };
+            let data = write.data.bind(py);
+            let len = data.as_bytes().len();
+            let sent = try_send_bytes(self.fd, &data.as_bytes()[write.sent..])?;
+            if sent == 0 {
+                return Ok(0);
+            }
+            write.sent += sent;
+            self.pending_write_bytes = self.pending_write_bytes.saturating_sub(sent);
+            if write.sent == len {
+                self.write_queue.pop_front();
+            }
+            return Ok(sent);
+        }
+
+        let mut iovecs = Vec::with_capacity(self.write_queue.len().min(WRITEV_BATCH_LIMIT));
+        for pending in self.write_queue.iter().take(WRITEV_BATCH_LIMIT) {
+            let data = pending.data.bind(py);
+            let bytes = data.as_bytes();
+            let slice = &bytes[pending.sent..];
+            if slice.is_empty() {
+                continue;
+            }
+            iovecs.push(libc::iovec {
+                iov_base: slice.as_ptr() as *mut libc::c_void,
+                iov_len: slice.len(),
+            });
+        }
+        if iovecs.is_empty() {
+            return Ok(0);
+        }
+
+        let sent = unsafe { libc::writev(self.fd, iovecs.as_ptr(), iovecs.len() as i32) };
+        if sent < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let sent = sent as usize;
+        if sent == 0 {
+            return Ok(0);
+        }
+        self.consume_written_bytes(py, sent);
+        Ok(sent)
+    }
+
+    fn consume_written_bytes(&mut self, py: Python<'_>, mut written: usize) {
+        while written != 0 {
+            let Some(write) = self.write_queue.front_mut() else {
+                break;
+            };
+            let len = write.data.bind(py).as_bytes().len();
+            let remaining = len.saturating_sub(write.sent);
+            let consumed = written.min(remaining);
+            write.sent += consumed;
+            self.pending_write_bytes = self.pending_write_bytes.saturating_sub(consumed);
+            written -= consumed;
+            if write.sent == len {
+                self.write_queue.pop_front();
+            }
+        }
     }
 
     fn finish_half_close(&mut self) -> PyResult<()> {
