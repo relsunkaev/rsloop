@@ -130,8 +130,7 @@ impl StreamTransport {
             } else {
                 (None, None, None, 64 * 1024)
             };
-        Ok(Self {
-            core: Rc::new(RefCell::new(StreamCore {
+        let core = Rc::new(RefCell::new(StreamCore {
                 stream_token: STREAM_TOKEN.fetch_add(1, Ordering::Relaxed),
                 sock,
                 fd,
@@ -162,8 +161,8 @@ impl StreamTransport {
                 protocol_paused: false,
                 connection_lost_sent: false,
                 write_queued: false,
-            })),
-        })
+            }));
+        Ok(Self { core })
     }
 
     fn activate(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {

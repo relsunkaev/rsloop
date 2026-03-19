@@ -666,9 +666,8 @@ impl Scheduler {
         {
             let mut ready_local = self.ready_local.lock();
             if !ready_local.is_empty() {
-                let drained = std::mem::take(&mut *ready_local);
-                ready_local_items = drained.len();
-                ready_batch.extend(drained);
+                ready_local_items = ready_local.len();
+                std::mem::swap(&mut *ready_local, ready_batch);
             }
         }
         let mut drained_remote = 0usize;
