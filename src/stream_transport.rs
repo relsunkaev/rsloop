@@ -1,10 +1,12 @@
 #![cfg(unix)]
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::env;
 use std::fmt::Write as _;
 use std::os::fd::RawFd;
 use std::ptr;
+use std::rc::Rc;
 use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
 use std::time::Instant;
 
@@ -52,8 +54,9 @@ struct PendingWrite {
     sent: usize,
 }
 
-#[pyclass(module = "kioto._kioto")]
-pub struct StreamTransport {
+pub(crate) type StreamCoreRef = Rc<RefCell<StreamCore>>;
+
+pub(crate) struct StreamCore {
     pub(crate) stream_token: u64,
     sock: Py<PyAny>,
     fd: RawFd,
@@ -84,6 +87,11 @@ pub struct StreamTransport {
     protocol_paused: bool,
     connection_lost_sent: bool,
     pub(crate) write_queued: bool,
+}
+
+#[pyclass(module = "kioto._kioto", unsendable)]
+pub struct StreamTransport {
+    pub(crate) core: StreamCoreRef,
 }
 
 #[pymethods]
@@ -122,54 +130,50 @@ impl StreamTransport {
                 (None, None, None, 64 * 1024)
             };
         Ok(Self {
-            stream_token: STREAM_TOKEN.fetch_add(1, Ordering::Relaxed),
-            sock,
-            fd,
-            protocol,
-            loop_obj,
-            poller,
-            registry,
-            transports,
-            extra,
-            reader,
-            reader_readexactly,
-            close_waiter,
-            drain_fallback: None,
-            ready_drain: None,
-            buffer,
-            limit,
-            pending_read: None,
-            read_buffer: vec![0_u8; read_size.max(1)],
-            write_queue: VecDeque::new(),
-            pending_write_bytes: 0,
-            closing: false,
-            closed: false,
-            read_paused: false,
-            reader_registered: false,
-            writer_registered: false,
-            eof_requested: false,
-            eof_sent: false,
-            protocol_paused: false,
-            connection_lost_sent: false,
-            write_queued: false,
+            core: Rc::new(RefCell::new(StreamCore {
+                stream_token: STREAM_TOKEN.fetch_add(1, Ordering::Relaxed),
+                sock,
+                fd,
+                protocol,
+                loop_obj,
+                poller,
+                registry,
+                transports,
+                extra,
+                reader,
+                reader_readexactly,
+                close_waiter,
+                drain_fallback: None,
+                ready_drain: None,
+                buffer,
+                limit,
+                pending_read: None,
+                read_buffer: vec![0_u8; read_size.max(1)],
+                write_queue: VecDeque::new(),
+                pending_write_bytes: 0,
+                closing: false,
+                closed: false,
+                read_paused: false,
+                reader_registered: false,
+                writer_registered: false,
+                eof_requested: false,
+                eof_sent: false,
+                protocol_paused: false,
+                connection_lost_sent: false,
+                write_queued: false,
+            })),
         })
     }
 
     fn activate(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
-        {
-            let transport = slf.borrow(py);
-            transport
-                .transports
-                .bind(py)
-                .set_item(transport.fd, slf.bind(py))?;
-            transport
-                .registry
-                .bind(py)
-                .borrow_mut()
-                .register_inner(transport.fd, slf.clone_ref(py));
-        }
-        let mut transport = slf.borrow_mut(py);
-        transport.sync_interest(py)
+        let core = slf.borrow(py).core.clone();
+        let fd = core.borrow().fd;
+        let transports = core.borrow().transports.clone_ref(py);
+        let registry = core.borrow().registry.clone_ref(py);
+        transports.bind(py).set_item(fd, slf.bind(py))?;
+        registry.bind(py).borrow_mut().register_inner(fd, core.clone());
+        let result = core.borrow_mut().sync_interest(py);
+        result
     }
 
     fn bind_readexactly(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
@@ -185,12 +189,167 @@ impl StreamTransport {
     }
 
     fn bind_drain(slf: Py<Self>, py: Python<'_>, fallback: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        slf.borrow_mut(py).drain_fallback = Some(fallback);
+        slf.borrow(py).core.borrow_mut().drain_fallback = Some(fallback);
         create_bound_drain(py, slf.bind(py).as_any().as_unbound())
     }
 
     fn bind_wait_closed(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
         create_bound_wait_closed(slf.py(), slf.as_any().as_unbound())
+    }
+
+    fn drain_fast(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.core.borrow_mut().drain_fast(py)
+    }
+
+    fn wait_closed_fast(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.core.borrow().wait_closed_fast(py)
+    }
+
+    fn write(&mut self, py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
+        self.core.borrow_mut().write(py, data)
+    }
+
+    fn writelines(&mut self, py: Python<'_>, list_of_data: Bound<'_, PyAny>) -> PyResult<()> {
+        for item in list_of_data.try_iter()? {
+            self.write(py, item?)?;
+        }
+        Ok(())
+    }
+
+    fn write_eof(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
+        let core = slf.borrow(py).core.clone();
+        let mut transport = core.borrow_mut();
+        if transport.closing || transport.eof_requested {
+            return Ok(());
+        }
+        transport.eof_requested = true;
+        if transport.pending_write_bytes == 0 {
+            transport.finish_half_close()?;
+        } else {
+            transport.sync_interest(py)?;
+        }
+        Ok(())
+    }
+
+    fn can_write_eof(&self) -> bool {
+        true
+    }
+
+    fn close(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
+        let core = slf.borrow(py).core.clone();
+        let mut transport = core.borrow_mut();
+        if transport.closing || transport.closed {
+            return Ok(());
+        }
+        transport.closing = true;
+        transport.remove_reader(py)?;
+        if transport.pending_write_bytes == 0 {
+            transport.finish_close(py, None)?;
+        } else {
+            transport.sync_interest(py)?;
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (message=None))]
+    fn abort(slf: Py<Self>, py: Python<'_>, message: Option<String>) -> PyResult<()> {
+        let exc = message.map(|message| PyRuntimeError::new_err(message).into_value(py).into_any());
+        let core = slf.borrow(py).core.clone();
+        let mut transport = core.borrow_mut();
+        transport.finish_close(py, exc)
+    }
+
+    fn is_closing(&self) -> bool {
+        let core = self.core.borrow();
+        core.closing || core.closed
+    }
+
+    fn get_write_buffer_size(&self) -> usize {
+        self.core.borrow().pending_write_bytes
+    }
+
+    #[pyo3(signature = (name, default=None))]
+    fn get_extra_info(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        default: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let core = self.core.borrow();
+        if name == "socket" {
+            return Ok(core.sock.clone_ref(py));
+        }
+        let extra = core.extra.bind(py).cast::<PyDict>()?;
+        if let Some(value) = extra.get_item(name)? {
+            Ok(value.unbind())
+        } else if let Some(default) = default {
+            Ok(default)
+        } else {
+            Ok(py.None())
+        }
+    }
+
+    fn pause_reading(&mut self, py: Python<'_>) -> PyResult<()> {
+        let mut core = self.core.borrow_mut();
+        if core.read_paused || core.closed {
+            return Ok(());
+        }
+        core.read_paused = true;
+        core.remove_reader(py)
+    }
+
+    fn resume_reading(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
+        let core = slf.borrow(py).core.clone();
+        let mut transport = core.borrow_mut();
+        if !transport.read_paused || transport.closed || transport.closing {
+            return Ok(());
+        }
+        transport.read_paused = false;
+        transport.sync_interest(py)
+    }
+
+    fn _on_readable(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
+        let core = slf.borrow(py).core.clone();
+        let result = core.borrow_mut().on_readable(py);
+        result
+    }
+
+    fn _on_writable(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
+        let core = slf.borrow(py).core.clone();
+        let result = core.borrow_mut().on_writable(py);
+        result
+    }
+
+    pub(crate) fn on_events(&mut self, py: Python<'_>, mask: u8) -> PyResult<()> {
+        self.core.borrow_mut().on_events(py, mask)
+    }
+
+    pub(crate) fn on_read_error(&mut self, py: Python<'_>, exc: Py<PyAny>) -> PyResult<()> {
+        self.core.borrow_mut().on_read_error(py, exc)
+    }
+}
+
+impl StreamCore {
+    fn pause_reading(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.read_paused || self.closed {
+            return Ok(());
+        }
+        self.read_paused = true;
+        self.remove_reader(py)
+    }
+
+    pub(crate) fn on_events(&mut self, py: Python<'_>, mask: u8) -> PyResult<()> {
+        if mask & 0x01 != 0 {
+            self.on_readable(py)?;
+        }
+        if !self.closed && mask & 0x02 != 0 {
+            self.on_writable(py)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn on_read_error(&mut self, py: Python<'_>, exc: Py<PyAny>) -> PyResult<()> {
+        self.finish_close(py, Some(exc))
     }
 
     fn drain_fast(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
@@ -242,124 +401,6 @@ impl StreamTransport {
         Ok(())
     }
 
-    fn writelines(&mut self, py: Python<'_>, list_of_data: Bound<'_, PyAny>) -> PyResult<()> {
-        for item in list_of_data.try_iter()? {
-            self.write(py, item?)?;
-        }
-        Ok(())
-    }
-
-    fn write_eof(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
-        let mut transport = slf.borrow_mut(py);
-        if transport.closing || transport.eof_requested {
-            return Ok(());
-        }
-        transport.eof_requested = true;
-        if transport.pending_write_bytes == 0 {
-            transport.finish_half_close()?;
-        } else {
-            transport.sync_interest(py)?;
-        }
-        Ok(())
-    }
-
-    fn can_write_eof(&self) -> bool {
-        true
-    }
-
-    fn close(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
-        let mut transport = slf.borrow_mut(py);
-        if transport.closing || transport.closed {
-            return Ok(());
-        }
-        transport.closing = true;
-        transport.remove_reader(py)?;
-        if transport.pending_write_bytes == 0 {
-            transport.finish_close(py, None)?;
-        } else {
-            transport.sync_interest(py)?;
-        }
-        Ok(())
-    }
-
-    #[pyo3(signature = (message=None))]
-    fn abort(slf: Py<Self>, py: Python<'_>, message: Option<String>) -> PyResult<()> {
-        let exc = message.map(|message| PyRuntimeError::new_err(message).into_value(py).into_any());
-        let mut transport = slf.borrow_mut(py);
-        transport.finish_close(py, exc)
-    }
-
-    fn is_closing(&self) -> bool {
-        self.closing || self.closed
-    }
-
-    fn get_write_buffer_size(&self) -> usize {
-        self.pending_write_bytes
-    }
-
-    #[pyo3(signature = (name, default=None))]
-    fn get_extra_info(
-        &self,
-        py: Python<'_>,
-        name: &str,
-        default: Option<Py<PyAny>>,
-    ) -> PyResult<Py<PyAny>> {
-        if name == "socket" {
-            return Ok(self.sock.clone_ref(py));
-        }
-        let extra = self.extra.bind(py).cast::<PyDict>()?;
-        if let Some(value) = extra.get_item(name)? {
-            Ok(value.unbind())
-        } else if let Some(default) = default {
-            Ok(default)
-        } else {
-            Ok(py.None())
-        }
-    }
-
-    fn pause_reading(&mut self, py: Python<'_>) -> PyResult<()> {
-        if self.read_paused || self.closed {
-            return Ok(());
-        }
-        self.read_paused = true;
-        self.remove_reader(py)
-    }
-
-    fn resume_reading(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
-        let mut transport = slf.borrow_mut(py);
-        if !transport.read_paused || transport.closed || transport.closing {
-            return Ok(());
-        }
-        transport.read_paused = false;
-        transport.sync_interest(py)
-    }
-
-    fn _on_readable(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
-        let mut transport = slf.borrow_mut(py);
-        transport.on_readable(py)
-    }
-
-    fn _on_writable(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
-        let mut transport = slf.borrow_mut(py);
-        transport.on_writable(py)
-    }
-
-    pub(crate) fn on_events(&mut self, py: Python<'_>, mask: u8) -> PyResult<()> {
-        if mask & 0x01 != 0 {
-            self.on_readable(py)?;
-        }
-        if !self.closed && mask & 0x02 != 0 {
-            self.on_writable(py)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn on_read_error(&mut self, py: Python<'_>, exc: Py<PyAny>) -> PyResult<()> {
-        self.finish_close(py, Some(exc))
-    }
-}
-
-impl StreamTransport {
     fn ensure_can_write(&self) -> PyResult<()> {
         if self.closing || self.closed {
             return Err(PyRuntimeError::new_err("stream transport is closing"));
@@ -1118,14 +1159,15 @@ unsafe extern "C" fn stream_transport_readexactly_c(
     let py = Python::assume_attached();
     let result = (|| -> PyResult<Py<PyAny>> {
         let transport = Bound::from_borrowed_ptr(py, slf).cast_into_unchecked::<StreamTransport>();
-        let mut transport_ref = transport.borrow_mut();
+        let core = transport.borrow().core.clone();
         let size = Bound::<PyAny>::from_borrowed_ptr(py, arg).extract::<isize>()?;
         if size < 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "readexactly size can not be less than zero",
             ));
         }
-        transport_ref.readexactly_inner(py, size as usize)
+        let result = core.borrow_mut().readexactly_inner(py, size as usize);
+        result
     })();
 
     match result {
@@ -1144,8 +1186,9 @@ unsafe extern "C" fn stream_transport_drain_c(
     let py = Python::assume_attached();
     let result = (|| -> PyResult<Py<PyAny>> {
         let transport = Bound::from_borrowed_ptr(py, slf).cast_into_unchecked::<StreamTransport>();
-        let mut transport_ref = transport.borrow_mut();
-        transport_ref.drain_inner(py)
+        let core = transport.borrow().core.clone();
+        let result = core.borrow_mut().drain_inner(py);
+        result
     })();
 
     match result {
@@ -1164,7 +1207,8 @@ unsafe extern "C" fn stream_transport_write_c(
     let py = Python::assume_attached();
     let result = (|| -> PyResult<Py<PyAny>> {
         let transport = Bound::from_borrowed_ptr(py, slf).cast_into_unchecked::<StreamTransport>();
-        let mut transport_ref = transport.borrow_mut();
+        let core = transport.borrow().core.clone();
+        let mut transport_ref = core.borrow_mut();
         if ffi::PyBytes_Check(arg) != 0 {
             transport_ref.ensure_can_write()?;
             let data = Bound::<PyAny>::from_borrowed_ptr(py, arg).cast_into_unchecked::<PyBytes>();
@@ -1212,17 +1256,9 @@ unsafe extern "C" fn stream_transport_wait_closed_c(
     let py = Python::assume_attached();
     let result = (|| -> PyResult<Py<PyAny>> {
         let transport = Bound::from_borrowed_ptr(py, slf).cast_into_unchecked::<StreamTransport>();
-        let transport_ref = transport.borrow();
-        if let Some(waiter) = transport_ref.close_waiter.as_ref() {
-            return Ok(waiter.clone_ref(py));
-        }
-        let future = transport_ref
-            .loop_obj
-            .bind(py)
-            .call_method0("create_future")?
-            .unbind();
-        future.bind(py).call_method1("set_result", (py.None(),))?;
-        Ok(future)
+        let core = transport.borrow().core.clone();
+        let result = core.borrow().wait_closed_fast(py);
+        result
     })();
 
     match result {

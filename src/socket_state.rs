@@ -1,9 +1,11 @@
 #![cfg(unix)]
 
+use std::cell::RefCell;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::RawFd;
+use std::rc::Rc;
 
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyBlockingIOError, PyInterruptedError, PyRuntimeError};
@@ -54,8 +56,9 @@ struct PendingConnect {
     future: Py<PyAny>,
 }
 
-#[pyclass(module = "kioto._kioto")]
-pub struct SocketState {
+pub(crate) type SocketCoreRef = Rc<RefCell<SocketCore>>;
+
+pub(crate) struct SocketCore {
     sock: Py<PyAny>,
     fd: RawFd,
     poller: Py<TokioPoller>,
@@ -65,6 +68,11 @@ pub struct SocketState {
     writes: VecDeque<PendingSend>,
     connects: VecDeque<PendingConnect>,
     closed: bool,
+}
+
+#[pyclass(module = "kioto._kioto", unsendable)]
+pub struct SocketState {
+    pub(crate) core: SocketCoreRef,
 }
 
 #[pymethods]
@@ -81,31 +89,33 @@ impl SocketState {
             .getattr("_socket_registry")?
             .extract::<Py<SocketStateRegistry>>()?;
         Ok(Self {
-            sock,
-            fd,
-            poller,
-            registry,
-            read_buffer: vec![0; 64 * 1024],
-            reads: VecDeque::new(),
-            writes: VecDeque::new(),
-            connects: VecDeque::new(),
-            closed: false,
+            core: Rc::new(RefCell::new(SocketCore {
+                sock,
+                fd,
+                poller,
+                registry,
+                read_buffer: vec![0; 64 * 1024],
+                reads: VecDeque::new(),
+                writes: VecDeque::new(),
+                connects: VecDeque::new(),
+                closed: false,
+            })),
         })
     }
 
     #[getter]
     fn sock(&self, py: Python<'_>) -> Py<PyAny> {
-        self.sock.clone_ref(py)
+        self.core.borrow().sock.clone_ref(py)
     }
 
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        self.close_inner(py)
+        self.core.borrow_mut().close_inner(py)
     }
 
     fn enqueue_recv(&mut self, py: Python<'_>, future: Py<PyAny>, size: usize) -> PyResult<()> {
-        self.reads
+        self.core.borrow_mut().reads
             .push_back(PendingRead::Recv(PendingRecv { future, size }));
-        self.sync_interest(py)
+        self.core.borrow().sync_interest(py)
     }
 
     fn enqueue_recv_into(
@@ -116,15 +126,15 @@ impl SocketState {
     ) -> PyResult<()> {
         // Validate once up front so the async path doesn't fail after registration.
         let _ = bytes_like_len(buffer.bind(py))?;
-        self.reads
+        self.core.borrow_mut().reads
             .push_back(PendingRead::RecvInto(PendingRecvInto { future, buffer }));
-        self.sync_interest(py)
+        self.core.borrow().sync_interest(py)
     }
 
     fn enqueue_accept(&mut self, py: Python<'_>, future: Py<PyAny>) -> PyResult<()> {
-        self.reads
+        self.core.borrow_mut().reads
             .push_back(PendingRead::Accept(PendingAccept { future }));
-        self.sync_interest(py)
+        self.core.borrow().sync_interest(py)
     }
 
     fn enqueue_sendall(
@@ -142,13 +152,13 @@ impl SocketState {
             }
             return Ok(());
         }
-        self.writes.push_back(PendingSend {
+        self.core.borrow_mut().writes.push_back(PendingSend {
             future,
             data: data.unbind(),
             len: data_len,
             sent,
         });
-        self.sync_interest(py)
+        self.core.borrow().sync_interest(py)
     }
 
     fn enqueue_connect(
@@ -157,12 +167,12 @@ impl SocketState {
         future: Py<PyAny>,
         _address: Py<PyAny>,
     ) -> PyResult<()> {
-        self.connects.push_back(PendingConnect { future });
-        self.sync_interest(py)
+        self.core.borrow_mut().connects.push_back(PendingConnect { future });
+        self.core.borrow().sync_interest(py)
     }
 }
 
-impl SocketState {
+impl SocketCore {
     pub(crate) fn on_readable(&mut self, py: Python<'_>) -> PyResult<()> {
         if self.closed {
             return Ok(());

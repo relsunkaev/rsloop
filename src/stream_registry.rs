@@ -2,12 +2,12 @@
 
 use std::cell::RefCell;
 use std::env;
-use std::sync::OnceLock;
 use std::os::fd::RawFd;
+use std::sync::OnceLock;
 
 use pyo3::prelude::*;
 
-use crate::stream_transport::StreamTransport;
+use crate::stream_transport::{StreamCoreRef, StreamTransport};
 
 const SEGMENT_BITS: usize = 8;
 const SEGMENT_SIZE: usize = 1 << SEGMENT_BITS;
@@ -15,7 +15,7 @@ const SEGMENT_MASK: usize = SEGMENT_SIZE - 1;
 
 #[pyclass(module = "kioto._kioto", unsendable)]
 pub struct StreamTransportRegistry {
-    segments: RefCell<Vec<Option<Box<[Option<Py<StreamTransport>>]>>>>,
+    segments: RefCell<Vec<Option<Box<[Option<StreamCoreRef>]>>>>,
     write_queue: RefCell<Vec<(RawFd, u64)>>,
 }
 
@@ -30,7 +30,8 @@ impl StreamTransportRegistry {
     }
 
     fn register(&self, fd: i32, transport: Py<StreamTransport>) {
-        self.register_inner(fd as RawFd, transport);
+        let core = Python::attach(|py| transport.borrow(py).core.clone());
+        self.register_inner(fd as RawFd, core);
     }
 
     fn unregister(&self, fd: i32) {
@@ -56,9 +57,7 @@ impl StreamTransportRegistry {
         if trace_stream_enabled() {
             eprintln!("stream-registry dispatch mask={mask}");
         }
-        let bound = transport.bind(py);
-        let mut stream = bound.borrow_mut();
-        stream.on_events(py, mask)?;
+        transport.borrow_mut().on_events(py, mask)?;
         Ok(true)
     }
 
@@ -85,8 +84,8 @@ impl StreamTransportRegistry {
                 let Some(transport) = segment[index & SEGMENT_MASK].as_ref() else {
                     continue;
                 };
-                let mut transport = transport.bind(py).borrow_mut();
-                if transport.stream_token != token {
+                let mut transport = transport.borrow_mut();
+                if transport.stream_token != token || transport.closed {
                     continue;
                 }
                 transport.write_queued = false;
@@ -96,7 +95,7 @@ impl StreamTransportRegistry {
         }
     }
 
-    pub(crate) fn register_inner(&self, fd: RawFd, transport: Py<StreamTransport>) {
+    pub(crate) fn register_inner(&self, fd: RawFd, transport: StreamCoreRef) {
         let index = fd as usize;
         let mut segments = self.segments.borrow_mut();
         let segment = Self::segment_mut(&mut segments, index);
@@ -129,9 +128,9 @@ impl StreamTransportRegistry {
     }
 
     fn segment_mut(
-        segments: &mut Vec<Option<Box<[Option<Py<StreamTransport>>]>>>,
+        segments: &mut Vec<Option<Box<[Option<StreamCoreRef>]>>>,
         index: usize,
-    ) -> &mut [Option<Py<StreamTransport>>] {
+    ) -> &mut [Option<StreamCoreRef>] {
         let segment_index = index >> SEGMENT_BITS;
         if segment_index >= segments.len() {
             segments.resize_with(segment_index + 1, || None);

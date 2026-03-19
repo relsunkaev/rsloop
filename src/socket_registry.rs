@@ -5,7 +5,7 @@ use std::os::fd::RawFd;
 
 use pyo3::prelude::*;
 
-use crate::socket_state::SocketState;
+use crate::socket_state::{SocketCoreRef, SocketState};
 
 const SEGMENT_BITS: usize = 8;
 const SEGMENT_SIZE: usize = 1 << SEGMENT_BITS;
@@ -13,7 +13,7 @@ const SEGMENT_MASK: usize = SEGMENT_SIZE - 1;
 
 #[pyclass(module = "kioto._kioto", unsendable)]
 pub struct SocketStateRegistry {
-    segments: RefCell<Vec<Option<Box<[Option<Py<SocketState>>]>>>>,
+    segments: RefCell<Vec<Option<Box<[Option<SocketCoreRef>]>>>>,
 }
 
 #[pymethods]
@@ -26,7 +26,8 @@ impl SocketStateRegistry {
     }
 
     fn register(&self, fd: i32, state: Py<SocketState>) {
-        self.register_inner(fd as RawFd, state);
+        let core = Python::attach(|py| state.borrow(py).core.clone());
+        self.register_inner(fd as RawFd, core);
     }
 
     fn unregister(&self, fd: i32) {
@@ -48,19 +49,18 @@ impl SocketStateRegistry {
         let Some(state) = segment[index & SEGMENT_MASK].as_ref() else {
             return Ok(false);
         };
-        let bound = state.bind(py);
         if mask & 0x01 != 0 {
-            let mut state = bound.borrow_mut();
+            let mut state = state.borrow_mut();
             state.on_readable(py)?;
         }
         if mask & 0x02 != 0 {
-            let mut state = bound.borrow_mut();
+            let mut state = state.borrow_mut();
             state.on_writable(py)?;
         }
         Ok(true)
     }
 
-    pub(crate) fn register_inner(&self, fd: RawFd, state: Py<SocketState>) {
+    pub(crate) fn register_inner(&self, fd: RawFd, state: SocketCoreRef) {
         let index = fd as usize;
         let mut segments = self.segments.borrow_mut();
         let segment = Self::segment_mut(&mut segments, index);
@@ -93,9 +93,9 @@ impl SocketStateRegistry {
     }
 
     fn segment_mut(
-        segments: &mut Vec<Option<Box<[Option<Py<SocketState>>]>>>,
+        segments: &mut Vec<Option<Box<[Option<SocketCoreRef>]>>>,
         index: usize,
-    ) -> &mut [Option<Py<SocketState>>] {
+    ) -> &mut [Option<SocketCoreRef>] {
         let segment_index = index >> SEGMENT_BITS;
         if segment_index >= segments.len() {
             segments.resize_with(segment_index + 1, || None);
