@@ -1,6 +1,8 @@
 #![cfg(unix)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::{collections::BTreeMap, env};
 
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyAttributeError, PyKeyboardInterrupt, PyRuntimeError, PySystemExit};
@@ -101,6 +103,74 @@ struct FutureHandleState {
 pub struct FutureHandle {
     cancelled: AtomicBool,
     state: Mutex<FutureHandleState>,
+}
+
+struct OneArgProfileState {
+    seen: usize,
+    limit: usize,
+    counts: BTreeMap<String, u64>,
+}
+
+static ONE_ARG_PROFILE: OnceLock<Option<Mutex<OneArgProfileState>>> = OnceLock::new();
+
+fn one_arg_profile_state() -> Option<&'static Mutex<OneArgProfileState>> {
+    ONE_ARG_PROFILE
+        .get_or_init(|| {
+            if env::var_os("KIOTO_PROFILE_ONEARG_JSON").is_none() {
+                return None;
+            }
+            let limit = env::var("KIOTO_PROFILE_ONEARG_LIMIT")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(16);
+            Some(Mutex::new(OneArgProfileState {
+                seen: 0,
+                limit,
+                counts: BTreeMap::new(),
+            }))
+        })
+        .as_ref()
+}
+
+pub(crate) fn profile_one_arg_callback(py: Python<'_>, callback: &Py<PyAny>) {
+    let Some(state) = one_arg_profile_state() else {
+        return;
+    };
+    let mut state = state.lock();
+    if state.seen >= state.limit {
+        return;
+    }
+    let label = callback
+        .bind(py)
+        .repr()
+        .ok()
+        .and_then(|value| value.extract::<String>().ok())
+        .unwrap_or_else(|| "<repr failed>".to_string());
+    *state.counts.entry(label).or_insert(0) += 1;
+    state.seen += 1;
+}
+
+pub(crate) fn take_one_arg_profile_json() -> Option<String> {
+    let state = one_arg_profile_state()?;
+    let mut state = state.lock();
+    let mut out = String::from("{\"counts\":[");
+    for (index, (label, count)) in state.counts.iter().enumerate() {
+        if index != 0 {
+            out.push(',');
+        }
+        let encoded = label.replace('\\', "\\\\").replace('"', "\\\"");
+        out.push_str("{\"callback\":");
+        out.push('"');
+        out.push_str(&encoded);
+        out.push('"');
+        out.push_str(",\"count\":");
+        out.push_str(&count.to_string());
+        out.push('}');
+    }
+    out.push_str("]}");
+    state.seen = 0;
+    state.counts.clear();
+    Some(out)
 }
 
 #[pymethods]
@@ -881,6 +951,7 @@ impl OneArgHandle {
         when: Option<f64>,
         debug: bool,
     ) -> PyResult<Py<PyAny>> {
+        profile_one_arg_callback(py, &callback);
         let context = match context {
             Some(context) => context,
             None => copy_context(py)?,

@@ -17,7 +17,9 @@ use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAny, PyByteArray, PyBytes, PyDict};
 
+use crate::handles::OneArgHandle;
 use crate::poller::TokioPoller;
+use crate::scheduler::Scheduler;
 use crate::stream_registry::StreamTransportRegistry;
 
 const DEFAULT_STREAM_READ_SIZE: usize = 64 * 1024;
@@ -48,7 +50,29 @@ struct StreamProfileState {
 
 struct PendingRead {
     size: usize,
-    future: Py<PyAny>,
+    waiter: Py<StreamWaiter>,
+}
+
+pub(crate) enum StreamCompletion {
+    ReadResult {
+        reader: Py<PyAny>,
+        waiter: Py<StreamWaiter>,
+        payload: Py<PyAny>,
+        resume_transport: bool,
+    },
+    ReadException {
+        reader: Py<PyAny>,
+        waiter: Py<StreamWaiter>,
+        exception: Py<PyAny>,
+    },
+    FutureResult {
+        future: Py<PyAny>,
+        value: Py<PyAny>,
+    },
+    FutureException {
+        future: Py<PyAny>,
+        exception: Py<PyAny>,
+    },
 }
 
 struct PendingWrite {
@@ -76,6 +100,8 @@ pub(crate) struct StreamCore {
     buffer: Option<Py<PyByteArray>>,
     limit: usize,
     pending_read: Option<PendingRead>,
+    pending_drains: Vec<Py<PyAny>>,
+    pending_close_waiters: Vec<Py<PyAny>>,
     read_buffer: Vec<u8>,
     write_queue: VecDeque<PendingWrite>,
     pub(crate) pending_write_bytes: usize,
@@ -103,6 +129,27 @@ struct ReadyAwaitable {
     done: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamWaiterState {
+    Pending,
+    Cancelled,
+    Finished,
+}
+
+#[pyclass(module = "kioto._kioto", unsendable)]
+pub(crate) struct StreamWaiter {
+    scheduler: Py<Scheduler>,
+    loop_obj: Py<PyAny>,
+    callbacks: Vec<(Py<PyAny>, Py<PyAny>)>,
+    result: Option<Py<PyAny>>,
+    exception: Option<Py<PyAny>>,
+    cancel_message: Option<Py<PyAny>>,
+    state: StreamWaiterState,
+    yielded: bool,
+    #[pyo3(get, set)]
+    _asyncio_future_blocking: bool,
+}
+
 #[pymethods]
 impl ReadyAwaitable {
     fn __await__(slf: Py<Self>) -> Py<Self> {
@@ -123,6 +170,221 @@ impl ReadyAwaitable {
         }
         let result = slf.result.take().unwrap_or_else(|| py.None());
         Err(PyStopIteration::new_err((result,)))
+    }
+}
+
+#[pymethods]
+impl StreamWaiter {
+    fn __await__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __next__(slf: Py<Self>, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let mut waiter = slf.borrow_mut(py);
+        if waiter.state == StreamWaiterState::Pending {
+            if waiter.yielded {
+                return Err(PyRuntimeError::new_err("await wasn't used with future"));
+            }
+            waiter.yielded = true;
+            waiter._asyncio_future_blocking = true;
+            return Ok(Some(slf.clone_ref(py).into_any()));
+        }
+        waiter.yielded = true;
+        waiter._asyncio_future_blocking = false;
+        if waiter.state == StreamWaiterState::Cancelled {
+            return Err(cancelled_error(py, waiter.cancel_message.as_ref())?);
+        }
+        if let Some(exception) = waiter.exception.as_ref() {
+            return Err(PyErr::from_value(exception.clone_ref(py).into_bound(py).into_any()));
+        }
+        let result = waiter.result.as_ref().map(|value| value.clone_ref(py)).unwrap_or_else(|| py.None());
+        Err(PyStopIteration::new_err((result,)))
+    }
+
+    #[pyo3(signature = (callback, *, context=None))]
+    fn add_done_callback(
+        slf: Py<Self>,
+        py: Python<'_>,
+        callback: Py<PyAny>,
+        context: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let context = match context {
+            Some(context) => context,
+            None => copy_context_obj(py)?,
+        };
+        let pending = {
+            let mut waiter = slf.borrow_mut(py);
+            if waiter.state == StreamWaiterState::Pending {
+                waiter.callbacks.push((callback.clone_ref(py), context.clone_ref(py)));
+                true
+            } else {
+                false
+            }
+        };
+        if !pending {
+            StreamWaiter::schedule_one(py, &slf, callback, context)?;
+        }
+        Ok(())
+    }
+
+    fn remove_done_callback(&mut self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<usize> {
+        let original = self.callbacks.len();
+        self.callbacks.retain(|(registered, _)| {
+            registered
+                .bind(py)
+                .eq(callback.bind(py))
+                .map(|equal| !equal)
+                .unwrap_or(true)
+        });
+        Ok(original - self.callbacks.len())
+    }
+
+    #[pyo3(signature = (msg=None))]
+    fn cancel(slf: Py<Self>, py: Python<'_>, msg: Option<Py<PyAny>>) -> PyResult<bool> {
+        let callbacks = {
+            let mut waiter = slf.borrow_mut(py);
+            if waiter.state != StreamWaiterState::Pending {
+                return Ok(false);
+            }
+            waiter.state = StreamWaiterState::Cancelled;
+            waiter.cancel_message = msg;
+            waiter.result = None;
+            waiter.exception = None;
+            waiter._asyncio_future_blocking = false;
+            std::mem::take(&mut waiter.callbacks)
+        };
+        StreamWaiter::schedule_callbacks(py, &slf, callbacks)?;
+        Ok(true)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.state == StreamWaiterState::Cancelled
+    }
+
+    fn done(&self) -> bool {
+        self.state != StreamWaiterState::Pending
+    }
+
+    fn result(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match self.state {
+            StreamWaiterState::Pending => Err(invalid_state_error(py, "Result is not ready.")?),
+            StreamWaiterState::Cancelled => Err(cancelled_error(py, self.cancel_message.as_ref())?),
+            StreamWaiterState::Finished => {
+                if let Some(exception) = self.exception.as_ref() {
+                    Err(PyErr::from_value(exception.clone_ref(py).into_bound(py).into_any()))
+                } else {
+                    Ok(self.result.as_ref().map(|value| value.clone_ref(py)).unwrap_or_else(|| py.None()))
+                }
+            }
+        }
+    }
+
+    fn exception(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        match self.state {
+            StreamWaiterState::Pending => Err(invalid_state_error(py, "Exception is not set.")?),
+            StreamWaiterState::Cancelled => Err(cancelled_error(py, self.cancel_message.as_ref())?),
+            StreamWaiterState::Finished => Ok(self.exception.as_ref().map(|value| value.clone_ref(py))),
+        }
+    }
+
+    fn set_result(slf: Py<Self>, py: Python<'_>, result: Py<PyAny>) -> PyResult<()> {
+        StreamWaiter::finish_result(&slf, py, result)
+    }
+
+    fn set_exception(slf: Py<Self>, py: Python<'_>, exception: Py<PyAny>) -> PyResult<()> {
+        StreamWaiter::finish_exception(&slf, py, exception)
+    }
+
+    fn get_loop(&self, py: Python<'_>) -> Py<PyAny> {
+        self.loop_obj.clone_ref(py)
+    }
+}
+
+impl StreamWaiter {
+    fn new(py: Python<'_>, scheduler: Py<Scheduler>, loop_obj: Py<PyAny>) -> PyResult<Py<Self>> {
+        Py::new(
+            py,
+            Self {
+                scheduler,
+                loop_obj,
+                callbacks: Vec::new(),
+                result: None,
+                exception: None,
+                cancel_message: None,
+                state: StreamWaiterState::Pending,
+                yielded: false,
+                _asyncio_future_blocking: false,
+            },
+        )
+    }
+
+    pub(crate) fn finish_result(slf: &Py<Self>, py: Python<'_>, result: Py<PyAny>) -> PyResult<()> {
+        let callbacks = {
+            let mut waiter = slf.borrow_mut(py);
+            if waiter.state != StreamWaiterState::Pending {
+                return Err(invalid_state_error(py, "Result is already set.")?);
+            }
+            waiter.result = Some(result);
+            waiter.exception = None;
+            waiter.state = StreamWaiterState::Finished;
+            waiter._asyncio_future_blocking = false;
+            std::mem::take(&mut waiter.callbacks)
+        };
+        Self::schedule_callbacks(py, slf, callbacks)
+    }
+
+    pub(crate) fn finish_exception(
+        slf: &Py<Self>,
+        py: Python<'_>,
+        exception: Py<PyAny>,
+    ) -> PyResult<()> {
+        let exception = normalize_exception(py, exception)?;
+        let callbacks = {
+            let mut waiter = slf.borrow_mut(py);
+            if waiter.state != StreamWaiterState::Pending {
+                return Err(invalid_state_error(py, "Exception is already set.")?);
+            }
+            waiter.result = None;
+            waiter.exception = Some(exception);
+            waiter.state = StreamWaiterState::Finished;
+            waiter._asyncio_future_blocking = false;
+            std::mem::take(&mut waiter.callbacks)
+        };
+        Self::schedule_callbacks(py, slf, callbacks)
+    }
+
+    fn schedule_callbacks(
+        py: Python<'_>,
+        slf: &Py<Self>,
+        callbacks: Vec<(Py<PyAny>, Py<PyAny>)>,
+    ) -> PyResult<()> {
+        for (callback, context) in callbacks {
+            Self::schedule_one(py, slf, callback, context)?;
+        }
+        Ok(())
+    }
+
+    fn schedule_one(
+        py: Python<'_>,
+        slf: &Py<Self>,
+        callback: Py<PyAny>,
+        context: Py<PyAny>,
+    ) -> PyResult<()> {
+        let waiter = slf.borrow(py);
+        let handle = OneArgHandle::create(
+            py,
+            callback,
+            slf.clone_ref(py).into_any(),
+            waiter.loop_obj.clone_ref(py),
+            Some(context),
+            None,
+        )?;
+        waiter.scheduler.bind(py).borrow().push_ready_inner(handle);
+        Ok(())
     }
 }
 
@@ -179,6 +441,8 @@ impl StreamTransport {
                 buffer,
                 limit,
                 pending_read: None,
+                pending_drains: Vec::new(),
+                pending_close_waiters: Vec::new(),
                 read_buffer: vec![0_u8; read_size.max(1)],
                 write_queue: VecDeque::new(),
                 pending_write_bytes: 0,
@@ -233,7 +497,7 @@ impl StreamTransport {
     }
 
     fn wait_closed_fast(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        self.core.borrow().wait_closed_fast(py)
+        self.core.borrow_mut().wait_closed_fast(py)
     }
 
     fn write(&mut self, py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
@@ -391,7 +655,7 @@ impl StreamCore {
             }
         }
 
-        if !self.closing && !self.protocol_paused && self.pending_write_bytes == 0 {
+        if !self.closing && !self.protocol_paused {
             if let Some(ready) = self.ready_drain.as_ref() {
                 return Ok(Some(ready.clone_ref(py)));
             }
@@ -408,16 +672,16 @@ impl StreamCore {
         Ok(None)
     }
 
-    fn wait_closed_fast(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        if let Some(waiter) = self.close_waiter.as_ref() {
-            return Ok(waiter.clone_ref(py));
+    fn wait_closed_fast(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if self.closed {
+            return ready_awaitable_result(py, py.None());
         }
         let future = self
             .loop_obj
             .bind(py)
             .call_method0("create_future")?
             .unbind();
-        future.bind(py).call_method1("set_result", (py.None(),))?;
+        self.pending_close_waiters.push(future.clone_ref(py));
         Ok(future)
     }
 
@@ -767,6 +1031,8 @@ impl StreamCore {
         };
         self.connection_lost_sent = true;
         self.sock.bind(py).call_method0("close")?;
+        self.queue_pending_drains(py, exc)?;
+        self.queue_close_waiters(py)?;
         Ok(())
     }
 
@@ -827,6 +1093,7 @@ impl StreamCore {
         }
         self.protocol.bind(py).call_method0("resume_writing")?;
         self.protocol_paused = false;
+        self.queue_pending_drains(py, None)?;
         Ok(())
     }
 
@@ -839,6 +1106,7 @@ impl StreamCore {
         }
 
         let reader = reader_obj.bind(py);
+        let had_pending_read = self.pending_read.is_some();
         if self.try_finish_pending_read_from_chunk(py, &reader, size)? {
             return Ok(());
         }
@@ -849,7 +1117,7 @@ impl StreamCore {
             .clone_ref(py);
         let buffer = buffer_obj.bind(py);
         append_to_bytearray(buffer.as_ptr(), &self.read_buffer[..size])?;
-        if !self.try_finish_pending_read(py, &reader)? {
+        if !self.try_finish_pending_read(py, &reader)? && !had_pending_read {
             wake_waiter(py, &reader)?;
         }
 
@@ -915,12 +1183,12 @@ impl StreamCore {
             )?
         };
         reader.setattr("_waiter", py.None())?;
-        if !future_done(py, &pending.future)? {
-            pending
-                .future
-                .bind(py)
-                .call_method1("set_result", (payload,))?;
-        }
+        self.queue_completion(py, StreamCompletion::ReadResult {
+            reader: reader.clone().unbind(),
+            waiter: pending.waiter,
+            payload,
+            resume_transport: true,
+        })?;
         record_stream_profile_event("read_wait_done", self.fd, pending.size, buffered);
 
         if needed_from_chunk != size || buffered != 0 {
@@ -991,17 +1259,19 @@ impl StreamCore {
                 .call_method0("resume_reading")?;
         }
 
-        let future = self
+        let scheduler = self
             .loop_obj
             .bind(py)
-            .call_method0("create_future")?
+            .getattr("_scheduler")?
+            .cast_into::<Scheduler>()?
             .unbind();
-        reader.setattr("_waiter", future.bind(py))?;
+        let waiter = StreamWaiter::new(py, scheduler, self.loop_obj.clone_ref(py))?;
+        reader.setattr("_waiter", waiter.bind(py))?;
         self.pending_read = Some(PendingRead {
             size,
-            future: future.clone_ref(py),
+            waiter: waiter.clone_ref(py),
         });
-        Ok(future)
+        Ok(waiter.into_any())
     }
 
     fn drain_inner(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -1016,16 +1286,13 @@ impl StreamCore {
             }
         }
 
-        let Some(fallback) = self.drain_fallback.as_ref() else {
-            let future = self
-                .loop_obj
-                .bind(py)
-                .call_method0("create_future")?
-                .unbind();
-            future.bind(py).call_method1("set_result", (py.None(),))?;
-            return Ok(future);
-        };
-        Ok(fallback.bind(py).call0()?.unbind())
+        let future = self
+            .loop_obj
+            .bind(py)
+            .call_method0("create_future")?
+            .unbind();
+        self.pending_drains.push(future.clone_ref(py));
+        Ok(future)
     }
 
     fn try_finish_pending_read(
@@ -1064,11 +1331,13 @@ impl StreamCore {
             pending.size,
         )?;
         reader.setattr("_waiter", py.None())?;
-        if !future_done(py, &pending.future)? {
-            pending.future.bind(py).call_method1("set_result", (data,))?;
-        }
+        self.queue_completion(py, StreamCompletion::ReadResult {
+            reader: reader.clone().unbind(),
+            waiter: pending.waiter,
+            payload: data,
+            resume_transport: true,
+        })?;
         record_stream_profile_event("read_wait_done", self.fd, pending.size, buffered);
-        maybe_resume_transport(reader)?;
         Ok(true)
     }
 
@@ -1090,11 +1359,58 @@ impl StreamCore {
         )?;
         let exc = incomplete_read_error(py, partial, pending.size)?;
         _reader.setattr("_waiter", py.None())?;
-        if !future_done(py, &pending.future)? {
-            pending
-                .future
-                .bind(py)
-                .call_method1("set_exception", (exc,))?;
+        self.queue_completion(py, StreamCompletion::ReadException {
+            reader: _reader.clone().unbind(),
+            waiter: pending.waiter,
+            exception: exc,
+        })?;
+        Ok(())
+    }
+
+    fn queue_completion(&self, py: Python<'_>, completion: StreamCompletion) -> PyResult<()> {
+        self.registry
+            .bind(py)
+            .borrow()
+            .queue_completion(completion);
+        Ok(())
+    }
+
+    fn queue_pending_drains(&mut self, py: Python<'_>, exception: Option<Py<PyAny>>) -> PyResult<()> {
+        if self.pending_drains.is_empty() {
+            return Ok(());
+        }
+        let completions = std::mem::take(&mut self.pending_drains);
+        let value = py.None();
+        for future in completions {
+            let completion = match exception.as_ref() {
+                Some(exception) => StreamCompletion::FutureException {
+                    future,
+                    exception: exception.clone_ref(py),
+                },
+                None => StreamCompletion::FutureResult {
+                    future,
+                    value: value.clone_ref(py),
+                },
+            };
+            self.queue_completion(py, completion)?;
+        }
+        Ok(())
+    }
+
+    fn queue_close_waiters(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.pending_close_waiters.is_empty() {
+            return Ok(());
+        }
+        let waiters = std::mem::take(&mut self.pending_close_waiters);
+        let value = py.None();
+        for future in waiters {
+            self.queue_completion(
+                py,
+                StreamCompletion::FutureResult {
+                    future,
+                    value: value.clone_ref(py),
+                },
+            )?;
         }
         Ok(())
     }
@@ -1373,7 +1689,7 @@ unsafe extern "C" fn stream_transport_wait_closed_c(
     let result = (|| -> PyResult<Py<PyAny>> {
         let transport = Bound::from_borrowed_ptr(py, slf).cast_into_unchecked::<StreamTransport>();
         let core = transport.borrow().core.clone();
-        let result = core.borrow().wait_closed_fast(py);
+        let result = core.borrow_mut().wait_closed_fast(py);
         result
     })();
 
@@ -1645,7 +1961,28 @@ fn maybe_resume_transport(reader: &Bound<'_, PyAny>) -> PyResult<()> {
     Ok(())
 }
 
-fn cancelled_error(py: Python<'_>) -> PyResult<Py<PyAny>> {
+fn copy_context_obj(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    static COPY_CONTEXT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    let copy_context = COPY_CONTEXT.get_or_try_init(py, || -> PyResult<_> {
+        Ok(py.import("contextvars")?.getattr("copy_context")?.unbind())
+    })?;
+    Ok(copy_context.bind(py).call0()?.unbind())
+}
+
+fn invalid_state_error(py: Python<'_>, message: &str) -> PyResult<PyErr> {
+    static INVALID_STATE_ERROR: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    let cls = INVALID_STATE_ERROR.get_or_try_init(py, || -> PyResult<_> {
+        Ok(py
+            .import("asyncio.exceptions")?
+            .getattr("InvalidStateError")?
+            .unbind())
+    })?;
+    Ok(PyErr::from_value(
+        cls.bind(py).call1((message,))?.into_any().unbind().into_bound(py).into_any(),
+    ))
+}
+
+fn cancelled_error(py: Python<'_>, message: Option<&Py<PyAny>>) -> PyResult<PyErr> {
     static CANCELLED_ERROR: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
     let cls = CANCELLED_ERROR.get_or_try_init(py, || -> PyResult<_> {
         Ok(py
@@ -1653,7 +1990,11 @@ fn cancelled_error(py: Python<'_>) -> PyResult<Py<PyAny>> {
             .getattr("CancelledError")?
             .unbind())
     })?;
-    Ok(cls.bind(py).call0()?.unbind())
+    let value = match message {
+        Some(message) => cls.bind(py).call1((message.bind(py),))?,
+        None => cls.bind(py).call0()?,
+    };
+    Ok(PyErr::from_value(value.into_any()))
 }
 
 fn normalize_exception(py: Python<'_>, exception: Py<PyAny>) -> PyResult<Py<PyAny>> {

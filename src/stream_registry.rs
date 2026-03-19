@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use pyo3::prelude::*;
 
-use crate::stream_transport::{StreamCoreRef, StreamTransport};
+use crate::stream_transport::{StreamCompletion, StreamCoreRef, StreamTransport, StreamWaiter};
 
 const SEGMENT_BITS: usize = 8;
 const SEGMENT_SIZE: usize = 1 << SEGMENT_BITS;
@@ -17,6 +17,7 @@ const SEGMENT_MASK: usize = SEGMENT_SIZE - 1;
 pub struct StreamTransportRegistry {
     segments: RefCell<Vec<Option<Box<[Option<StreamCoreRef>]>>>>,
     write_queue: RefCell<Vec<(RawFd, u64)>>,
+    completions: RefCell<Vec<StreamCompletion>>,
 }
 
 #[pymethods]
@@ -26,6 +27,7 @@ impl StreamTransportRegistry {
         Self {
             segments: RefCell::new(Vec::new()),
             write_queue: RefCell::new(Vec::new()),
+            completions: RefCell::new(Vec::new()),
         }
     }
 
@@ -41,6 +43,7 @@ impl StreamTransportRegistry {
     fn clear(&self) {
         self.segments.borrow_mut().clear();
         self.write_queue.borrow_mut().clear();
+        self.completions.borrow_mut().clear();
     }
 }
 
@@ -63,6 +66,63 @@ impl StreamTransportRegistry {
 
     pub(crate) fn queue_write_phase(&self, fd: RawFd, token: u64) {
         self.write_queue.borrow_mut().push((fd, token));
+    }
+
+    pub(crate) fn queue_completion(&self, completion: StreamCompletion) {
+        self.completions.borrow_mut().push(completion);
+    }
+
+    pub(crate) fn has_completions(&self) -> bool {
+        !self.completions.borrow().is_empty()
+    }
+
+    pub(crate) fn drain_completion_queue(&self, py: Python<'_>) -> PyResult<usize> {
+        let completions = {
+            let mut queued = self.completions.borrow_mut();
+            if queued.is_empty() {
+                return Ok(0);
+            }
+            std::mem::take(&mut *queued)
+        };
+        let mut drained = 0usize;
+        for completion in completions {
+            match completion {
+                StreamCompletion::ReadResult {
+                    reader,
+                    waiter,
+                    payload,
+                    resume_transport,
+                } => {
+                    let reader = reader.bind(py);
+                    clear_waiter(reader, py)?;
+                    StreamWaiter::finish_result(&waiter, py, payload)?;
+                    if resume_transport {
+                        maybe_resume_transport(reader)?;
+                    }
+                }
+                StreamCompletion::ReadException {
+                    reader,
+                    waiter,
+                    exception,
+                } => {
+                    let reader = reader.bind(py);
+                    clear_waiter(reader, py)?;
+                    StreamWaiter::finish_exception(&waiter, py, exception)?;
+                }
+                StreamCompletion::FutureResult { future, value } => {
+                    if !future_done(py, &future)? {
+                        future.bind(py).call_method1("set_result", (value,))?;
+                    }
+                }
+                StreamCompletion::FutureException { future, exception } => {
+                    if !future_done(py, &future)? {
+                        future.bind(py).call_method1("set_exception", (exception,))?;
+                    }
+                }
+            }
+            drained += 1;
+        }
+        Ok(drained)
     }
 
     pub(crate) fn flush_write_queue(&self, py: Python<'_>) -> PyResult<usize> {
@@ -148,4 +208,19 @@ impl StreamTransportRegistry {
 fn trace_stream_enabled() -> bool {
     static TRACE_STREAM: OnceLock<bool> = OnceLock::new();
     *TRACE_STREAM.get_or_init(|| env::var_os("KIOTO_TRACE_STREAM").is_some())
+}
+
+fn future_done(py: Python<'_>, future: &Py<PyAny>) -> PyResult<bool> {
+    future.bind(py).call_method0("done")?.is_truthy()
+}
+
+fn clear_waiter(reader: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<()> {
+    reader.setattr("_waiter", py.None())
+}
+
+fn maybe_resume_transport(reader: &Bound<'_, PyAny>) -> PyResult<()> {
+    if reader.getattr("_paused")?.is_truthy()? {
+        reader.call_method0("_maybe_resume_transport")?;
+    }
+    Ok(())
 }

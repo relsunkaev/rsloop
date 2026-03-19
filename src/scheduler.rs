@@ -14,7 +14,10 @@ use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 
 use crate::completion::{Completion, CompletionPort};
-use crate::handles::{NativeHandleKind, is_native_cancelled, mark_native_unscheduled, native_handle_kind, run_native_handle};
+use crate::handles::{
+    NativeHandleKind, is_native_cancelled, mark_native_unscheduled, native_handle_kind,
+    run_native_handle, take_one_arg_profile_json,
+};
 use crate::loop_api::LoopApi;
 use crate::poller::TokioPoller;
 use crate::socket_registry::SocketStateRegistry;
@@ -391,6 +394,9 @@ impl Scheduler {
             if let Some(trace_json) = take_profile_stream_json() {
                 eprintln!("KIOTO_PROFILE_STREAM_JSON {trace_json}");
             }
+            if let Some(one_arg_json) = take_one_arg_profile_json() {
+                eprintln!("KIOTO_PROFILE_ONEARG_JSON {one_arg_json}");
+            }
         }
 
         Ok(())
@@ -576,8 +582,17 @@ impl Scheduler {
             }
         }
 
+        if let Some(registry) = stream_registry {
+            let started = stats.as_ref().map(|_| Instant::now());
+            let drained = registry.bind(py).borrow().drain_completion_queue(py)? as u32;
+            tick.completion_items += drained;
+            if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
+                stats.completions += started.elapsed();
+            }
+        }
+
         if !completions.is_empty() {
-            tick.completion_items = completions.len() as u32;
+            tick.completion_items += completions.len() as u32;
             let started = stats.as_ref().map(|_| Instant::now());
             drain_completions(py, completions)?;
             if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
@@ -611,6 +626,26 @@ impl Scheduler {
             tick.writes_flushed = registry.bind(py).borrow().flush_write_queue(py)? as u32;
             if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
                 stats.writes += started.elapsed();
+            }
+            if registry.bind(py).borrow().has_completions() {
+                let started = stats.as_ref().map(|_| Instant::now());
+                let drained = registry.bind(py).borrow().drain_completion_queue(py)? as u32;
+                tick.completion_items += drained;
+                if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
+                    stats.completions += started.elapsed();
+                }
+                let ready_started = stats.as_ref().map(|_| Instant::now());
+                self.run_ready_inner(
+                    py,
+                    &loop_obj,
+                    debug,
+                    slow_callback_duration,
+                    ready_batch,
+                    &mut tick,
+                )?;
+                if let Some(stats) = stats.as_deref_mut() {
+                    stats.ready += ready_started.map(|started| started.elapsed()).unwrap_or_default();
+                }
             }
         }
         if let Some(stats) = stats.as_deref_mut() {
@@ -708,9 +743,9 @@ impl Scheduler {
             self.ready_remote_len
                 .fetch_sub(drained_remote, AtomicOrdering::AcqRel);
         }
-        tick.ready_local_items = ready_local_items as u32;
-        tick.ready_remote_items = drained_remote as u32;
-        tick.ready_handles = (ready_local_items + drained_remote) as u32;
+        tick.ready_local_items += ready_local_items as u32;
+        tick.ready_remote_items += drained_remote as u32;
+        tick.ready_handles += (ready_local_items + drained_remote) as u32;
 
         for handle in ready_batch.drain(..) {
             match native_handle_kind(py, &handle) {
