@@ -24,7 +24,7 @@ use crate::stream_registry::StreamTransportRegistry;
 
 const DEFAULT_STREAM_READ_SIZE: usize = 64 * 1024;
 const NATIVE_READEXACTLY_LIMIT: usize = 16 * 1024;
-const DIRECT_WRITE_LIMIT: usize = 64;
+const DIRECT_WRITE_LIMIT: usize = 0;
 const WRITEV_BATCH_LIMIT: usize = 8;
 const COALESCED_WRITE_LIMIT: usize = 4 * 1024;
 const WRITE_HIGH_WATER: usize = 64 * 1024;

@@ -137,12 +137,18 @@ impl StreamTransportRegistry {
             };
             for (fd, token) in drained {
                 let index = fd as usize;
-                let segments = self.segments.borrow();
-                let Some(segment) = segments.get(index >> SEGMENT_BITS).and_then(|segment| segment.as_ref()) else {
-                    continue;
-                };
-                let Some(transport) = segment[index & SEGMENT_MASK].as_ref() else {
-                    continue;
+                let transport = {
+                    let segments = self.segments.borrow();
+                    let Some(segment) = segments
+                        .get(index >> SEGMENT_BITS)
+                        .and_then(|segment| segment.as_ref())
+                    else {
+                        continue;
+                    };
+                    let Some(transport) = segment[index & SEGMENT_MASK].as_ref() else {
+                        continue;
+                    };
+                    transport.clone()
                 };
                 let mut transport = transport.borrow_mut();
                 if transport.stream_token != token || transport.closed {
