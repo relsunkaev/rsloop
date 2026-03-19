@@ -34,6 +34,20 @@ List available scenarios:
 .venv/bin/python benchmarks/loops.py --list
 ```
 
+Capture Kioto scheduler shape data and stream events for an isolated run:
+
+```bash
+.venv/bin/python benchmarks/loops.py \
+  --loop kioto \
+  --benchmark tcp_echo_parallel \
+  --repeats 1 \
+  --warmups 0 \
+  --profile-runtime \
+  --profile-stream \
+  --output benchmarks/out/tcp_echo_parallel-profile.json \
+  --json
+```
+
 ### Profiles
 
 - `smoke`: fast sanity checks
@@ -44,4 +58,7 @@ List available scenarios:
 
 - Default output prints per-loop lines plus a compact summary table for Kioto vs the selected baseline.
 - JSON output includes environment metadata, per-sample timings, medians, and baseline ratios.
+- `--profile-runtime` captures Kioto scheduler per-tick summaries into the JSON artifact.
+- `--profile-stream` captures a bounded Kioto stream event trace into the JSON artifact.
 - `--iterations` overrides the default iteration count for the selected scenarios.
+- Runtime profile capture requires subprocess isolation; leave `--no-isolate-process` off when using it.

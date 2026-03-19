@@ -46,6 +46,7 @@ class BenchResult:
     repeats: int
     unit: str
     samples: list[float]
+    profiles: list[dict[str, Any]] | None = None
 
     @property
     def median(self) -> float:
@@ -74,7 +75,45 @@ def bench_result_from_payload(payload: dict[str, Any]) -> BenchResult:
         repeats=payload["repeats"],
         unit=payload["unit"],
         samples=list(payload["samples"]),
+        profiles=payload.get("profiles"),
     )
+
+
+def parse_runtime_profile(stderr: str) -> dict[str, Any] | None:
+    scheduler_runs: list[dict[str, Any]] = []
+    stream_runs: list[dict[str, Any]] = []
+    for line in stderr.splitlines():
+        if line.startswith("KIOTO_PROFILE_SCHED_JSON "):
+            scheduler_runs.append(
+                json.loads(line.removeprefix("KIOTO_PROFILE_SCHED_JSON "))
+            )
+        elif line.startswith("KIOTO_PROFILE_STREAM_JSON "):
+            stream_runs.append(
+                json.loads(line.removeprefix("KIOTO_PROFILE_STREAM_JSON "))
+            )
+    if not scheduler_runs and not stream_runs:
+        return None
+    profile: dict[str, Any] = {}
+    if scheduler_runs:
+        profile["scheduler_runs"] = scheduler_runs
+        profile["scheduler"] = max(
+            scheduler_runs,
+            key=lambda item: (
+                item.get("iterations", 0),
+                item.get("fd_events", 0),
+                item.get("ready_handles", 0),
+            ),
+        )
+    if stream_runs:
+        profile["stream_runs"] = stream_runs
+        profile["stream"] = max(
+            stream_runs,
+            key=lambda item: (
+                len(item.get("events", [])),
+                item.get("dropped", 0),
+            ),
+        )
+    return profile
 
 
 def get_loop_factory(loop_name: str) -> LoopFactory:
@@ -666,8 +705,10 @@ def run_single_isolated(
     iterations: int,
     repeats: int,
     warmups: int,
+    profile_runtime: bool,
+    profile_stream: bool,
 ) -> BenchResult:
-    def run_child_once() -> float:
+    def run_child_once() -> tuple[float, dict[str, Any] | None]:
         cmd = [
             sys.executable,
             __file__,
@@ -686,21 +727,33 @@ def run_single_isolated(
             "uvloop",
             "--json",
         ]
+        env = os.environ.copy()
+        if loop_name == "kioto" and profile_runtime:
+            env["KIOTO_PROFILE_SCHED_JSON"] = "1"
+        if loop_name == "kioto" and profile_stream:
+            env["KIOTO_PROFILE_SCHED_JSON"] = "1"
+            env["KIOTO_PROFILE_STREAM_JSON"] = "1"
         completed = subprocess.run(
             cmd,
             check=True,
             capture_output=True,
             text=True,
-            env=os.environ.copy(),
+            env=env,
         )
         payload = json.loads(completed.stdout)
         result = bench_result_from_payload(payload["results"][0])
-        return result.samples[0]
+        return result.samples[0], parse_runtime_profile(completed.stderr)
 
     for _ in range(warmups):
         run_child_once()
 
-    samples = [run_child_once() for _ in range(repeats)]
+    samples = []
+    profiles = []
+    for _ in range(repeats):
+        sample, profile = run_child_once()
+        samples.append(sample)
+        if profile is not None:
+            profiles.append(profile)
     return BenchResult(
         loop=loop_name,
         benchmark=spec.name,
@@ -710,6 +763,7 @@ def run_single_isolated(
         repeats=repeats,
         unit=spec.unit,
         samples=samples,
+        profiles=profiles or None,
     )
 
 
@@ -818,6 +872,16 @@ def main() -> None:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--list", action="store_true")
+    parser.add_argument(
+        "--profile-runtime",
+        action="store_true",
+        help="Capture Kioto scheduler/runtime profile data for isolated child runs.",
+    )
+    parser.add_argument(
+        "--profile-stream",
+        action="store_true",
+        help="Capture Kioto stream event traces for isolated child runs.",
+    )
     parser.add_argument("--child-run", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--no-isolate-process",
@@ -839,6 +903,8 @@ def main() -> None:
 
     results: list[BenchResult] = []
     isolate_process = not args.no_isolate_process and not args.child_run
+    if (args.profile_runtime or args.profile_stream) and not isolate_process:
+        raise SystemExit("runtime profiling requires subprocess isolation")
     for spec in specs:
         iterations = args.iterations or spec.default_iterations
         for loop_name in loops:
@@ -851,6 +917,8 @@ def main() -> None:
                     iterations,
                     args.repeats,
                     args.warmups,
+                    args.profile_runtime,
+                    args.profile_stream,
                 )
             else:
                 result = run_single(loop_name, spec, iterations, args.repeats, args.warmups)

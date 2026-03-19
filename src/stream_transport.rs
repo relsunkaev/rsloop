@@ -2,10 +2,13 @@
 
 use std::collections::VecDeque;
 use std::env;
+use std::fmt::Write as _;
 use std::os::fd::RawFd;
 use std::ptr;
 use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
+use std::time::Instant;
 
+use parking_lot::Mutex;
 use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -22,6 +25,22 @@ const WRITE_HIGH_WATER: usize = 64 * 1024;
 const WRITE_LOW_WATER: usize = 16 * 1024;
 static TRACE_STREAM: OnceLock<bool> = OnceLock::new();
 static STREAM_TOKEN: AtomicU64 = AtomicU64::new(1);
+static STREAM_PROFILE: OnceLock<Option<Mutex<StreamProfileState>>> = OnceLock::new();
+
+struct StreamProfileEvent {
+    at_us: u64,
+    kind: &'static str,
+    fd: RawFd,
+    size: usize,
+    aux: usize,
+}
+
+struct StreamProfileState {
+    started_at: Instant,
+    limit: usize,
+    dropped: u64,
+    events: Vec<StreamProfileEvent>,
+}
 
 struct PendingRead {
     size: usize,
@@ -357,7 +376,10 @@ impl StreamTransport {
         let bytes = data.as_bytes();
         if self.write_queue.is_empty() && !self.writer_registered && bytes.len() <= DIRECT_WRITE_LIMIT {
             match try_send_bytes(self.fd, bytes) {
-                Ok(sent) if sent == bytes.len() => return Ok(()),
+                Ok(sent) if sent == bytes.len() => {
+                    record_stream_profile_event("write_direct", self.fd, sent, 0);
+                    return Ok(());
+                }
                 Ok(sent) => {
                     let tail = PyBytes::new(py, &bytes[sent..]).unbind();
                     self.queue_write_bytes(py, tail, sent)?;
@@ -436,6 +458,12 @@ impl StreamTransport {
         let sent = sent.min(len);
         self.pending_write_bytes += len.saturating_sub(sent);
         self.write_queue.push_back(PendingWrite { data, sent });
+        record_stream_profile_event(
+            "write_queue",
+            self.fd,
+            len.saturating_sub(sent),
+            self.pending_write_bytes,
+        );
         Ok(())
     }
 
@@ -463,6 +491,7 @@ impl StreamTransport {
                     return Ok(());
                 }
                 Ok(n) => {
+                    record_stream_profile_event("read", self.fd, n, self.pending_write_bytes);
                     if trace_stream_enabled() {
                         eprintln!("stream-transport read fd={} bytes={}", self.fd, n);
                     }
@@ -504,6 +533,7 @@ impl StreamTransport {
             match try_send_bytes(self.fd, write_bytes) {
                 Ok(0) => break,
                 Ok(sent) => {
+                    record_stream_profile_event("write_flush", self.fd, sent, self.pending_write_bytes);
                     if trace_stream_enabled() {
                         eprintln!("stream-transport wrote fd={} bytes={}", self.fd, sent);
                     }
@@ -734,6 +764,7 @@ impl StreamTransport {
                 .bind(py)
                 .call_method1("set_result", (payload,))?;
         }
+        record_stream_profile_event("read_wait_done", self.fd, pending.size, buffered);
 
         if needed_from_chunk != size || buffered != 0 {
             replace_bytearray(buffer.as_ptr(), &self.read_buffer[needed_from_chunk..size])?;
@@ -879,6 +910,7 @@ impl StreamTransport {
         if !future_done(py, &pending.future)? {
             pending.future.bind(py).call_method1("set_result", (data,))?;
         }
+        record_stream_profile_event("read_wait_done", self.fd, pending.size, buffered);
         maybe_resume_transport(reader)?;
         Ok(true)
     }
@@ -913,6 +945,66 @@ impl StreamTransport {
 
 fn trace_stream_enabled() -> bool {
     *TRACE_STREAM.get_or_init(|| env::var_os("KIOTO_TRACE_STREAM").is_some())
+}
+
+pub(crate) fn take_profile_stream_json() -> Option<String> {
+    let state = stream_profile_state()?;
+    let mut state = state.lock();
+    let mut out = String::new();
+    let _ = write!(out, "{{\"dropped\":{},\"events\":[", state.dropped);
+    for (index, event) in state.events.iter().enumerate() {
+        if index != 0 {
+            out.push(',');
+        }
+        let _ = write!(
+            out,
+            "{{\"at_us\":{},\"kind\":\"{}\",\"fd\":{},\"size\":{},\"aux\":{}}}",
+            event.at_us, event.kind, event.fd, event.size, event.aux
+        );
+    }
+    out.push_str("]}");
+    state.events.clear();
+    state.dropped = 0;
+    Some(out)
+}
+
+fn stream_profile_state() -> Option<&'static Mutex<StreamProfileState>> {
+    STREAM_PROFILE
+        .get_or_init(|| {
+            if env::var_os("KIOTO_PROFILE_STREAM_JSON").is_none() {
+                return None;
+            }
+            let limit = env::var("KIOTO_PROFILE_STREAM_LIMIT")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(256);
+            Some(Mutex::new(StreamProfileState {
+                started_at: Instant::now(),
+                limit,
+                dropped: 0,
+                events: Vec::with_capacity(limit.min(1024)),
+            }))
+        })
+        .as_ref()
+}
+
+fn record_stream_profile_event(kind: &'static str, fd: RawFd, size: usize, aux: usize) {
+    let Some(state) = stream_profile_state() else {
+        return;
+    };
+    let mut state = state.lock();
+    if state.events.len() >= state.limit {
+        state.dropped += 1;
+        return;
+    }
+    let at_us = state.started_at.elapsed().as_micros() as u64;
+    state.events.push(StreamProfileEvent {
+        at_us,
+        kind,
+        fd,
+        size,
+        aux,
+    });
 }
 
 struct SyncPyMethodDef(ffi::PyMethodDef);

@@ -66,12 +66,13 @@ impl StreamTransportRegistry {
         self.write_queue.borrow_mut().push((fd, token));
     }
 
-    pub(crate) fn flush_write_queue(&self, py: Python<'_>) -> PyResult<()> {
+    pub(crate) fn flush_write_queue(&self, py: Python<'_>) -> PyResult<usize> {
+        let mut flushed = 0usize;
         loop {
             let drained = {
                 let mut queued = self.write_queue.borrow_mut();
                 if queued.is_empty() {
-                    return Ok(());
+                    return Ok(flushed);
                 }
                 std::mem::take(&mut *queued)
             };
@@ -90,6 +91,7 @@ impl StreamTransportRegistry {
                 }
                 transport.write_queued = false;
                 transport.flush_write_phase(py)?;
+                flushed += 1;
             }
         }
     }

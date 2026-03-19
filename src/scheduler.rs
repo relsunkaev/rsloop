@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::env;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,7 @@ use crate::loop_api::LoopApi;
 use crate::poller::TokioPoller;
 use crate::socket_registry::SocketStateRegistry;
 use crate::stream_registry::StreamTransportRegistry;
+use crate::stream_transport::take_profile_stream_json;
 
 #[derive(Debug)]
 struct TimerEntry {
@@ -85,6 +87,55 @@ struct PhaseStats {
     timers: Duration,
     ready: Duration,
     writes: Duration,
+    tick_stats: TickStats,
+}
+
+#[derive(Default)]
+struct TickStats {
+    fd_events: Vec<u32>,
+    stream_fd_hits: Vec<u32>,
+    socket_fd_hits: Vec<u32>,
+    generic_fd_hits: Vec<u32>,
+    ready_handles: Vec<u32>,
+    ready_local_items: Vec<u32>,
+    ready_remote_items: Vec<u32>,
+    completion_items: Vec<u32>,
+    writes_flushed: Vec<u32>,
+}
+
+#[derive(Default)]
+struct TickSample {
+    fd_events: u32,
+    stream_fd_hits: u32,
+    socket_fd_hits: u32,
+    generic_fd_hits: u32,
+    ready_handles: u32,
+    ready_local_items: u32,
+    ready_remote_items: u32,
+    completion_items: u32,
+    writes_flushed: u32,
+}
+
+impl PhaseStats {
+    fn record_tick(&mut self, tick: &TickSample) {
+        self.ready_handles += tick.ready_handles as u64;
+        self.fd_events += tick.fd_events as u64;
+        self.stream_fd_hits += tick.stream_fd_hits as u64;
+        self.socket_fd_hits += tick.socket_fd_hits as u64;
+        self.generic_fd_hits += tick.generic_fd_hits as u64;
+        self.ready_local_items += tick.ready_local_items as u64;
+        self.ready_remote_items += tick.ready_remote_items as u64;
+        self.completion_items += tick.completion_items as u64;
+        self.tick_stats.fd_events.push(tick.fd_events);
+        self.tick_stats.stream_fd_hits.push(tick.stream_fd_hits);
+        self.tick_stats.socket_fd_hits.push(tick.socket_fd_hits);
+        self.tick_stats.generic_fd_hits.push(tick.generic_fd_hits);
+        self.tick_stats.ready_handles.push(tick.ready_handles);
+        self.tick_stats.ready_local_items.push(tick.ready_local_items);
+        self.tick_stats.ready_remote_items.push(tick.ready_remote_items);
+        self.tick_stats.completion_items.push(tick.completion_items);
+        self.tick_stats.writes_flushed.push(tick.writes_flushed);
+    }
 }
 
 #[pymethods]
@@ -249,7 +300,8 @@ impl Scheduler {
         let mut generic_fd_events = Vec::new();
         let mut _stream_fd_events = Vec::new();
         let mut ready_batch = Vec::new();
-        let profiling = env::var_os("KIOTO_PROFILE_SCHED").is_some();
+        let profiling_json = env::var_os("KIOTO_PROFILE_SCHED_JSON").is_some();
+        let profiling = profiling_json || env::var_os("KIOTO_PROFILE_SCHED").is_some();
         let mut stats = PhaseStats::default();
         self.stopping.store(0, AtomicOrdering::Release);
         loop {
@@ -305,6 +357,12 @@ impl Scheduler {
                 stats.writes.as_secs_f64(),
             );
         }
+        if profiling_json {
+            eprintln!("KIOTO_PROFILE_SCHED_JSON {}", scheduler_profile_json(&stats));
+            if let Some(trace_json) = take_profile_stream_json() {
+                eprintln!("KIOTO_PROFILE_STREAM_JSON {trace_json}");
+            }
+        }
 
         Ok(())
     }
@@ -334,6 +392,7 @@ impl Scheduler {
         stats: Option<&mut PhaseStats>,
     ) -> PyResult<()> {
         let mut stats = stats;
+        let mut tick = TickSample::default();
         if let Some(native_api) = native_api {
             let native_api = native_api.bind(py);
             let mut fallback = native_api.borrow().drain_ready_fallback();
@@ -359,7 +418,7 @@ impl Scheduler {
             self.next_timer_inner(py)?
         };
         let timeout = if has_ready || stopping {
-            Some(0.0)
+                    Some(0.0)
         } else {
             match next_timer {
                 Some(when) => {
@@ -412,9 +471,7 @@ impl Scheduler {
                 let socket_registry = socket_registry.as_ref().map(|registry| registry.borrow());
                 generic_fd_events.clear();
                 for (fd, mask) in fd_events.iter().copied() {
-                    if let Some(stats) = stats.as_deref_mut() {
-                        stats.fd_events += 1;
-                    }
+                    tick.fd_events += 1;
                     if self_pipe_fd.is_some_and(|self_pipe_fd| fd == self_pipe_fd) {
                         drain_self_pipe_fd(fd)?;
                         if let Some(native_api) = native_api {
@@ -423,22 +480,16 @@ impl Scheduler {
                         continue;
                     }
                     if stream_registry.dispatch_one(py, fd, mask)? {
-                        if let Some(stats) = stats.as_deref_mut() {
-                            stats.stream_fd_hits += 1;
-                        }
+                        tick.stream_fd_hits += 1;
                         continue;
                     }
                     if let Some(socket_registry) = socket_registry.as_ref() {
                         if socket_registry.dispatch_one(py, fd, mask)? {
-                            if let Some(stats) = stats.as_deref_mut() {
-                                stats.socket_fd_hits += 1;
-                            }
+                            tick.socket_fd_hits += 1;
                             continue;
                         }
                     }
-                    if let Some(stats) = stats.as_deref_mut() {
-                        stats.generic_fd_hits += 1;
-                    }
+                    tick.generic_fd_hits += 1;
                     generic_fd_events.push((fd, mask));
                 }
                 if !generic_fd_events.is_empty() {
@@ -451,9 +502,7 @@ impl Scheduler {
                 let socket_registry = socket_registry.borrow();
                 generic_fd_events.clear();
                 for (fd, mask) in fd_events.iter().copied() {
-                    if let Some(stats) = stats.as_deref_mut() {
-                        stats.fd_events += 1;
-                    }
+                    tick.fd_events += 1;
                     if self_pipe_fd.is_some_and(|self_pipe_fd| fd == self_pipe_fd) {
                         drain_self_pipe_fd(fd)?;
                         if let Some(native_api) = native_api {
@@ -462,12 +511,10 @@ impl Scheduler {
                         continue;
                     }
                     if !socket_registry.dispatch_one(py, fd, mask)? {
-                        if let Some(stats) = stats.as_deref_mut() {
-                            stats.generic_fd_hits += 1;
-                        }
+                        tick.generic_fd_hits += 1;
                         generic_fd_events.push((fd, mask));
-                    } else if let Some(stats) = stats.as_deref_mut() {
-                        stats.socket_fd_hits += 1;
+                    } else {
+                        tick.socket_fd_hits += 1;
                     }
                 }
                 if !generic_fd_events.is_empty() {
@@ -478,9 +525,7 @@ impl Scheduler {
             } else {
                 let mut python_fd_events = Vec::new();
                 for (fd, mask) in fd_events.iter().copied() {
-                    if let Some(stats) = stats.as_deref_mut() {
-                        stats.fd_events += 1;
-                    }
+                    tick.fd_events += 1;
                     if self_pipe_fd.is_some_and(|self_pipe_fd| fd == self_pipe_fd) {
                         drain_self_pipe_fd(fd)?;
                         if let Some(native_api) = native_api {
@@ -488,9 +533,7 @@ impl Scheduler {
                         }
                         continue;
                     }
-                    if let Some(stats) = stats.as_deref_mut() {
-                        stats.generic_fd_hits += 1;
-                    }
+                    tick.generic_fd_hits += 1;
                     python_fd_events.push((fd, mask));
                 }
                 if !python_fd_events.is_empty() {
@@ -505,9 +548,7 @@ impl Scheduler {
         }
 
         if !completions.is_empty() {
-            if let Some(stats) = stats.as_deref_mut() {
-                stats.completion_items += completions.len() as u64;
-            }
+            tick.completion_items = completions.len() as u32;
             let started = stats.as_ref().map(|_| Instant::now());
             drain_completions(py, completions)?;
             if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
@@ -524,18 +565,13 @@ impl Scheduler {
             }
         }
         let ready_started = stats.as_ref().map(|_| Instant::now());
-        if let Some(stats) = stats.as_deref_mut() {
-            stats.ready_handles += ready_batch.len() as u64
-                + self.ready_remote_len.load(AtomicOrdering::Acquire) as u64
-                + self.ready_local.lock().len() as u64;
-        }
         self.run_ready_inner(
             py,
             &loop_obj,
             debug,
             slow_callback_duration,
             ready_batch,
-            stats.as_deref_mut(),
+            &mut tick,
         )?;
         if let Some(stats) = stats.as_deref_mut() {
             stats.ready += ready_started.map(|started| started.elapsed()).unwrap_or_default();
@@ -543,10 +579,13 @@ impl Scheduler {
 
         if let Some(registry) = stream_registry {
             let started = stats.as_ref().map(|_| Instant::now());
-            registry.bind(py).borrow().flush_write_queue(py)?;
+            tick.writes_flushed = registry.bind(py).borrow().flush_write_queue(py)? as u32;
             if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
                 stats.writes += started.elapsed();
             }
+        }
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.record_tick(&tick);
         }
 
         Ok(())
@@ -617,14 +656,13 @@ impl Scheduler {
         debug: bool,
         slow_callback_duration: f64,
         ready_batch: &mut Vec<Py<PyAny>>,
-        stats: Option<&mut PhaseStats>,
+        tick: &mut TickSample,
     ) -> PyResult<()> {
         if self.ready_remote_len.load(AtomicOrdering::Acquire) == 0 && self.ready_local.lock().is_empty() {
             return Ok(());
         }
         ready_batch.clear();
         let mut ready_local_items = 0usize;
-        let mut ready_remote_items = 0usize;
         {
             let mut ready_local = self.ready_local.lock();
             if !ready_local.is_empty() {
@@ -638,15 +676,13 @@ impl Scheduler {
             drained_remote += 1;
             ready_batch.push(handle);
         }
-        ready_remote_items = drained_remote;
         if drained_remote != 0 {
             self.ready_remote_len
                 .fetch_sub(drained_remote, AtomicOrdering::AcqRel);
         }
-        if let Some(stats) = stats {
-            stats.ready_local_items += ready_local_items as u64;
-            stats.ready_remote_items += ready_remote_items as u64;
-        }
+        tick.ready_local_items = ready_local_items as u32;
+        tick.ready_remote_items = drained_remote as u32;
+        tick.ready_handles = (ready_local_items + drained_remote) as u32;
 
         for handle in ready_batch.drain(..) {
             run_ready_handle(py, loop_obj, &handle, debug, slow_callback_duration)?;
@@ -654,6 +690,80 @@ impl Scheduler {
 
         Ok(())
     }
+}
+
+fn scheduler_profile_json(stats: &PhaseStats) -> String {
+    let mut out = String::new();
+    out.push('{');
+    let _ = write!(
+        out,
+        "\"iterations\":{},\"direct_waits\":{},\"poll_waits\":{},\"completion_items\":{},\"ready_handles\":{},\"fd_events\":{},\"stream_fd_hits\":{},\"socket_fd_hits\":{},\"generic_fd_hits\":{},\"ready_local_items\":{},\"ready_remote_items\":{},\"phase_seconds\":{{\"select\":{:.6},\"fd_dispatch\":{:.6},\"completions\":{:.6},\"timers\":{:.6},\"ready\":{:.6},\"writes\":{:.6}}},\"ticks\":{{",
+        stats.iterations,
+        stats.direct_waits,
+        stats.poll_waits,
+        stats.completion_items,
+        stats.ready_handles,
+        stats.fd_events,
+        stats.stream_fd_hits,
+        stats.socket_fd_hits,
+        stats.generic_fd_hits,
+        stats.ready_local_items,
+        stats.ready_remote_items,
+        stats.select.as_secs_f64(),
+        stats.fd_dispatch.as_secs_f64(),
+        stats.completions.as_secs_f64(),
+        stats.timers.as_secs_f64(),
+        stats.ready.as_secs_f64(),
+        stats.writes.as_secs_f64(),
+    );
+    append_distribution_json(&mut out, "fd_events", &stats.tick_stats.fd_events);
+    out.push(',');
+    append_distribution_json(&mut out, "stream_fd_hits", &stats.tick_stats.stream_fd_hits);
+    out.push(',');
+    append_distribution_json(&mut out, "socket_fd_hits", &stats.tick_stats.socket_fd_hits);
+    out.push(',');
+    append_distribution_json(&mut out, "generic_fd_hits", &stats.tick_stats.generic_fd_hits);
+    out.push(',');
+    append_distribution_json(&mut out, "ready_handles", &stats.tick_stats.ready_handles);
+    out.push(',');
+    append_distribution_json(&mut out, "ready_local_items", &stats.tick_stats.ready_local_items);
+    out.push(',');
+    append_distribution_json(&mut out, "ready_remote_items", &stats.tick_stats.ready_remote_items);
+    out.push(',');
+    append_distribution_json(&mut out, "completion_items", &stats.tick_stats.completion_items);
+    out.push(',');
+    append_distribution_json(&mut out, "writes_flushed", &stats.tick_stats.writes_flushed);
+    out.push_str("}}");
+    out
+}
+
+fn append_distribution_json(out: &mut String, name: &str, values: &[u32]) {
+    let _ = write!(out, "\"{name}\":");
+    if values.is_empty() {
+        out.push_str("{\"count\":0,\"sum\":0,\"mean\":0.0,\"p50\":0,\"p95\":0,\"max\":0}");
+        return;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let count = sorted.len();
+    let sum: u64 = values.iter().map(|value| *value as u64).sum();
+    let mean = sum as f64 / count as f64;
+    let p50 = percentile(&sorted, 0.50);
+    let p95 = percentile(&sorted, 0.95);
+    let max = *sorted.last().unwrap_or(&0);
+    let _ = write!(
+        out,
+        "{{\"count\":{},\"sum\":{},\"mean\":{:.3},\"p50\":{},\"p95\":{},\"max\":{}}}",
+        count, sum, mean, p50, p95, max
+    );
+}
+
+fn percentile(sorted: &[u32], pct: f64) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let index = ((sorted.len() - 1) as f64 * pct).round() as usize;
+    sorted[index.min(sorted.len() - 1)]
 }
 
 fn is_cancelled(py: Python<'_>, handle: &Py<PyAny>) -> PyResult<bool> {
