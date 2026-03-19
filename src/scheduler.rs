@@ -14,7 +14,7 @@ use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 
 use crate::completion::{Completion, CompletionPort};
-use crate::handles::{is_native_cancelled, mark_native_unscheduled, run_native_handle};
+use crate::handles::{NativeHandleKind, is_native_cancelled, mark_native_unscheduled, native_handle_kind, run_native_handle};
 use crate::loop_api::LoopApi;
 use crate::poller::TokioPoller;
 use crate::socket_registry::SocketStateRegistry;
@@ -81,6 +81,11 @@ struct PhaseStats {
     generic_fd_hits: u64,
     ready_local_items: u64,
     ready_remote_items: u64,
+    ready_zero_arg: u64,
+    ready_one_arg: u64,
+    ready_handle_native: u64,
+    ready_future_native: u64,
+    ready_python: u64,
     select: Duration,
     fd_dispatch: Duration,
     completions: Duration,
@@ -99,6 +104,11 @@ struct TickStats {
     ready_handles: Vec<u32>,
     ready_local_items: Vec<u32>,
     ready_remote_items: Vec<u32>,
+    ready_zero_arg: Vec<u32>,
+    ready_one_arg: Vec<u32>,
+    ready_handle_native: Vec<u32>,
+    ready_future_native: Vec<u32>,
+    ready_python: Vec<u32>,
     completion_items: Vec<u32>,
     writes_flushed: Vec<u32>,
 }
@@ -112,6 +122,11 @@ struct TickSample {
     ready_handles: u32,
     ready_local_items: u32,
     ready_remote_items: u32,
+    ready_zero_arg: u32,
+    ready_one_arg: u32,
+    ready_handle_native: u32,
+    ready_future_native: u32,
+    ready_python: u32,
     completion_items: u32,
     writes_flushed: u32,
 }
@@ -125,6 +140,11 @@ impl PhaseStats {
         self.generic_fd_hits += tick.generic_fd_hits as u64;
         self.ready_local_items += tick.ready_local_items as u64;
         self.ready_remote_items += tick.ready_remote_items as u64;
+        self.ready_zero_arg += tick.ready_zero_arg as u64;
+        self.ready_one_arg += tick.ready_one_arg as u64;
+        self.ready_handle_native += tick.ready_handle_native as u64;
+        self.ready_future_native += tick.ready_future_native as u64;
+        self.ready_python += tick.ready_python as u64;
         self.completion_items += tick.completion_items as u64;
         self.tick_stats.fd_events.push(tick.fd_events);
         self.tick_stats.stream_fd_hits.push(tick.stream_fd_hits);
@@ -133,6 +153,15 @@ impl PhaseStats {
         self.tick_stats.ready_handles.push(tick.ready_handles);
         self.tick_stats.ready_local_items.push(tick.ready_local_items);
         self.tick_stats.ready_remote_items.push(tick.ready_remote_items);
+        self.tick_stats.ready_zero_arg.push(tick.ready_zero_arg);
+        self.tick_stats.ready_one_arg.push(tick.ready_one_arg);
+        self.tick_stats
+            .ready_handle_native
+            .push(tick.ready_handle_native);
+        self.tick_stats
+            .ready_future_native
+            .push(tick.ready_future_native);
+        self.tick_stats.ready_python.push(tick.ready_python);
         self.tick_stats.completion_items.push(tick.completion_items);
         self.tick_stats.writes_flushed.push(tick.writes_flushed);
     }
@@ -684,6 +713,13 @@ impl Scheduler {
         tick.ready_handles = (ready_local_items + drained_remote) as u32;
 
         for handle in ready_batch.drain(..) {
+            match native_handle_kind(py, &handle) {
+                Some(NativeHandleKind::ZeroArg) => tick.ready_zero_arg += 1,
+                Some(NativeHandleKind::OneArg) => tick.ready_one_arg += 1,
+                Some(NativeHandleKind::Handle) => tick.ready_handle_native += 1,
+                Some(NativeHandleKind::Future) => tick.ready_future_native += 1,
+                None => tick.ready_python += 1,
+            }
             run_ready_handle(py, loop_obj, &handle, debug, slow_callback_duration)?;
         }
 
@@ -696,7 +732,7 @@ fn scheduler_profile_json(stats: &PhaseStats) -> String {
     out.push('{');
     let _ = write!(
         out,
-        "\"iterations\":{},\"direct_waits\":{},\"poll_waits\":{},\"completion_items\":{},\"ready_handles\":{},\"fd_events\":{},\"stream_fd_hits\":{},\"socket_fd_hits\":{},\"generic_fd_hits\":{},\"ready_local_items\":{},\"ready_remote_items\":{},\"phase_seconds\":{{\"select\":{:.6},\"fd_dispatch\":{:.6},\"completions\":{:.6},\"timers\":{:.6},\"ready\":{:.6},\"writes\":{:.6}}},\"ticks\":{{",
+        "\"iterations\":{},\"direct_waits\":{},\"poll_waits\":{},\"completion_items\":{},\"ready_handles\":{},\"fd_events\":{},\"stream_fd_hits\":{},\"socket_fd_hits\":{},\"generic_fd_hits\":{},\"ready_local_items\":{},\"ready_remote_items\":{},\"ready_zero_arg\":{},\"ready_one_arg\":{},\"ready_handle_native\":{},\"ready_future_native\":{},\"ready_python\":{},\"phase_seconds\":{{\"select\":{:.6},\"fd_dispatch\":{:.6},\"completions\":{:.6},\"timers\":{:.6},\"ready\":{:.6},\"writes\":{:.6}}},\"ticks\":{{",
         stats.iterations,
         stats.direct_waits,
         stats.poll_waits,
@@ -708,6 +744,11 @@ fn scheduler_profile_json(stats: &PhaseStats) -> String {
         stats.generic_fd_hits,
         stats.ready_local_items,
         stats.ready_remote_items,
+        stats.ready_zero_arg,
+        stats.ready_one_arg,
+        stats.ready_handle_native,
+        stats.ready_future_native,
+        stats.ready_python,
         stats.select.as_secs_f64(),
         stats.fd_dispatch.as_secs_f64(),
         stats.completions.as_secs_f64(),
@@ -728,6 +769,24 @@ fn scheduler_profile_json(stats: &PhaseStats) -> String {
     append_distribution_json(&mut out, "ready_local_items", &stats.tick_stats.ready_local_items);
     out.push(',');
     append_distribution_json(&mut out, "ready_remote_items", &stats.tick_stats.ready_remote_items);
+    out.push(',');
+    append_distribution_json(&mut out, "ready_zero_arg", &stats.tick_stats.ready_zero_arg);
+    out.push(',');
+    append_distribution_json(&mut out, "ready_one_arg", &stats.tick_stats.ready_one_arg);
+    out.push(',');
+    append_distribution_json(
+        &mut out,
+        "ready_handle_native",
+        &stats.tick_stats.ready_handle_native,
+    );
+    out.push(',');
+    append_distribution_json(
+        &mut out,
+        "ready_future_native",
+        &stats.tick_stats.ready_future_native,
+    );
+    out.push(',');
+    append_distribution_json(&mut out, "ready_python", &stats.tick_stats.ready_python);
     out.push(',');
     append_distribution_json(&mut out, "completion_items", &stats.tick_stats.completion_items);
     out.push(',');

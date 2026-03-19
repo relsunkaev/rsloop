@@ -6,7 +6,7 @@ It now covers four workload classes:
 
 - `scheduler`: callback, timer, and cross-thread scheduling churn
 - `raw-socket`: `loop.sock_*` helpers and socketpair/TCP raw I/O
-- `stream`: asyncio streams on small, large, concurrent, and request/response payloads
+- `stream`: asyncio streams on small, large, concurrent, request/response, pipelined, and mixed-payload traffic
 - `connection`: connect/close churn and idle fanout
 
 ### Useful commands
@@ -52,7 +52,7 @@ Capture Kioto scheduler shape data and stream events for an isolated run:
 
 - `smoke`: fast sanity checks
 - `default`: balanced comparison set for routine iteration
-- `full`: all scenarios
+- `full`: all scenarios, including heavier mixed-payload stream cases
 
 ### Notes
 

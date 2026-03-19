@@ -11,7 +11,7 @@ use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
 use std::time::Instant;
 
 use parking_lot::Mutex;
-use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError};
+use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyStopIteration};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -24,6 +24,7 @@ const DEFAULT_STREAM_READ_SIZE: usize = 64 * 1024;
 const NATIVE_READEXACTLY_LIMIT: usize = 16 * 1024;
 const DIRECT_WRITE_LIMIT: usize = 64;
 const WRITEV_BATCH_LIMIT: usize = 8;
+const COALESCED_WRITE_LIMIT: usize = 4 * 1024;
 const WRITE_HIGH_WATER: usize = 64 * 1024;
 const WRITE_LOW_WATER: usize = 16 * 1024;
 static TRACE_STREAM: OnceLock<bool> = OnceLock::new();
@@ -93,6 +94,36 @@ pub(crate) struct StreamCore {
 #[pyclass(module = "kioto._kioto", unsendable)]
 pub struct StreamTransport {
     pub(crate) core: StreamCoreRef,
+}
+
+#[pyclass(module = "kioto._kioto", unsendable)]
+struct ReadyAwaitable {
+    result: Option<Py<PyAny>>,
+    exception: Option<Py<PyAny>>,
+    done: bool,
+}
+
+#[pymethods]
+impl ReadyAwaitable {
+    fn __await__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        if slf.done {
+            return Ok(None);
+        }
+        slf.done = true;
+        if let Some(exception) = slf.exception.take() {
+            return Err(PyErr::from_value(exception.into_bound(py).into_any()));
+        }
+        let result = slf.result.take().unwrap_or_else(|| py.None());
+        Err(PyStopIteration::new_err((result,)))
+    }
 }
 
 #[pymethods]
@@ -623,6 +654,34 @@ impl StreamCore {
             return Ok(sent);
         }
 
+        let mut total = 0usize;
+        for pending in self.write_queue.iter().take(WRITEV_BATCH_LIMIT) {
+            let data = pending.data.bind(py);
+            let bytes = data.as_bytes();
+            total += bytes.len().saturating_sub(pending.sent);
+            if total > COALESCED_WRITE_LIMIT {
+                break;
+            }
+        }
+        if total != 0 && total <= COALESCED_WRITE_LIMIT {
+            let mut merged = Vec::with_capacity(total);
+            for pending in self.write_queue.iter().take(WRITEV_BATCH_LIMIT) {
+                let data = pending.data.bind(py);
+                let bytes = data.as_bytes();
+                let slice = &bytes[pending.sent..];
+                if slice.is_empty() {
+                    continue;
+                }
+                merged.extend_from_slice(slice);
+            }
+            let sent = try_send_bytes(self.fd, &merged)?;
+            if sent == 0 {
+                return Ok(0);
+            }
+            self.consume_written_bytes(py, sent);
+            return Ok(sent);
+        }
+
         let mut iovecs = Vec::with_capacity(self.write_queue.len().min(WRITEV_BATCH_LIMIT));
         for pending in self.write_queue.iter().take(WRITEV_BATCH_LIMIT) {
             let data = pending.data.bind(py);
@@ -895,11 +954,11 @@ impl StreamCore {
             .clone_ref(py);
         let buffer = buffer_obj.bind(py);
         if let Some(exc) = current_exception(&reader)? {
-            return ready_future_exception(py, &reader, exc);
+            return ready_awaitable_exception(py, exc);
         }
         if size == 0 {
             let payload = PyBytes::new(py, b"").into_any().unbind();
-            return ready_future_result(py, &reader, payload);
+            return ready_awaitable_result(py, payload);
         }
 
         if size > NATIVE_READEXACTLY_LIMIT {
@@ -911,12 +970,12 @@ impl StreamCore {
         if try_consume_exact(buffer.as_ptr(), size)? {
             let data = consume_exact(py, buffer.as_ptr(), size)?;
             maybe_resume_transport(&reader)?;
-            return ready_future_result(py, &reader, data);
+            return ready_awaitable_result(py, data);
         }
 
         if reader.getattr("_eof")?.is_truthy()? {
             let partial = consume_all(py, buffer.as_ptr())?;
-            return ready_future_exception(py, &reader, incomplete_read_error(py, partial, size)?);
+            return ready_awaitable_exception(py, incomplete_read_error(py, partial, size)?);
         }
 
         if self.pending_read.is_some() {
@@ -1511,24 +1570,28 @@ fn coerce_bytes(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyBytes>
         .unbind())
 }
 
-fn ready_future_result(
-    py: Python<'_>,
-    reader: &Bound<'_, PyAny>,
-    payload: Py<PyAny>,
-) -> PyResult<Py<PyAny>> {
-    let future = reader.getattr("_loop")?.call_method0("create_future")?;
-    future.call_method1("set_result", (payload.bind(py),))?;
-    Ok(future.unbind())
+fn ready_awaitable_result(py: Python<'_>, payload: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    Py::new(
+        py,
+        ReadyAwaitable {
+            result: Some(payload),
+            exception: None,
+            done: false,
+        },
+    )
+    .map(|obj| obj.into_bound(py).into_any().unbind())
 }
 
-fn ready_future_exception(
-    py: Python<'_>,
-    reader: &Bound<'_, PyAny>,
-    exc: Py<PyAny>,
-) -> PyResult<Py<PyAny>> {
-    let future = reader.getattr("_loop")?.call_method0("create_future")?;
-    future.call_method1("set_exception", (exc.bind(py),))?;
-    Ok(future.unbind())
+fn ready_awaitable_exception(py: Python<'_>, exc: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    Py::new(
+        py,
+        ReadyAwaitable {
+            result: None,
+            exception: Some(exc),
+            done: false,
+        },
+    )
+    .map(|obj| obj.into_bound(py).into_any().unbind())
 }
 
 fn incomplete_read_error(

@@ -807,7 +807,6 @@ impl ZeroArgHandle {
         if borrowed.cancelled.load(Ordering::Acquire) {
             return Ok(());
         }
-
         let context = borrowed.context.clone_ref(py);
         let callback = borrowed.callback.clone_ref(py);
         let loop_obj = borrowed.loop_obj.clone_ref(py);
@@ -912,7 +911,6 @@ impl OneArgHandle {
         if borrowed.cancelled.load(Ordering::Acquire) {
             return Ok(());
         }
-
         let context = borrowed.context.clone_ref(py);
         let callback = borrowed.callback.clone_ref(py);
         let arg = borrowed.arg.clone_ref(py);
@@ -1008,14 +1006,14 @@ pub(crate) fn run_native_handle(py: Python<'_>, handle: &Py<PyAny>) -> Option<Py
 }
 
 #[derive(Clone, Copy)]
-enum NativeHandleKind {
+pub(crate) enum NativeHandleKind {
     ZeroArg,
     OneArg,
     Handle,
     Future,
 }
 
-fn native_handle_kind(py: Python<'_>, handle: &Py<PyAny>) -> Option<NativeHandleKind> {
+pub(crate) fn native_handle_kind(py: Python<'_>, handle: &Py<PyAny>) -> Option<NativeHandleKind> {
     let ty = unsafe { ffi::Py_TYPE(handle.as_ptr()) } as usize;
     if ty == native_type_ptr::<ZeroArgHandle>(py) {
         return Some(NativeHandleKind::ZeroArg);
