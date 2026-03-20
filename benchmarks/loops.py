@@ -11,6 +11,7 @@ import subprocess
 import socket
 import statistics
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -365,6 +366,97 @@ def run_on_loop(loop_name: str, coro: Awaitable[None]) -> None:
         runner.run(coro)
 
 
+def split_evenly(total: int, buckets: int) -> list[int]:
+    if buckets <= 0:
+        raise ValueError("buckets must be positive")
+    base, remainder = divmod(total, buckets)
+    return [base + (1 if index < remainder else 0) for index in range(buckets)]
+
+
+def split_weighted(total: int, weights: list[int]) -> list[int]:
+    if not weights or any(weight < 0 for weight in weights):
+        raise ValueError("weights must be non-empty and non-negative")
+    weight_total = sum(weights)
+    if weight_total == 0:
+        return split_evenly(total, len(weights))
+    counts = [(total * weight) // weight_total for weight in weights]
+    remaining = total - sum(counts)
+    ranked = sorted(
+        range(len(weights)),
+        key=lambda index: (weights[index], -index),
+        reverse=True,
+    )
+    for index in ranked[:remaining]:
+        counts[index] += 1
+    return counts
+
+
+async def wait_for_fd(
+    loop: asyncio.AbstractEventLoop,
+    fd: int,
+    *,
+    readable: bool,
+) -> None:
+    future = loop.create_future()
+
+    def on_ready() -> None:
+        remover = loop.remove_reader if readable else loop.remove_writer
+        remover(fd)
+        if not future.done():
+            future.set_result(None)
+
+    registrar = loop.add_reader if readable else loop.add_writer
+    remover = loop.remove_reader if readable else loop.remove_writer
+    registrar(fd, on_ready)
+    try:
+        await future
+    finally:
+        remover(fd)
+
+
+async def recv_exact_into(
+    loop: asyncio.AbstractEventLoop,
+    sock: socket.socket,
+    buf: memoryview,
+) -> int:
+    received = 0
+    while received < len(buf):
+        chunk = await loop.sock_recv_into(sock, buf[received:])
+        if chunk == 0:
+            raise RuntimeError(f"unexpected EOF while reading {len(buf)} bytes")
+        received += chunk
+    return received
+
+
+async def udp_sendto(
+    loop: asyncio.AbstractEventLoop,
+    sock: socket.socket,
+    data: bytes,
+    address: Any,
+) -> None:
+    while True:
+        try:
+            sent = sock.sendto(data, address)
+        except (BlockingIOError, InterruptedError):
+            await wait_for_fd(loop, sock.fileno(), readable=False)
+            continue
+        if sent != len(data):
+            raise RuntimeError(f"partial UDP send: {sent} != {len(data)}")
+        return
+
+
+async def udp_recvfrom(
+    loop: asyncio.AbstractEventLoop,
+    sock: socket.socket,
+    size: int,
+) -> tuple[bytes, Any]:
+    while True:
+        try:
+            return sock.recvfrom(size)
+        except (BlockingIOError, InterruptedError):
+            await wait_for_fd(loop, sock.fileno(), readable=True)
+
+
 async def bench_call_soon(count: int) -> None:
     loop = asyncio.get_running_loop()
     done = loop.create_future()
@@ -379,6 +471,32 @@ async def bench_call_soon(count: int) -> None:
     for _ in range(count):
         loop.call_soon(tick)
 
+    await done
+
+
+async def bench_call_soon_batched(count: int, batch_size: int = 8) -> None:
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+    scheduled = 0
+    completed = 0
+
+    def schedule_batch() -> None:
+        nonlocal scheduled
+        burst = min(batch_size, count - scheduled)
+        for _ in range(burst):
+            scheduled += 1
+            loop.call_soon(tick)
+
+    def tick() -> None:
+        nonlocal completed
+        completed += 1
+        if completed == count and not done.done():
+            done.set_result(None)
+            return
+        if scheduled < count:
+            schedule_batch()
+
+    schedule_batch()
     await done
 
 
@@ -399,6 +517,47 @@ async def bench_call_soon_threadsafe(count: int) -> None:
 
     await asyncio.to_thread(producer)
     await done
+
+
+async def bench_call_soon_threadsafe_multi(count: int, producers: int) -> None:
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+    remaining = count
+    per_thread = split_evenly(count, producers)
+
+    def tick() -> None:
+        nonlocal remaining
+        remaining -= 1
+        if remaining == 0 and not done.done():
+            done.set_result(None)
+
+    def launch_threads() -> None:
+        barrier = threading.Barrier(producers + 1)
+        threads: list[threading.Thread] = []
+
+        def producer(iterations: int) -> None:
+            barrier.wait()
+            for _ in range(iterations):
+                loop.call_soon_threadsafe(tick)
+
+        for iterations in per_thread:
+            thread = threading.Thread(target=producer, args=(iterations,))
+            thread.start()
+            threads.append(thread)
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+    await asyncio.to_thread(launch_threads)
+    await done
+
+
+async def bench_call_soon_threadsafe_multi_4(count: int) -> None:
+    await bench_call_soon_threadsafe_multi(count, producers=4)
+
+
+async def bench_call_soon_threadsafe_multi_8(count: int) -> None:
+    await bench_call_soon_threadsafe_multi(count, producers=8)
 
 
 async def bench_sleep_zero(count: int) -> None:
@@ -423,12 +582,60 @@ async def bench_timer_zero(count: int) -> None:
     await done
 
 
+async def bench_timer_staggered(count: int) -> None:
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+    remaining = count
+    delays = (0.0, 0.0001, 0.0005, 0.001)
+
+    def tick() -> None:
+        nonlocal remaining
+        remaining -= 1
+        if remaining == 0 and not done.done():
+            done.set_result(None)
+
+    for index in range(count):
+        loop.call_later(delays[index % len(delays)], tick)
+
+    await done
+
+
+async def bench_timer_cancel(count: int) -> None:
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+    remaining = 0
+    handles: list[asyncio.Handle] = []
+    delays = (0.0005, 0.001, 0.0015, 0.002)
+
+    def tick() -> None:
+        nonlocal remaining
+        remaining -= 1
+        if remaining == 0 and not done.done():
+            done.set_result(None)
+
+    for index in range(count):
+        handles.append(loop.call_later(delays[index % len(delays)], tick))
+    for index, handle in enumerate(handles):
+        if index % 8 == 0:
+            remaining += 1
+        else:
+            handle.cancel()
+
+    if remaining == 0:
+        return
+    await done
+
+
 async def bench_socketpair_small(count: int) -> None:
     await socketpair_roundtrip(count, payload_size=1)
 
 
 async def bench_socketpair_large(count: int) -> None:
     await socketpair_roundtrip(count, payload_size=4096)
+
+
+async def bench_sock_recv_into(count: int) -> None:
+    await socketpair_roundtrip_into(count, payload_size=4096)
 
 
 async def socketpair_roundtrip(count: int, payload_size: int) -> None:
@@ -453,6 +660,34 @@ async def socketpair_roundtrip(count: int, payload_size: int) -> None:
         right.close()
 
 
+async def socketpair_roundtrip_into(count: int, payload_size: int) -> None:
+    loop = asyncio.get_running_loop()
+    left, right = socket.socketpair()
+    left.setblocking(False)
+    right.setblocking(False)
+    payload = b"x" * payload_size
+    left_buf = bytearray(payload_size)
+    right_buf = bytearray(payload_size)
+    left_view = memoryview(left_buf)
+    right_view = memoryview(right_buf)
+
+    try:
+        for _ in range(count):
+            await loop.sock_sendall(left, payload)
+            await recv_exact_into(loop, right, right_view)
+            if right_view[0] != payload[0] or right_view[-1] != payload[-1]:
+                raise RuntimeError("unexpected payload contents on right socket")
+            await loop.sock_sendall(right, payload)
+            await recv_exact_into(loop, left, left_view)
+            if left_view[0] != payload[0] or left_view[-1] != payload[-1]:
+                raise RuntimeError("unexpected payload contents on left socket")
+    finally:
+        left_view.release()
+        right_view.release()
+        left.close()
+        right.close()
+
+
 async def bench_tcp_echo_small(count: int) -> None:
     await tcp_stream_echo(count, payload_size=1)
 
@@ -463,6 +698,23 @@ async def bench_tcp_echo_large(count: int) -> None:
 
 async def bench_tcp_echo_parallel(count: int) -> None:
     await tcp_stream_echo_parallel(count, clients=32, payload_size=64)
+
+
+async def bench_tcp_echo_fragmented(count: int) -> None:
+    await tcp_stream_echo_fragmented(count, payload_size=64, fragment_size=1)
+
+
+async def bench_tcp_echo_burst_no_drain(count: int) -> None:
+    await tcp_stream_echo_burst_no_drain(count, payload_size=64, burst=16)
+
+
+async def bench_tcp_echo_backpressured(count: int) -> None:
+    await tcp_stream_echo_backpressured(
+        count,
+        payload_size=16 * 1024,
+        pause_every=8,
+        pause_seconds=0.0005,
+    )
 
 
 async def bench_tcp_rpc(count: int) -> None:
@@ -487,6 +739,14 @@ async def bench_tcp_rpc_pipeline_parallel(count: int) -> None:
     )
 
 
+async def bench_tcp_rpc_asymmetric_smallreq_hugeresp(count: int) -> None:
+    await tcp_stream_rpc(count, request_size=64, response_size=64 * 1024)
+
+
+async def bench_tcp_rpc_asymmetric_hugereq_smallresp(count: int) -> None:
+    await tcp_stream_rpc(count, request_size=64 * 1024, response_size=64)
+
+
 async def bench_tcp_upload_parallel(count: int) -> None:
     await tcp_stream_rpc_parallel(count, clients=16, request_size=16 * 1024, response_size=1)
 
@@ -505,6 +765,29 @@ async def bench_tcp_rpc_pipeline_4k_parallel(count: int) -> None:
     )
 
 
+async def bench_tcp_echo_parallel_128(count: int) -> None:
+    await tcp_stream_echo_parallel(count, clients=128, payload_size=64)
+
+
+async def bench_tcp_rpc_pipeline_deep(count: int) -> None:
+    await tcp_stream_rpc_pipeline(count, request_size=64, response_size=256, pipeline=64)
+
+
+async def bench_tcp_rpc_pipeline_unbalanced(count: int) -> None:
+    await tcp_stream_rpc_pipeline_unbalanced(
+        count,
+        heavy_clients=4,
+        light_clients=28,
+        request_size=64,
+        response_size=256,
+        pipeline=8,
+    )
+
+
+async def bench_tcp_stream_half_close(count: int) -> None:
+    await tcp_stream_half_close(count, payload_size=4096)
+
+
 async def bench_tcp_echo_mixed_parallel(count: int) -> None:
     await tcp_stream_echo_mixed_parallel(count, clients=16, payload_sizes=(64, 256, 1024, 4096))
 
@@ -515,6 +798,22 @@ async def bench_tcp_bulk(count: int) -> None:
 
 async def bench_tcp_sock_small(count: int) -> None:
     await tcp_sock_echo(count, payload_size=1)
+
+
+async def bench_tcp_sock_large(count: int) -> None:
+    await tcp_sock_echo(count, payload_size=4096)
+
+
+async def bench_tcp_sock_parallel(count: int) -> None:
+    await tcp_sock_echo_parallel(count, clients=32, payload_size=64)
+
+
+async def bench_udp_pingpong(count: int) -> None:
+    await udp_pingpong(count, payload_size=64)
+
+
+async def bench_udp_fanout(count: int) -> None:
+    await udp_fanout(count, clients=32, payload_size=64)
 
 
 async def bench_tcp_connect_close(count: int) -> None:
@@ -540,6 +839,106 @@ async def bench_tcp_connect_close(count: int) -> None:
             writer.close()
             await writer.wait_closed()
         await done
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def bench_tcp_connect_parallel(count: int) -> None:
+    accepted = 0
+    done = asyncio.get_running_loop().create_future()
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        nonlocal accepted
+        accepted += 1
+        writer.close()
+        await writer.wait_closed()
+        if accepted == count and not done.done():
+            done.set_result(None)
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0, backlog=max(256, count))
+    host, port = server.sockets[0].getsockname()[:2]
+
+    async def client() -> None:
+        _reader, writer = await asyncio.open_connection(host, port)
+        writer.close()
+        await writer.wait_closed()
+
+    try:
+        await asyncio.gather(*(client() for _ in range(count)))
+        await done
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def bench_tcp_accept_burst(count: int) -> None:
+    accepted = 0
+    done = asyncio.get_running_loop().create_future()
+    peers: list[asyncio.StreamWriter] = []
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        nonlocal accepted
+        accepted += 1
+        peers.append(writer)
+        if accepted == count and not done.done():
+            done.set_result(None)
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0, backlog=max(256, count))
+    host, port = server.sockets[0].getsockname()[:2]
+
+    async def client() -> asyncio.StreamWriter:
+        _reader, writer = await asyncio.open_connection(host, port)
+        return writer
+
+    clients: list[asyncio.StreamWriter] = []
+    try:
+        clients = list(await asyncio.gather(*(client() for _ in range(count))))
+        await done
+    finally:
+        for writer in clients:
+            writer.close()
+        for writer in clients:
+            await writer.wait_closed()
+        for writer in peers:
+            writer.close()
+        for writer in peers:
+            await writer.wait_closed()
+        server.close()
+        await server.wait_closed()
+
+
+async def bench_tcp_churn_small_io(count: int) -> None:
+    payload = b"x"
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            data = await reader.readexactly(1)
+            if data != payload:
+                raise RuntimeError(f"unexpected payload size={len(data)}")
+            writer.write(data)
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0, backlog=max(256, count))
+    host, port = server.sockets[0].getsockname()[:2]
+
+    try:
+        for _ in range(count):
+            reader, writer = await asyncio.open_connection(host, port)
+            writer.write(payload)
+            await writer.drain()
+            data = await reader.readexactly(1)
+            if data != payload:
+                raise RuntimeError(f"unexpected payload size={len(data)}")
+            writer.close()
+            await writer.wait_closed()
     finally:
         server.close()
         await server.wait_closed()
@@ -581,6 +980,10 @@ async def bench_tcp_idle_fanout(count: int) -> None:
         await server.wait_closed()
 
 
+async def bench_tcp_idle_fanout_large(count: int) -> None:
+    await bench_tcp_idle_fanout(count)
+
+
 async def tcp_stream_echo(count: int, payload_size: int) -> None:
     payload = b"x" * payload_size
 
@@ -616,9 +1019,16 @@ async def tcp_stream_echo(count: int, payload_size: int) -> None:
         await server.wait_closed()
 
 
-async def tcp_stream_echo_parallel(count: int, clients: int, payload_size: int) -> None:
+async def tcp_stream_echo_fragmented(
+    count: int,
+    payload_size: int,
+    fragment_size: int,
+) -> None:
     payload = b"x" * payload_size
-    per_client = max(1, count // clients)
+    fragments = [
+        payload[offset : offset + fragment_size]
+        for offset in range(0, payload_size, fragment_size)
+    ]
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         label_stream_endpoint(reader, writer, "server")
@@ -636,11 +1046,146 @@ async def tcp_stream_echo_parallel(count: int, clients: int, payload_size: int) 
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     host, port = server.sockets[0].getsockname()[:2]
 
-    async def client() -> None:
+    try:
+        reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
+        for _ in range(count):
+            for fragment in fragments:
+                writer.write(fragment)
+            await writer.drain()
+            data = await reader.readexactly(payload_size)
+            if data != payload:
+                raise RuntimeError(f"unexpected payload size={len(data)}")
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def tcp_stream_echo_burst_no_drain(
+    count: int,
+    payload_size: int,
+    burst: int,
+) -> None:
+    payload = b"x" * payload_size
+    burst = max(1, burst)
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        label_stream_endpoint(reader, writer, "server")
+        pending = 0
+        try:
+            while True:
+                data = await reader.readexactly(payload_size)
+                writer.write(data)
+                pending += 1
+                if pending >= burst:
+                    await writer.drain()
+                    pending = 0
+        except asyncio.IncompleteReadError:
+            pass
+        finally:
+            if pending:
+                await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    try:
+        reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
+        remaining = count
+        while remaining:
+            current = min(burst, remaining)
+            for _ in range(current):
+                writer.write(payload)
+            await writer.drain()
+            for _ in range(current):
+                data = await reader.readexactly(payload_size)
+                if data != payload:
+                    raise RuntimeError(f"unexpected payload size={len(data)}")
+            remaining -= current
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def tcp_stream_echo_backpressured(
+    count: int,
+    payload_size: int,
+    pause_every: int,
+    pause_seconds: float,
+) -> None:
+    payload = b"x" * payload_size
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        label_stream_endpoint(reader, writer, "server")
+        transport = writer.transport
+        seen = 0
+        try:
+            while True:
+                if seen and seen % pause_every == 0:
+                    transport.pause_reading()
+                    await asyncio.sleep(pause_seconds)
+                    transport.resume_reading()
+                data = await reader.readexactly(payload_size)
+                writer.write(data)
+                await writer.drain()
+                seen += 1
+        except asyncio.IncompleteReadError:
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    try:
+        reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
+        for _ in range(count):
+            writer.write(payload)
+            await writer.drain()
+            data = await reader.readexactly(payload_size)
+            if data != payload:
+                raise RuntimeError(f"unexpected payload size={len(data)}")
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def tcp_stream_echo_parallel(count: int, clients: int, payload_size: int) -> None:
+    payload = b"x" * payload_size
+    per_client_counts = split_evenly(count, clients)
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        label_stream_endpoint(reader, writer, "server")
+        try:
+            while True:
+                data = await reader.readexactly(payload_size)
+                writer.write(data)
+                await writer.drain()
+        except asyncio.IncompleteReadError:
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    async def client(iterations: int) -> None:
         reader, writer = await asyncio.open_connection(host, port)
         label_stream_endpoint(reader, writer, "client")
         try:
-            for _ in range(per_client):
+            for _ in range(iterations):
                 writer.write(payload)
                 await writer.drain()
                 data = await reader.readexactly(payload_size)
@@ -651,7 +1196,7 @@ async def tcp_stream_echo_parallel(count: int, clients: int, payload_size: int) 
             await writer.wait_closed()
 
     try:
-        await asyncio.gather(*(client() for _ in range(clients)))
+        await asyncio.gather(*(client(iterations) for iterations in per_client_counts))
     finally:
         server.close()
         await server.wait_closed()
@@ -703,7 +1248,7 @@ async def tcp_stream_rpc_parallel(
 ) -> None:
     request = b"r" * request_size
     response = b"s" * response_size
-    per_client = max(1, count // clients)
+    per_client_counts = split_evenly(count, clients)
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         label_stream_endpoint(reader, writer, "server")
@@ -723,11 +1268,11 @@ async def tcp_stream_rpc_parallel(
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     host, port = server.sockets[0].getsockname()[:2]
 
-    async def client() -> None:
+    async def client(iterations: int) -> None:
         reader, writer = await asyncio.open_connection(host, port)
         label_stream_endpoint(reader, writer, "client")
         try:
-            for _ in range(per_client):
+            for _ in range(iterations):
                 writer.write(request)
                 await writer.drain()
                 data = await reader.readexactly(response_size)
@@ -738,7 +1283,7 @@ async def tcp_stream_rpc_parallel(
             await writer.wait_closed()
 
     try:
-        await asyncio.gather(*(client() for _ in range(clients)))
+        await asyncio.gather(*(client(iterations) for iterations in per_client_counts))
     finally:
         server.close()
         await server.wait_closed()
@@ -801,7 +1346,7 @@ async def tcp_stream_rpc_pipeline_parallel(
 ) -> None:
     request = b"r" * request_size
     response = b"s" * response_size
-    per_client = max(1, count // clients)
+    per_client_counts = split_evenly(count, clients)
     pipeline = max(1, pipeline)
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -821,11 +1366,11 @@ async def tcp_stream_rpc_pipeline_parallel(
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     host, port = server.sockets[0].getsockname()[:2]
 
-    async def client() -> None:
+    async def client(iterations: int) -> None:
         reader, writer = await asyncio.open_connection(host, port)
         label_stream_endpoint(reader, writer, "client")
         try:
-            remaining = per_client
+            remaining = iterations
             while remaining:
                 burst = min(pipeline, remaining)
                 for _ in range(burst):
@@ -841,7 +1386,64 @@ async def tcp_stream_rpc_pipeline_parallel(
             await writer.wait_closed()
 
     try:
-        await asyncio.gather(*(client() for _ in range(clients)))
+        await asyncio.gather(*(client(iterations) for iterations in per_client_counts))
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def tcp_stream_rpc_pipeline_unbalanced(
+    count: int,
+    heavy_clients: int,
+    light_clients: int,
+    request_size: int,
+    response_size: int,
+    pipeline: int,
+) -> None:
+    request = b"r" * request_size
+    response = b"s" * response_size
+    pipeline = max(1, pipeline)
+    weights = [8] * heavy_clients + [1] * light_clients
+    per_client_counts = split_weighted(count, weights)
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        label_stream_endpoint(reader, writer, "server")
+        try:
+            while True:
+                data = await reader.readexactly(request_size)
+                if data != request:
+                    raise RuntimeError(f"unexpected payload size={len(data)}")
+                writer.write(response)
+        except asyncio.IncompleteReadError:
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0, backlog=max(128, len(weights)))
+    host, port = server.sockets[0].getsockname()[:2]
+
+    async def client(iterations: int) -> None:
+        reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
+        try:
+            remaining = iterations
+            while remaining:
+                burst = min(pipeline, remaining)
+                for _ in range(burst):
+                    writer.write(request)
+                await writer.drain()
+                for _ in range(burst):
+                    data = await reader.readexactly(response_size)
+                    if data != response:
+                        raise RuntimeError(f"unexpected payload size={len(data)}")
+                remaining -= burst
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    try:
+        await asyncio.gather(*(client(iterations) for iterations in per_client_counts))
     finally:
         server.close()
         await server.wait_closed()
@@ -852,7 +1454,7 @@ async def tcp_stream_echo_mixed_parallel(
     clients: int,
     payload_sizes: tuple[int, ...],
 ) -> None:
-    per_client = max(1, count // clients)
+    per_client_counts = split_evenly(count, clients)
     payloads = [bytes([65 + index % 26]) * size for index, size in enumerate(payload_sizes)]
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -876,11 +1478,11 @@ async def tcp_stream_echo_mixed_parallel(
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     host, port = server.sockets[0].getsockname()[:2]
 
-    async def client() -> None:
+    async def client(iterations: int) -> None:
         reader, writer = await asyncio.open_connection(host, port)
         label_stream_endpoint(reader, writer, "client")
         try:
-            for index in range(per_client):
+            for index in range(iterations):
                 payload = payloads[index % len(payloads)]
                 writer.write(payload)
                 await writer.drain()
@@ -892,7 +1494,54 @@ async def tcp_stream_echo_mixed_parallel(
             await writer.wait_closed()
 
     try:
-        await asyncio.gather(*(client() for _ in range(clients)))
+        await asyncio.gather(*(client(iterations) for iterations in per_client_counts))
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def tcp_stream_half_close(count: int, payload_size: int) -> None:
+    payload = b"x" * payload_size
+    expected = count * payload_size
+    flush_every = 16
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        total = 0
+        try:
+            while True:
+                data = await reader.read(64 * 1024)
+                if not data:
+                    break
+                total += len(data)
+            writer.write(total.to_bytes(8, "big"))
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    try:
+        reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
+        pending = 0
+        for _ in range(count):
+            writer.write(payload)
+            pending += 1
+            if pending >= flush_every:
+                await writer.drain()
+                pending = 0
+        if pending:
+            await writer.drain()
+        if not writer.can_write_eof():
+            raise RuntimeError("transport does not support write_eof()")
+        writer.write_eof()
+        total = int.from_bytes(await reader.readexactly(8), "big")
+        if total != expected:
+            raise RuntimeError(f"unexpected byte count={total}")
+        writer.close()
+        await writer.wait_closed()
     finally:
         server.close()
         await server.wait_closed()
@@ -942,6 +1591,126 @@ async def tcp_sock_echo(count: int, payload_size: int) -> None:
         await server_task
 
 
+async def tcp_sock_echo_parallel(count: int, clients: int, payload_size: int) -> None:
+    loop = asyncio.get_running_loop()
+    payload = b"x" * payload_size
+    per_client_counts = split_evenly(count, clients)
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(max(128, clients))
+    listener.setblocking(False)
+    host, port = listener.getsockname()[:2]
+    server_tasks: list[asyncio.Task[None]] = []
+
+    async def handle(conn: socket.socket, iterations: int) -> None:
+        try:
+            for _ in range(iterations):
+                data = await recv_exact(loop, conn, payload_size)
+                if data != payload:
+                    raise RuntimeError(f"unexpected payload size={len(data)}")
+                await loop.sock_sendall(conn, data)
+        finally:
+            conn.close()
+
+    async def acceptor() -> None:
+        for iterations in per_client_counts:
+            conn, _addr = await loop.sock_accept(listener)
+            conn.setblocking(False)
+            server_tasks.append(asyncio.create_task(handle(conn, iterations)))
+
+    async def client(iterations: int) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        try:
+            await loop.sock_connect(sock, (host, port))
+            for _ in range(iterations):
+                await loop.sock_sendall(sock, payload)
+                data = await recv_exact(loop, sock, payload_size)
+                if data != payload:
+                    raise RuntimeError(f"unexpected payload size={len(data)}")
+        finally:
+            sock.close()
+
+    accept_task = asyncio.create_task(acceptor())
+    try:
+        await asyncio.gather(*(client(iterations) for iterations in per_client_counts))
+        await accept_task
+        if server_tasks:
+            await asyncio.gather(*server_tasks)
+    finally:
+        listener.close()
+
+
+async def udp_pingpong(count: int, payload_size: int) -> None:
+    loop = asyncio.get_running_loop()
+    payload = b"x" * payload_size
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("127.0.0.1", 0))
+    client.bind(("127.0.0.1", 0))
+    server.setblocking(False)
+    client.setblocking(False)
+    server_addr = server.getsockname()
+
+    async def server_loop() -> None:
+        for _ in range(count):
+            data, addr = await udp_recvfrom(loop, server, payload_size)
+            if data != payload:
+                raise RuntimeError(f"unexpected payload size={len(data)}")
+            await udp_sendto(loop, server, data, addr)
+
+    server_task = asyncio.create_task(server_loop())
+    try:
+        for _ in range(count):
+            await udp_sendto(loop, client, payload, server_addr)
+            data, _addr = await udp_recvfrom(loop, client, payload_size)
+            if data != payload:
+                raise RuntimeError(f"unexpected payload size={len(data)}")
+        await server_task
+    finally:
+        client.close()
+        server.close()
+
+
+async def udp_fanout(count: int, clients: int, payload_size: int) -> None:
+    loop = asyncio.get_running_loop()
+    payload = b"x" * payload_size
+    per_client_counts = split_evenly(count, clients)
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("127.0.0.1", 0))
+    server.setblocking(False)
+    server_addr = server.getsockname()
+
+    async def server_loop() -> None:
+        for _ in range(count):
+            data, addr = await udp_recvfrom(loop, server, payload_size)
+            if data != payload:
+                raise RuntimeError(f"unexpected payload size={len(data)}")
+            await udp_sendto(loop, server, data, addr)
+
+    async def client(iterations: int) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.setblocking(False)
+        try:
+            for _ in range(iterations):
+                await udp_sendto(loop, sock, payload, server_addr)
+                data, _addr = await udp_recvfrom(loop, sock, payload_size)
+                if data != payload:
+                    raise RuntimeError(f"unexpected payload size={len(data)}")
+        finally:
+            sock.close()
+
+    server_task = asyncio.create_task(server_loop())
+    try:
+        await asyncio.gather(*(client(iterations) for iterations in per_client_counts))
+        await server_task
+    finally:
+        server.close()
+
+
 async def recv_exact(
     loop: asyncio.AbstractEventLoop,
     sock: socket.socket,
@@ -975,6 +1744,30 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         unit="callbacks",
         func=bench_call_soon_threadsafe,
     ),
+    "call_soon_batched": BenchmarkSpec(
+        name="call_soon_batched",
+        description="Ready-queue refill churn where callbacks enqueue more callbacks",
+        category="scheduler",
+        default_iterations=100_000,
+        unit="callbacks",
+        func=bench_call_soon_batched,
+    ),
+    "call_soon_threadsafe_multi_4": BenchmarkSpec(
+        name="call_soon_threadsafe_multi_4",
+        description="Cross-thread scheduling from 4 concurrent producer threads",
+        category="scheduler",
+        default_iterations=50_000,
+        unit="callbacks",
+        func=bench_call_soon_threadsafe_multi_4,
+    ),
+    "call_soon_threadsafe_multi_8": BenchmarkSpec(
+        name="call_soon_threadsafe_multi_8",
+        description="Cross-thread scheduling from 8 concurrent producer threads",
+        category="scheduler",
+        default_iterations=50_000,
+        unit="callbacks",
+        func=bench_call_soon_threadsafe_multi_8,
+    ),
     "sleep_zero": BenchmarkSpec(
         name="sleep_zero",
         description="Coroutine yield/resume churn through asyncio.sleep(0)",
@@ -991,6 +1784,22 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         unit="timers",
         func=bench_timer_zero,
     ),
+    "timer_staggered": BenchmarkSpec(
+        name="timer_staggered",
+        description="Mixed near-future timers with staggered deadlines",
+        category="scheduler",
+        default_iterations=20_000,
+        unit="timers",
+        func=bench_timer_staggered,
+    ),
+    "timer_cancel": BenchmarkSpec(
+        name="timer_cancel",
+        description="Timer scheduling churn with most timers cancelled before firing",
+        category="scheduler",
+        default_iterations=20_000,
+        unit="timers",
+        func=bench_timer_cancel,
+    ),
     "socketpair_1b": BenchmarkSpec(
         name="socketpair_1b",
         description="Raw socketpair ping-pong with 1-byte payloads",
@@ -1006,6 +1815,14 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         default_iterations=5_000,
         unit="roundtrips",
         func=bench_socketpair_large,
+    ),
+    "sock_recv_into": BenchmarkSpec(
+        name="sock_recv_into",
+        description="Raw socketpair ping-pong using loop.sock_recv_into() with reusable 4 KiB buffers",
+        category="raw-socket",
+        default_iterations=5_000,
+        unit="roundtrips",
+        func=bench_sock_recv_into,
     ),
     "tcp_echo_1b": BenchmarkSpec(
         name="tcp_echo_1b",
@@ -1030,6 +1847,30 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         default_iterations=16_384,
         unit="messages",
         func=bench_tcp_echo_parallel,
+    ),
+    "tcp_echo_fragmented": BenchmarkSpec(
+        name="tcp_echo_fragmented",
+        description="Single TCP stream echo where each 64-byte message is written 1 byte at a time",
+        category="stream",
+        default_iterations=8_192,
+        unit="messages",
+        func=bench_tcp_echo_fragmented,
+    ),
+    "tcp_echo_burst_no_drain": BenchmarkSpec(
+        name="tcp_echo_burst_no_drain",
+        description="Single TCP stream echo with bursts of writes before each drain()",
+        category="stream",
+        default_iterations=16_384,
+        unit="messages",
+        func=bench_tcp_echo_burst_no_drain,
+    ),
+    "tcp_echo_backpressured": BenchmarkSpec(
+        name="tcp_echo_backpressured",
+        description="Single TCP stream echo with periodic server-side read pauses to force backpressure",
+        category="stream",
+        default_iterations=1_024,
+        unit="messages",
+        func=bench_tcp_echo_backpressured,
     ),
     "tcp_rpc": BenchmarkSpec(
         name="tcp_rpc",
@@ -1063,6 +1904,22 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         unit="messages",
         func=bench_tcp_rpc_pipeline_parallel,
     ),
+    "tcp_rpc_asymmetric_smallreq_hugeresp": BenchmarkSpec(
+        name="tcp_rpc_asymmetric_smallreq_hugeresp",
+        description="Single TCP request/response stream with 64-byte requests and 64 KiB responses",
+        category="stream",
+        default_iterations=512,
+        unit="roundtrips",
+        func=bench_tcp_rpc_asymmetric_smallreq_hugeresp,
+    ),
+    "tcp_rpc_asymmetric_hugereq_smallresp": BenchmarkSpec(
+        name="tcp_rpc_asymmetric_hugereq_smallresp",
+        description="Single TCP request/response stream with 64 KiB requests and 64-byte responses",
+        category="stream",
+        default_iterations=512,
+        unit="roundtrips",
+        func=bench_tcp_rpc_asymmetric_hugereq_smallresp,
+    ),
     "tcp_upload_parallel": BenchmarkSpec(
         name="tcp_upload_parallel",
         description="16 concurrent clients uploading 16 KiB requests with 1-byte acknowledgements",
@@ -1086,6 +1943,38 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         default_iterations=4_096,
         unit="messages",
         func=bench_tcp_rpc_pipeline_4k_parallel,
+    ),
+    "tcp_echo_parallel_128": BenchmarkSpec(
+        name="tcp_echo_parallel_128",
+        description="128 concurrent stream clients with 64-byte echo payloads",
+        category="stream",
+        default_iterations=16_384,
+        unit="messages",
+        func=bench_tcp_echo_parallel_128,
+    ),
+    "tcp_rpc_pipeline_deep": BenchmarkSpec(
+        name="tcp_rpc_pipeline_deep",
+        description="Single TCP request/response stream with pipeline depth 64",
+        category="stream",
+        default_iterations=16_384,
+        unit="messages",
+        func=bench_tcp_rpc_pipeline_deep,
+    ),
+    "tcp_rpc_pipeline_unbalanced": BenchmarkSpec(
+        name="tcp_rpc_pipeline_unbalanced",
+        description="32 concurrent pipelined TCP RPC clients with heavily skewed per-client message counts",
+        category="stream",
+        default_iterations=16_384,
+        unit="messages",
+        func=bench_tcp_rpc_pipeline_unbalanced,
+    ),
+    "tcp_stream_half_close": BenchmarkSpec(
+        name="tcp_stream_half_close",
+        description="Client writes a stream, half-closes with write_eof(), then reads the server summary",
+        category="stream",
+        default_iterations=512,
+        unit="messages",
+        func=bench_tcp_stream_half_close,
     ),
     "tcp_echo_mixed_parallel": BenchmarkSpec(
         name="tcp_echo_mixed_parallel",
@@ -1111,6 +2000,38 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         unit="roundtrips",
         func=bench_tcp_sock_small,
     ),
+    "tcp_sock_4k": BenchmarkSpec(
+        name="tcp_sock_4k",
+        description="TCP echo through loop.sock_* helpers with 4 KiB payloads",
+        category="raw-socket",
+        default_iterations=5_000,
+        unit="roundtrips",
+        func=bench_tcp_sock_large,
+    ),
+    "tcp_sock_parallel": BenchmarkSpec(
+        name="tcp_sock_parallel",
+        description="32 concurrent TCP echo clients through loop.sock_* helpers with 64-byte payloads",
+        category="raw-socket",
+        default_iterations=8_192,
+        unit="messages",
+        func=bench_tcp_sock_parallel,
+    ),
+    "udp_pingpong": BenchmarkSpec(
+        name="udp_pingpong",
+        description="Single UDP ping-pong using nonblocking sockets and loop readiness callbacks",
+        category="raw-socket",
+        default_iterations=20_000,
+        unit="roundtrips",
+        func=bench_udp_pingpong,
+    ),
+    "udp_fanout": BenchmarkSpec(
+        name="udp_fanout",
+        description="32 concurrent UDP clients ping-ponging through one local server socket",
+        category="raw-socket",
+        default_iterations=8_192,
+        unit="messages",
+        func=bench_udp_fanout,
+    ),
     "tcp_connect": BenchmarkSpec(
         name="tcp_connect",
         description="Connection open/close churn against a local server",
@@ -1119,6 +2040,30 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         unit="connections",
         func=bench_tcp_connect_close,
     ),
+    "tcp_connect_parallel": BenchmarkSpec(
+        name="tcp_connect_parallel",
+        description="Many TCP connections opened and closed concurrently against a local server",
+        category="connection",
+        default_iterations=256,
+        unit="connections",
+        func=bench_tcp_connect_parallel,
+    ),
+    "tcp_accept_burst": BenchmarkSpec(
+        name="tcp_accept_burst",
+        description="Burst open many TCP connections concurrently and hold them until the server accepts all of them",
+        category="connection",
+        default_iterations=256,
+        unit="connections",
+        func=bench_tcp_accept_burst,
+    ),
+    "tcp_churn_small_io": BenchmarkSpec(
+        name="tcp_churn_small_io",
+        description="Connect, exchange a 1-byte request/response, then close",
+        category="connection",
+        default_iterations=128,
+        unit="connections",
+        func=bench_tcp_churn_small_io,
+    ),
     "tcp_idle_fanout": BenchmarkSpec(
         name="tcp_idle_fanout",
         description="Open many idle TCP connections and tear them down",
@@ -1126,6 +2071,14 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         default_iterations=128,
         unit="connections",
         func=bench_tcp_idle_fanout,
+    ),
+    "tcp_idle_fanout_large": BenchmarkSpec(
+        name="tcp_idle_fanout_large",
+        description="Open a larger set of idle TCP connections and tear them down",
+        category="connection",
+        default_iterations=512,
+        unit="connections",
+        func=bench_tcp_idle_fanout_large,
     ),
 }
 

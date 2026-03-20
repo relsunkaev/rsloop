@@ -4,10 +4,10 @@
 
 It now covers four workload classes:
 
-- `scheduler`: callback, timer, and cross-thread scheduling churn
-- `raw-socket`: `loop.sock_*` helpers and socketpair/TCP raw I/O
-- `stream`: asyncio streams on small, large, concurrent, asymmetric upload/download, request/response, pipelined, backpressured, and mixed-payload traffic
-- `connection`: connect/close churn and idle fanout
+- `scheduler`: callback, timer, cancellation, and cross-thread scheduling churn
+- `raw-socket`: `loop.sock_*` helpers, socketpair/TCP raw I/O, reusable recv-into buffers, and UDP datagrams
+- `stream`: asyncio streams on small, large, fragmented, bursty, concurrent, asymmetric upload/download, request/response, pipelined, half-close, backpressured, and mixed-payload traffic
+- `connection`: sequential and parallel connect/close churn, burst accept, small-I/O churn, and idle fanout
 
 ### Methodology
 
@@ -89,6 +89,7 @@ Capture cross-loop Python stream delivery/write shape for an isolated comparison
 - `smoke`: fast sanity checks
 - `default`: balanced comparison set for routine iteration
 - `full`: all scenarios, including heavier mixed-payload stream cases
+- The expanded `full` profile also includes bursty/backpressured stream cases, UDP cases, deeper pipeline/fanout cases, and additional connection lifecycle benchmarks.
 
 ### Notes
 

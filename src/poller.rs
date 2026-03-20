@@ -120,14 +120,7 @@ impl PollerState {
                 mask |= WRITABLE;
             }
             if mask != 0 {
-                let fd = fd as i32;
-                if let Some((_, existing_mask)) =
-                    ready.iter_mut().find(|(existing_fd, _)| *existing_fd == fd)
-                {
-                    *existing_mask |= mask;
-                } else {
-                    ready.push((fd, mask));
-                }
+                ready.push((fd as i32, mask));
             }
         }
         Ok(())

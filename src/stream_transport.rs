@@ -26,6 +26,8 @@ const DEFAULT_STREAM_READ_SIZE: usize = 64 * 1024;
 const NATIVE_READEXACTLY_LIMIT: usize = 16 * 1024;
 const DIRECT_WRITE_LIMIT: usize = 0;
 const WRITEV_BATCH_LIMIT: usize = 8;
+const SMALL_WRITE_CHUNK_LIMIT: usize = 256;
+const SMALL_WRITE_BUFFER_LIMIT: usize = 4 * 1024;
 const WRITE_HIGH_WATER: usize = 64 * 1024;
 const WRITE_LOW_WATER: usize = 16 * 1024;
 static TRACE_STREAM: OnceLock<bool> = OnceLock::new();
@@ -74,9 +76,23 @@ pub(crate) enum StreamCompletion {
     },
 }
 
+enum PendingWriteData {
+    PyBytes(Py<PyBytes>),
+    Owned(Vec<u8>),
+}
+
 struct PendingWrite {
-    data: Py<PyBytes>,
+    data: PendingWriteData,
     sent: usize,
+}
+
+impl PendingWrite {
+    fn len(&self, py: Python<'_>) -> usize {
+        match &self.data {
+            PendingWriteData::PyBytes(data) => data.bind(py).as_bytes().len(),
+            PendingWriteData::Owned(data) => data.len(),
+        }
+    }
 }
 
 pub(crate) type StreamCoreRef = Rc<RefCell<StreamCore>>;
@@ -791,12 +807,56 @@ impl StreamCore {
     fn queue_write_bytes(&mut self, py: Python<'_>, data: Py<PyBytes>, sent: usize) -> PyResult<()> {
         let len = data.bind(py).as_bytes().len();
         let sent = sent.min(len);
-        self.pending_write_bytes += len.saturating_sub(sent);
-        self.write_queue.push_back(PendingWrite { data, sent });
+        let queued = len.saturating_sub(sent);
+        self.pending_write_bytes += queued;
+        if queued != 0 && sent == 0 && len <= SMALL_WRITE_CHUNK_LIMIT {
+            let bytes = data.bind(py).as_bytes();
+            if let Some(last) = self.write_queue.back_mut() {
+                if last.sent == 0 {
+                    match &mut last.data {
+                        PendingWriteData::Owned(existing) => {
+                            if existing.len() + len <= SMALL_WRITE_BUFFER_LIMIT {
+                                existing.extend_from_slice(bytes);
+                                record_stream_profile_event(
+                                    "write_queue_small_append",
+                                    self.fd,
+                                    queued,
+                                    self.pending_write_bytes,
+                                );
+                                return Ok(());
+                            }
+                        }
+                        PendingWriteData::PyBytes(existing) => {
+                            let existing_bytes = existing.bind(py).as_bytes();
+                            if existing_bytes.len() <= SMALL_WRITE_CHUNK_LIMIT
+                                && existing_bytes.len() + len <= SMALL_WRITE_BUFFER_LIMIT
+                            {
+                                let mut combined =
+                                    Vec::with_capacity(existing_bytes.len() + len);
+                                combined.extend_from_slice(existing_bytes);
+                                combined.extend_from_slice(bytes);
+                                last.data = PendingWriteData::Owned(combined);
+                                record_stream_profile_event(
+                                    "write_queue_small_merge",
+                                    self.fd,
+                                    queued,
+                                    self.pending_write_bytes,
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.write_queue.push_back(PendingWrite {
+            data: PendingWriteData::PyBytes(data),
+            sent,
+        });
         record_stream_profile_event(
             "write_queue",
             self.fd,
-            len.saturating_sub(sent),
+            queued,
             self.pending_write_bytes,
         );
         Ok(())
@@ -903,12 +963,18 @@ impl StreamCore {
             let Some(write) = self.write_queue.front_mut() else {
                 return Ok(0);
             };
-            let data = write.data.bind(py);
-            let len = data.as_bytes().len();
-            let sent = try_send_bytes(self.fd, &data.as_bytes()[write.sent..])?;
+            let sent = match &write.data {
+                PendingWriteData::PyBytes(data) => {
+                    let data = data.bind(py);
+                    let bytes = data.as_bytes();
+                    try_send_bytes(self.fd, &bytes[write.sent..])?
+                }
+                PendingWriteData::Owned(data) => try_send_bytes(self.fd, &data[write.sent..])?,
+            };
             if sent == 0 {
                 return Ok(0);
             }
+            let len = write.len(py);
             write.sent += sent;
             self.pending_write_bytes = self.pending_write_bytes.saturating_sub(sent);
             if write.sent == len {
@@ -923,9 +989,13 @@ impl StreamCore {
         }; WRITEV_BATCH_LIMIT];
         let mut iovec_count = 0usize;
         for pending in self.write_queue.iter().take(WRITEV_BATCH_LIMIT) {
-            let data = pending.data.bind(py);
-            let bytes = data.as_bytes();
-            let slice = &bytes[pending.sent..];
+            let slice = match &pending.data {
+                PendingWriteData::PyBytes(data) => {
+                    let bytes = data.bind(py).as_bytes();
+                    &bytes[pending.sent..]
+                }
+                PendingWriteData::Owned(data) => &data[pending.sent..],
+            };
             if slice.is_empty() {
                 continue;
             }
@@ -956,7 +1026,7 @@ impl StreamCore {
             let Some(write) = self.write_queue.front_mut() else {
                 break;
             };
-            let len = write.data.bind(py).as_bytes().len();
+            let len = write.len(py);
             let remaining = len.saturating_sub(write.sent);
             let consumed = written.min(remaining);
             write.sent += consumed;
