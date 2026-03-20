@@ -28,6 +28,144 @@ LoopFactory = Callable[[], asyncio.AbstractEventLoop] | None
 BenchFn = Callable[[int], Awaitable[None]]
 
 
+class PythonStreamProfiler:
+    def __init__(self) -> None:
+        self._orig_feed_data = asyncio.StreamReader.feed_data
+        self._orig_feed_eof = asyncio.StreamReader.feed_eof
+        self._orig_readexactly = asyncio.StreamReader.readexactly
+        self._orig_write = asyncio.StreamWriter.write
+        self._orig_drain = asyncio.StreamWriter.drain
+        self._installed = False
+        self._roles: dict[str, dict[str, Any]] = {}
+
+    def _bucket(self, role: str) -> dict[str, Any]:
+        bucket = self._roles.get(role)
+        if bucket is None:
+            bucket = {
+                "feed_data_calls": 0,
+                "feed_data_bytes": 0,
+                "feed_data_sizes": [],
+                "feed_eof_calls": 0,
+                "readexactly_calls": 0,
+                "readexactly_bytes": 0,
+                "write_calls": 0,
+                "write_bytes": 0,
+                "drain_calls": 0,
+            }
+            self._roles[role] = bucket
+        return bucket
+
+    def install(self) -> None:
+        if self._installed:
+            return
+        profiler = self
+
+        def feed_data(reader: asyncio.StreamReader, data: bytes) -> None:
+            role = getattr(reader, "_bench_stream_role", "unknown")
+            bucket = profiler._bucket(role)
+            bucket["feed_data_calls"] += 1
+            bucket["feed_data_bytes"] += len(data)
+            bucket["feed_data_sizes"].append(len(data))
+            return profiler._orig_feed_data(reader, data)
+
+        def feed_eof(reader: asyncio.StreamReader) -> None:
+            role = getattr(reader, "_bench_stream_role", "unknown")
+            profiler._bucket(role)["feed_eof_calls"] += 1
+            return profiler._orig_feed_eof(reader)
+
+        async def readexactly(reader: asyncio.StreamReader, n: int) -> bytes:
+            role = getattr(reader, "_bench_stream_role", "unknown")
+            bucket = profiler._bucket(role)
+            bucket["readexactly_calls"] += 1
+            bucket["readexactly_bytes"] += n
+            return await profiler._orig_readexactly(reader, n)
+
+        def write(writer: asyncio.StreamWriter, data: bytes) -> None:
+            role = STREAM_WRITER_ROLES.get(id(writer), "unknown")
+            bucket = profiler._bucket(role)
+            bucket["write_calls"] += 1
+            bucket["write_bytes"] += len(data)
+            return profiler._orig_write(writer, data)
+
+        async def drain(writer: asyncio.StreamWriter) -> None:
+            role = STREAM_WRITER_ROLES.get(id(writer), "unknown")
+            profiler._bucket(role)["drain_calls"] += 1
+            return await profiler._orig_drain(writer)
+
+        asyncio.StreamReader.feed_data = feed_data
+        asyncio.StreamReader.feed_eof = feed_eof
+        asyncio.StreamReader.readexactly = readexactly
+        asyncio.StreamWriter.write = write
+        asyncio.StreamWriter.drain = drain
+        self._installed = True
+
+    def emit(self) -> None:
+        if not self._installed:
+            return
+        roles: dict[str, Any] = {}
+        totals = {
+            "feed_data_calls": 0,
+            "feed_data_bytes": 0,
+            "feed_eof_calls": 0,
+            "readexactly_calls": 0,
+            "readexactly_bytes": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "drain_calls": 0,
+        }
+        for role, bucket in sorted(self._roles.items()):
+            feed_sizes = list(bucket["feed_data_sizes"])
+            role_payload = {
+                "feed_data_calls": bucket["feed_data_calls"],
+                "feed_data_bytes": bucket["feed_data_bytes"],
+                "feed_data_mean": (
+                    bucket["feed_data_bytes"] / bucket["feed_data_calls"]
+                    if bucket["feed_data_calls"]
+                    else 0.0
+                ),
+                "feed_data_p50": statistics.median(feed_sizes) if feed_sizes else 0.0,
+                "feed_data_p95": percentile(feed_sizes, 0.95) if feed_sizes else 0.0,
+                "feed_data_max": max(feed_sizes) if feed_sizes else 0,
+                "feed_eof_calls": bucket["feed_eof_calls"],
+                "readexactly_calls": bucket["readexactly_calls"],
+                "readexactly_bytes": bucket["readexactly_bytes"],
+                "write_calls": bucket["write_calls"],
+                "write_bytes": bucket["write_bytes"],
+                "drain_calls": bucket["drain_calls"],
+            }
+            roles[role] = role_payload
+            for key in totals:
+                totals[key] += role_payload[key]
+        print(
+            "BENCH_PROFILE_PY_STREAM_JSON "
+            + json.dumps({"roles": roles, "totals": totals}, sort_keys=True),
+            file=sys.stderr,
+        )
+
+
+PYTHON_STREAM_PROFILER: PythonStreamProfiler | None = None
+STREAM_WRITER_ROLES: dict[int, str] = {}
+
+
+def install_python_stream_profiler() -> None:
+    global PYTHON_STREAM_PROFILER
+    if PYTHON_STREAM_PROFILER is None:
+        PYTHON_STREAM_PROFILER = PythonStreamProfiler()
+        PYTHON_STREAM_PROFILER.install()
+
+
+def emit_python_stream_profiler() -> None:
+    if PYTHON_STREAM_PROFILER is not None:
+        PYTHON_STREAM_PROFILER.emit()
+
+
+def label_stream_endpoint(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, role: str
+) -> None:
+    setattr(reader, "_bench_stream_role", role)
+    STREAM_WRITER_ROLES[id(writer)] = role
+
+
 def percentile(samples: list[float], fraction: float) -> float:
     if not samples:
         raise ValueError("percentile requires at least one sample")
@@ -164,6 +302,7 @@ def bench_result_from_payload(payload: dict[str, Any]) -> BenchResult:
 def parse_runtime_profile(stderr: str) -> dict[str, Any] | None:
     scheduler_runs: list[dict[str, Any]] = []
     stream_runs: list[dict[str, Any]] = []
+    python_stream_runs: list[dict[str, Any]] = []
     for line in stderr.splitlines():
         if line.startswith("KIOTO_PROFILE_SCHED_JSON "):
             scheduler_runs.append(
@@ -173,7 +312,11 @@ def parse_runtime_profile(stderr: str) -> dict[str, Any] | None:
             stream_runs.append(
                 json.loads(line.removeprefix("KIOTO_PROFILE_STREAM_JSON "))
             )
-    if not scheduler_runs and not stream_runs:
+        elif line.startswith("BENCH_PROFILE_PY_STREAM_JSON "):
+            python_stream_runs.append(
+                json.loads(line.removeprefix("BENCH_PROFILE_PY_STREAM_JSON "))
+            )
+    if not scheduler_runs and not stream_runs and not python_stream_runs:
         return None
     profile: dict[str, Any] = {}
     if scheduler_runs:
@@ -194,6 +337,12 @@ def parse_runtime_profile(stderr: str) -> dict[str, Any] | None:
                 len(item.get("events", [])),
                 item.get("dropped", 0),
             ),
+        )
+    if python_stream_runs:
+        profile["python_stream_runs"] = python_stream_runs
+        profile["python_stream"] = max(
+            python_stream_runs,
+            key=lambda item: item.get("totals", {}).get("feed_data_calls", 0),
         )
     return profile
 
@@ -436,6 +585,7 @@ async def tcp_stream_echo(count: int, payload_size: int) -> None:
     payload = b"x" * payload_size
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        label_stream_endpoint(reader, writer, "server")
         try:
             while True:
                 data = await reader.readexactly(payload_size)
@@ -452,6 +602,7 @@ async def tcp_stream_echo(count: int, payload_size: int) -> None:
 
     try:
         reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
         for _ in range(count):
             writer.write(payload)
             await writer.drain()
@@ -470,6 +621,7 @@ async def tcp_stream_echo_parallel(count: int, clients: int, payload_size: int) 
     per_client = max(1, count // clients)
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        label_stream_endpoint(reader, writer, "server")
         try:
             while True:
                 data = await reader.readexactly(payload_size)
@@ -486,6 +638,7 @@ async def tcp_stream_echo_parallel(count: int, clients: int, payload_size: int) 
 
     async def client() -> None:
         reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
         try:
             for _ in range(per_client):
                 writer.write(payload)
@@ -509,6 +662,7 @@ async def tcp_stream_rpc(count: int, request_size: int, response_size: int) -> N
     response = b"s" * response_size
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        label_stream_endpoint(reader, writer, "server")
         try:
             while True:
                 data = await reader.readexactly(request_size)
@@ -527,6 +681,7 @@ async def tcp_stream_rpc(count: int, request_size: int, response_size: int) -> N
 
     try:
         reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
         for _ in range(count):
             writer.write(request)
             await writer.drain()
@@ -551,6 +706,7 @@ async def tcp_stream_rpc_parallel(
     per_client = max(1, count // clients)
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        label_stream_endpoint(reader, writer, "server")
         try:
             while True:
                 data = await reader.readexactly(request_size)
@@ -569,6 +725,7 @@ async def tcp_stream_rpc_parallel(
 
     async def client() -> None:
         reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
         try:
             for _ in range(per_client):
                 writer.write(request)
@@ -598,6 +755,7 @@ async def tcp_stream_rpc_pipeline(
     pipeline = max(1, pipeline)
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        label_stream_endpoint(reader, writer, "server")
         try:
             while True:
                 data = await reader.readexactly(request_size)
@@ -615,6 +773,7 @@ async def tcp_stream_rpc_pipeline(
 
     try:
         reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
         remaining = count
         while remaining:
             burst = min(pipeline, remaining)
@@ -646,6 +805,7 @@ async def tcp_stream_rpc_pipeline_parallel(
     pipeline = max(1, pipeline)
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        label_stream_endpoint(reader, writer, "server")
         try:
             while True:
                 data = await reader.readexactly(request_size)
@@ -663,6 +823,7 @@ async def tcp_stream_rpc_pipeline_parallel(
 
     async def client() -> None:
         reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
         try:
             remaining = per_client
             while remaining:
@@ -695,6 +856,7 @@ async def tcp_stream_echo_mixed_parallel(
     payloads = [bytes([65 + index % 26]) * size for index, size in enumerate(payload_sizes)]
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        label_stream_endpoint(reader, writer, "server")
         try:
             index = 0
             while True:
@@ -716,6 +878,7 @@ async def tcp_stream_echo_mixed_parallel(
 
     async def client() -> None:
         reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
         try:
             for index in range(per_client):
                 payload = payloads[index % len(payloads)]
@@ -993,6 +1156,7 @@ def run_once(
     iterations: int,
     profile_runtime: bool,
     profile_stream: bool,
+    profile_python_streams: bool,
     isolate_process: bool,
     child_retries: int,
 ) -> tuple[float, dict[str, Any] | None, int]:
@@ -1006,6 +1170,7 @@ def run_once(
         iterations,
         profile_runtime,
         profile_stream,
+        profile_python_streams,
         child_retries,
     )
 
@@ -1016,6 +1181,7 @@ def run_once_isolated(
     iterations: int,
     profile_runtime: bool,
     profile_stream: bool,
+    profile_python_streams: bool,
     child_retries: int,
 ) -> tuple[float, dict[str, Any] | None, int]:
     attempts = 0
@@ -1046,6 +1212,8 @@ def run_once_isolated(
         if loop_name == "kioto" and profile_stream:
             env["KIOTO_PROFILE_SCHED_JSON"] = "1"
             env["KIOTO_PROFILE_STREAM_JSON"] = "1"
+        if profile_python_streams:
+            env["BENCH_PROFILE_PY_STREAM_JSON"] = "1"
         try:
             completed = subprocess.run(
                 cmd,
@@ -1088,6 +1256,7 @@ def run_benchmark_group(
     isolate_process: bool,
     profile_runtime: bool,
     profile_stream: bool,
+    profile_python_streams: bool,
     interleave_loops: bool,
     child_retries: int,
 ) -> tuple[list[BenchResult], list[dict[str, Any]] | None]:
@@ -1105,6 +1274,7 @@ def run_benchmark_group(
                     iterations,
                     profile_runtime,
                     profile_stream,
+                    profile_python_streams,
                     isolate_process,
                     child_retries,
                 )
@@ -1124,6 +1294,7 @@ def run_benchmark_group(
                     iterations,
                     profile_runtime,
                     profile_stream,
+                    profile_python_streams,
                     isolate_process,
                     child_retries,
                 )
@@ -1145,6 +1316,7 @@ def run_benchmark_group(
                     iterations,
                     profile_runtime,
                     profile_stream,
+                    profile_python_streams,
                     isolate_process,
                     child_retries,
                 )
@@ -1155,6 +1327,7 @@ def run_benchmark_group(
                     iterations,
                     profile_runtime,
                     profile_stream,
+                    profile_python_streams,
                     isolate_process,
                     child_retries,
                 )
@@ -1367,6 +1540,11 @@ def main() -> None:
         action="store_true",
         help="Capture Kioto stream event traces for isolated child runs.",
     )
+    parser.add_argument(
+        "--profile-python-streams",
+        action="store_true",
+        help="Capture cross-loop Python stream delivery/write/drain counters for isolated child runs.",
+    )
     parser.add_argument("--child-run", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--no-isolate-process",
@@ -1385,6 +1563,9 @@ def main() -> None:
         help="Retry isolated child benchmark failures this many times before aborting.",
     )
     args = parser.parse_args()
+    profile_python_streams = args.profile_python_streams or (
+        os.environ.get("BENCH_PROFILE_PY_STREAM_JSON") == "1"
+    )
 
     if args.list:
         for name, spec in BENCHMARKS.items():
@@ -1401,8 +1582,10 @@ def main() -> None:
     rounds_by_benchmark: dict[str, list[dict[str, Any]]] = {}
     isolate_process = not args.no_isolate_process and not args.child_run
     interleave_loops = not args.no_interleave_loops and not args.child_run
-    if (args.profile_runtime or args.profile_stream) and not isolate_process:
-        raise SystemExit("runtime profiling requires subprocess isolation")
+    if (args.profile_runtime or args.profile_stream or profile_python_streams) and not isolate_process and not args.child_run:
+        raise SystemExit("profiling requires subprocess isolation")
+    if profile_python_streams:
+        install_python_stream_profiler()
     for spec in specs:
         iterations = args.iterations or spec.default_iterations
         selected_loops = [loop_name for loop_name in loops if loop_name != "uvloop" or uvloop is not None]
@@ -1415,6 +1598,7 @@ def main() -> None:
             isolate_process,
             args.profile_runtime,
             args.profile_stream,
+            profile_python_streams,
             interleave_loops,
             max(0, args.child_retries),
         )
@@ -1443,6 +1627,8 @@ def main() -> None:
         print(json.dumps(payload, indent=2))
     elif len(loops) > 1:
         emit_summary(results, args.baseline, rounds_by_benchmark)
+    if profile_python_streams:
+        emit_python_stream_profiler()
 
 
 if __name__ == "__main__":

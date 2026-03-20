@@ -71,6 +71,19 @@ Capture Kioto scheduler shape data and stream events for an isolated run:
   --json
 ```
 
+Capture cross-loop Python stream delivery/write shape for an isolated comparison:
+
+```bash
+.venv/bin/python benchmarks/loops.py \
+  --loop all \
+  --benchmark tcp_rpc_pipeline_parallel \
+  --repeats 1 \
+  --warmups 0 \
+  --profile-python-streams \
+  --output benchmarks/out/tcp_rpc_pipeline_parallel-python-stream-profile.json \
+  --json
+```
+
 ### Profiles
 
 - `smoke`: fast sanity checks
@@ -83,7 +96,9 @@ Capture Kioto scheduler shape data and stream events for an isolated run:
 - JSON output includes environment metadata, git state, per-sample timings, dispersion stats, paired round samples, and baseline ratios.
 - `--profile-runtime` captures Kioto scheduler per-tick summaries into the JSON artifact.
 - `--profile-stream` captures a bounded Kioto stream event trace into the JSON artifact.
+- `--profile-python-streams` captures cross-loop Python stream counters for `feed_data`, `readexactly`, `write`, and `drain`.
 - `--iterations` overrides the default iteration count for the selected scenarios.
 - `--no-interleave-loops` disables round-robin pairing if you need the old run shape.
 - `--child-retries` retries transient child failures before aborting the suite.
 - Runtime profile capture requires subprocess isolation; leave `--no-isolate-process` off when using it.
+- On Kioto’s native stream fast path, Python stream counters can legitimately stay near zero. That means the workload stayed below `StreamReader`/`StreamWriter`, not that the profiler failed.
