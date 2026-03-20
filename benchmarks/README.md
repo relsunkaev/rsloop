@@ -6,8 +6,19 @@ It now covers four workload classes:
 
 - `scheduler`: callback, timer, and cross-thread scheduling churn
 - `raw-socket`: `loop.sock_*` helpers and socketpair/TCP raw I/O
-- `stream`: asyncio streams on small, large, concurrent, request/response, pipelined, and mixed-payload traffic
+- `stream`: asyncio streams on small, large, concurrent, asymmetric upload/download, request/response, pipelined, backpressured, and mixed-payload traffic
 - `connection`: connect/close churn and idle fanout
+
+### Methodology
+
+The harness is designed to make comparisons harder to dismiss:
+
+- each measured sample runs in a fresh child process by default
+- multi-loop comparisons are interleaved round-robin, so `asyncio`, `uvloop`, and `kioto` each see the same thermal/drift conditions per round
+- JSON artifacts include paired per-round samples, not just aggregate medians
+- comparisons include both median ratio and paired round data
+- environment metadata includes Python/platform details plus git commit/dirty state
+- child benchmark failures can be retried before the suite aborts, and retries are recorded in round data when they occur
 
 ### Useful commands
 
@@ -26,6 +37,18 @@ Run the full suite and save structured output:
   --repeats 5 \
   --warmups 1 \
   --output benchmarks/out/full.json
+```
+
+Run a stricter, paired comparison with explicit retry policy:
+
+```bash
+.venv/bin/python benchmarks/loops.py \
+  --loop all \
+  --profile full \
+  --repeats 7 \
+  --warmups 2 \
+  --child-retries 1 \
+  --output benchmarks/out/full-paired.json
 ```
 
 List available scenarios:
@@ -56,9 +79,11 @@ Capture Kioto scheduler shape data and stream events for an isolated run:
 
 ### Notes
 
-- Default output prints per-loop lines plus a compact summary table for Kioto vs the selected baseline.
-- JSON output includes environment metadata, per-sample timings, medians, and baseline ratios.
+- Default output prints per-loop lines plus a compact summary table for Kioto vs the selected baseline, including paired round wins.
+- JSON output includes environment metadata, git state, per-sample timings, dispersion stats, paired round samples, and baseline ratios.
 - `--profile-runtime` captures Kioto scheduler per-tick summaries into the JSON artifact.
 - `--profile-stream` captures a bounded Kioto stream event trace into the JSON artifact.
 - `--iterations` overrides the default iteration count for the selected scenarios.
+- `--no-interleave-loops` disables round-robin pairing if you need the old run shape.
+- `--child-retries` retries transient child failures before aborting the suite.
 - Runtime profile capture requires subprocess isolation; leave `--no-isolate-process` off when using it.

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime as dt
+import importlib.metadata as importlib_metadata
 import json
 import os
 import platform
@@ -24,6 +26,64 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
 
 LoopFactory = Callable[[], asyncio.AbstractEventLoop] | None
 BenchFn = Callable[[int], Awaitable[None]]
+
+
+def percentile(samples: list[float], fraction: float) -> float:
+    if not samples:
+        raise ValueError("percentile requires at least one sample")
+    if len(samples) == 1:
+        return samples[0]
+    ordered = sorted(samples)
+    position = max(0.0, min(1.0, fraction)) * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def median_absolute_deviation(samples: list[float]) -> float:
+    center = statistics.median(samples)
+    deviations = [abs(sample - center) for sample in samples]
+    return statistics.median(deviations)
+
+
+def interquartile_range(samples: list[float]) -> float:
+    return percentile(samples, 0.75) - percentile(samples, 0.25)
+
+
+def safe_stdev(samples: list[float]) -> float:
+    if len(samples) < 2:
+        return 0.0
+    return statistics.stdev(samples)
+
+
+def maybe_version(dist_name: str) -> str | None:
+    try:
+        return importlib_metadata.version(dist_name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def git_snapshot() -> dict[str, Any]:
+    def run_git(*args: str) -> str | None:
+        try:
+            completed = subprocess.run(
+                ["git", *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return None
+        return completed.stdout.strip()
+
+    status = run_git("status", "--short")
+    return {
+        "commit": run_git("rev-parse", "HEAD"),
+        "branch": run_git("rev-parse", "--abbrev-ref", "HEAD"),
+        "dirty": bool(status),
+        "status_short": status.splitlines() if status else [],
+    }
 
 
 @dataclass(frozen=True)
@@ -59,6 +119,28 @@ class BenchResult:
     @property
     def mean(self) -> float:
         return statistics.fmean(self.samples)
+
+    @property
+    def maximum(self) -> float:
+        return max(self.samples)
+
+    @property
+    def stdev(self) -> float:
+        return safe_stdev(self.samples)
+
+    @property
+    def mad(self) -> float:
+        return median_absolute_deviation(self.samples)
+
+    @property
+    def iqr(self) -> float:
+        return interquartile_range(self.samples)
+
+    @property
+    def coefficient_of_variation(self) -> float:
+        if self.mean == 0.0:
+            return 0.0
+        return self.stdev / self.mean
 
     @property
     def ns_per_unit(self) -> float:
@@ -253,6 +335,24 @@ async def bench_tcp_rpc_pipeline_parallel(count: int) -> None:
         request_size=64,
         response_size=256,
         pipeline=4,
+    )
+
+
+async def bench_tcp_upload_parallel(count: int) -> None:
+    await tcp_stream_rpc_parallel(count, clients=16, request_size=16 * 1024, response_size=1)
+
+
+async def bench_tcp_download_parallel(count: int) -> None:
+    await tcp_stream_rpc_parallel(count, clients=16, request_size=1, response_size=16 * 1024)
+
+
+async def bench_tcp_rpc_pipeline_4k_parallel(count: int) -> None:
+    await tcp_stream_rpc_pipeline_parallel(
+        count,
+        clients=16,
+        request_size=64,
+        response_size=4096,
+        pipeline=8,
     )
 
 
@@ -800,6 +900,30 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         unit="messages",
         func=bench_tcp_rpc_pipeline_parallel,
     ),
+    "tcp_upload_parallel": BenchmarkSpec(
+        name="tcp_upload_parallel",
+        description="16 concurrent clients uploading 16 KiB requests with 1-byte acknowledgements",
+        category="stream",
+        default_iterations=4_096,
+        unit="messages",
+        func=bench_tcp_upload_parallel,
+    ),
+    "tcp_download_parallel": BenchmarkSpec(
+        name="tcp_download_parallel",
+        description="16 concurrent clients issuing 1-byte requests with 16 KiB responses",
+        category="stream",
+        default_iterations=4_096,
+        unit="messages",
+        func=bench_tcp_download_parallel,
+    ),
+    "tcp_rpc_pipeline_4k_parallel": BenchmarkSpec(
+        name="tcp_rpc_pipeline_4k_parallel",
+        description="16 concurrent pipelined TCP RPC clients with 4 KiB responses and depth 8",
+        category="stream",
+        default_iterations=4_096,
+        unit="messages",
+        func=bench_tcp_rpc_pipeline_4k_parallel,
+    ),
     "tcp_echo_mixed_parallel": BenchmarkSpec(
         name="tcp_echo_mixed_parallel",
         description="16 concurrent echo clients cycling mixed 64B-4KiB payloads",
@@ -863,44 +987,41 @@ PROFILE_BENCHMARKS = {
 }
 
 
-def run_single(
+def run_once(
     loop_name: str,
     spec: BenchmarkSpec,
     iterations: int,
-    repeats: int,
-    warmups: int,
-) -> BenchResult:
-    for _ in range(warmups):
-        run_on_loop(loop_name, spec.func(iterations))
-
-    samples = []
-    for _ in range(repeats):
+    profile_runtime: bool,
+    profile_stream: bool,
+    isolate_process: bool,
+    child_retries: int,
+) -> tuple[float, dict[str, Any] | None, int]:
+    if not isolate_process:
         started = time.perf_counter()
         run_on_loop(loop_name, spec.func(iterations))
-        samples.append(time.perf_counter() - started)
-
-    return BenchResult(
-        loop=loop_name,
-        benchmark=spec.name,
-        category=spec.category,
-        description=spec.description,
-        iterations=iterations,
-        repeats=repeats,
-        unit=spec.unit,
-        samples=samples,
+        return time.perf_counter() - started, None, 0
+    return run_once_isolated(
+        loop_name,
+        spec,
+        iterations,
+        profile_runtime,
+        profile_stream,
+        child_retries,
     )
 
 
-def run_single_isolated(
+def run_once_isolated(
     loop_name: str,
     spec: BenchmarkSpec,
     iterations: int,
-    repeats: int,
-    warmups: int,
     profile_runtime: bool,
     profile_stream: bool,
-) -> BenchResult:
-    def run_child_once() -> tuple[float, dict[str, Any] | None]:
+    child_retries: int,
+) -> tuple[float, dict[str, Any] | None, int]:
+    attempts = 0
+    last_error: subprocess.CalledProcessError | None = None
+    while attempts <= child_retries:
+        attempts += 1
         cmd = [
             sys.executable,
             __file__,
@@ -925,55 +1046,216 @@ def run_single_isolated(
         if loop_name == "kioto" and profile_stream:
             env["KIOTO_PROFILE_SCHED_JSON"] = "1"
             env["KIOTO_PROFILE_STREAM_JSON"] = "1"
-        completed = subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
+        try:
+            completed = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+        except subprocess.CalledProcessError as exc:
+            last_error = exc
+            if attempts <= child_retries:
+                continue
+            stderr = (exc.stderr or "").strip()
+            stdout = (exc.stdout or "").strip()
+            detail = stderr or stdout or "<no child output>"
+            raise RuntimeError(
+                f"benchmark child failed for loop={loop_name} benchmark={spec.name} "
+                f"after {attempts} attempt(s): {detail}"
+            ) from exc
         payload = json.loads(completed.stdout)
         result = bench_result_from_payload(payload["results"][0])
-        return result.samples[0], parse_runtime_profile(completed.stderr)
+        return result.samples[0], parse_runtime_profile(completed.stderr), attempts - 1
+    assert last_error is not None
+    raise RuntimeError("benchmark child retry loop exited unexpectedly") from last_error
 
-    for _ in range(warmups):
-        run_child_once()
 
-    samples = []
-    profiles = []
-    for _ in range(repeats):
-        sample, profile = run_child_once()
-        samples.append(sample)
-        if profile is not None:
-            profiles.append(profile)
-    return BenchResult(
-        loop=loop_name,
-        benchmark=spec.name,
-        category=spec.category,
-        description=spec.description,
-        iterations=iterations,
-        repeats=repeats,
-        unit=spec.unit,
-        samples=samples,
-        profiles=profiles or None,
-    )
+def rotated_order(items: list[str], offset: int) -> list[str]:
+    if not items:
+        return []
+    shift = offset % len(items)
+    return items[shift:] + items[:shift]
+
+
+def run_benchmark_group(
+    loops: list[str],
+    spec: BenchmarkSpec,
+    iterations: int,
+    repeats: int,
+    warmups: int,
+    isolate_process: bool,
+    profile_runtime: bool,
+    profile_stream: bool,
+    interleave_loops: bool,
+    child_retries: int,
+) -> tuple[list[BenchResult], list[dict[str, Any]] | None]:
+    sample_map: dict[str, list[float]] = {loop_name: [] for loop_name in loops}
+    profile_map: dict[str, list[dict[str, Any]]] = {loop_name: [] for loop_name in loops}
+    round_records: list[dict[str, Any]] = []
+
+    if interleave_loops and len(loops) > 1:
+        for warmup_index in range(warmups):
+            order = rotated_order(loops, warmup_index)
+            for loop_name in order:
+                run_once(
+                    loop_name,
+                    spec,
+                    iterations,
+                    profile_runtime,
+                    profile_stream,
+                    isolate_process,
+                    child_retries,
+                )
+
+        for repeat_index in range(repeats):
+            order = rotated_order(loops, repeat_index)
+            round_record: dict[str, Any] = {
+                "index": repeat_index,
+                "order": order,
+                "samples": {},
+            }
+            retries_used: dict[str, int] = {}
+            for loop_name in order:
+                sample, profile, retries_used_count = run_once(
+                    loop_name,
+                    spec,
+                    iterations,
+                    profile_runtime,
+                    profile_stream,
+                    isolate_process,
+                    child_retries,
+                )
+                sample_map[loop_name].append(sample)
+                round_record["samples"][loop_name] = sample
+                if retries_used_count:
+                    retries_used[loop_name] = retries_used_count
+                if profile is not None:
+                    profile_map[loop_name].append(profile)
+            if retries_used:
+                round_record["retries"] = retries_used
+            round_records.append(round_record)
+    else:
+        for loop_name in loops:
+            for _ in range(warmups):
+                run_once(
+                    loop_name,
+                    spec,
+                    iterations,
+                    profile_runtime,
+                    profile_stream,
+                    isolate_process,
+                    child_retries,
+                )
+            for repeat_index in range(repeats):
+                sample, profile, retries_used_count = run_once(
+                    loop_name,
+                    spec,
+                    iterations,
+                    profile_runtime,
+                    profile_stream,
+                    isolate_process,
+                    child_retries,
+                )
+                sample_map[loop_name].append(sample)
+                if profile is not None:
+                    profile_map[loop_name].append(profile)
+                round_record = {
+                    "index": repeat_index,
+                    "order": [loop_name],
+                    "samples": {loop_name: sample},
+                }
+                if retries_used_count:
+                    round_record["retries"] = {loop_name: retries_used_count}
+                round_records.append(round_record)
+
+    results = [
+        BenchResult(
+            loop=loop_name,
+            benchmark=spec.name,
+            category=spec.category,
+            description=spec.description,
+            iterations=iterations,
+            repeats=repeats,
+            unit=spec.unit,
+            samples=sample_map[loop_name],
+            profiles=profile_map[loop_name] or None,
+        )
+        for loop_name in loops
+    ]
+    return results, round_records or None
 
 
 def format_result(result: BenchResult) -> str:
     return (
         f"{result.loop:7} {result.benchmark:18} "
-        f"median={result.median:.6f}s mean={result.mean:.6f}s min={result.minimum:.6f}s "
+        f"median={result.median:.6f}s mean={result.mean:.6f}s "
+        f"min={result.minimum:.6f}s max={result.maximum:.6f}s "
+        f"mad={result.mad:.6f}s iqr={result.iqr:.6f}s "
         f"ns/{result.unit}={result.ns_per_unit:,.0f}"
     )
 
 
-def emit_summary(results: list[BenchResult], baseline: str) -> None:
+def compute_paired_comparisons(
+    results: list[BenchResult],
+    baseline: str,
+    rounds_by_benchmark: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, BenchResult]] = {}
+    for result in results:
+        grouped.setdefault(result.benchmark, {})[result.loop] = result
+
+    comparisons: list[dict[str, Any]] = []
+    for benchmark, row in sorted(grouped.items()):
+        baseline_result = row.get(baseline)
+        if baseline_result is None:
+            continue
+        rounds = rounds_by_benchmark.get(benchmark, [])
+        for loop_name, result in sorted(row.items()):
+            ratios: list[float] = []
+            wins = 0
+            for round_record in rounds:
+                samples = round_record.get("samples", {})
+                if loop_name not in samples or baseline not in samples:
+                    continue
+                ratio = samples[loop_name] / samples[baseline]
+                ratios.append(ratio)
+                if loop_name != baseline and samples[loop_name] < samples[baseline]:
+                    wins += 1
+            comparisons.append(
+                {
+                    "benchmark": benchmark,
+                    "loop": loop_name,
+                    "baseline": baseline,
+                    "ratio_to_baseline": result.median / baseline_result.median,
+                    "paired_ratio_median": statistics.median(ratios) if ratios else None,
+                    "paired_ratio_iqr": interquartile_range(ratios) if len(ratios) >= 2 else 0.0,
+                    "paired_rounds": len(ratios),
+                    "paired_wins": wins if loop_name != baseline else len(ratios),
+                }
+            )
+    return comparisons
+
+
+def emit_summary(
+    results: list[BenchResult],
+    baseline: str,
+    rounds_by_benchmark: dict[str, list[dict[str, Any]]],
+) -> None:
     by_benchmark: dict[str, dict[str, BenchResult]] = {}
     for result in results:
         by_benchmark.setdefault(result.benchmark, {})[result.loop] = result
+    paired = {
+        (item["benchmark"], item["loop"]): item
+        for item in compute_paired_comparisons(results, baseline, rounds_by_benchmark)
+    }
 
     print()
-    print(f"{'benchmark':18} {'baseline':>10} {'kioto':>10} {'kioto/x':>10}")
+    print(
+        f"{'benchmark':24} {'baseline':>10} {'kioto':>10} "
+        f"{'kioto/x':>10} {'paired':>10} {'wins':>8}"
+    )
     for benchmark in sorted(by_benchmark):
         row = by_benchmark[benchmark]
         baseline_result = row.get(baseline)
@@ -981,11 +1263,17 @@ def emit_summary(results: list[BenchResult], baseline: str) -> None:
         if baseline_result is None or kioto_result is None:
             continue
         ratio = kioto_result.median / baseline_result.median
+        paired_row = paired.get((benchmark, "kioto"))
+        paired_ratio = paired_row["paired_ratio_median"] if paired_row else None
+        wins = paired_row["paired_wins"] if paired_row else None
+        rounds = paired_row["paired_rounds"] if paired_row else None
         print(
-            f"{benchmark:18} "
+            f"{benchmark:24} "
             f"{baseline_result.median:10.6f} "
             f"{kioto_result.median:10.6f} "
-            f"{ratio:10.3f}x"
+            f"{ratio:10.3f}x "
+            f"{(f'{paired_ratio:0.3f}x' if paired_ratio is not None else '-'):>10} "
+            f"{(f'{wins}/{rounds}' if wins is not None and rounds is not None else '-'):>8}"
         )
 
 
@@ -999,16 +1287,30 @@ def selected_benchmarks(args: argparse.Namespace) -> list[BenchmarkSpec]:
 
 def environment_snapshot() -> dict[str, Any]:
     return {
+        "timestamp_utc": dt.datetime.now(dt.UTC).isoformat(),
         "python": sys.version,
+        "python_executable": sys.executable,
         "platform": platform.platform(),
+        "machine": platform.machine(),
         "processor": platform.processor(),
+        "cpu_count": os.cpu_count(),
+        "cwd": os.getcwd(),
         "pid": os.getpid(),
+        "versions": {
+            "kioto": maybe_version("kioto"),
+            "uvloop": maybe_version("uvloop"),
+        },
+        "git": git_snapshot(),
     }
 
 
-def result_payload(results: list[BenchResult], baseline: str) -> dict[str, Any]:
+def result_payload(
+    results: list[BenchResult],
+    baseline: str,
+    rounds_by_benchmark: dict[str, list[dict[str, Any]]],
+    methodology: dict[str, Any],
+) -> dict[str, Any]:
     payload_results = []
-    grouped: dict[str, dict[str, BenchResult]] = {}
     for result in results:
         payload_results.append(
             {
@@ -1016,31 +1318,22 @@ def result_payload(results: list[BenchResult], baseline: str) -> dict[str, Any]:
                 "median": result.median,
                 "mean": result.mean,
                 "minimum": result.minimum,
+                "maximum": result.maximum,
+                "stdev": result.stdev,
+                "mad": result.mad,
+                "iqr": result.iqr,
+                "coefficient_of_variation": result.coefficient_of_variation,
                 "ns_per_unit": result.ns_per_unit,
             }
         )
-        grouped.setdefault(result.benchmark, {})[result.loop] = result
-
-    comparisons = []
-    for benchmark, row in sorted(grouped.items()):
-        baseline_result = row.get(baseline)
-        if baseline_result is None:
-            continue
-        for loop_name, result in sorted(row.items()):
-            comparisons.append(
-                {
-                    "benchmark": benchmark,
-                    "loop": loop_name,
-                    "baseline": baseline,
-                    "ratio_to_baseline": result.median / baseline_result.median,
-                }
-            )
 
     return {
         "environment": environment_snapshot(),
+        "methodology": methodology,
         "baseline": baseline,
         "results": payload_results,
-        "comparisons": comparisons,
+        "rounds": rounds_by_benchmark,
+        "comparisons": compute_paired_comparisons(results, baseline, rounds_by_benchmark),
     }
 
 
@@ -1080,6 +1373,17 @@ def main() -> None:
         action="store_true",
         help="Run all cases in the current process instead of subprocess isolation.",
     )
+    parser.add_argument(
+        "--no-interleave-loops",
+        action="store_true",
+        help="Disable round-robin loop interleaving for multi-loop comparisons.",
+    )
+    parser.add_argument(
+        "--child-retries",
+        type=int,
+        default=1,
+        help="Retry isolated child benchmark failures this many times before aborting.",
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -1094,37 +1398,51 @@ def main() -> None:
     specs = selected_benchmarks(args)
 
     results: list[BenchResult] = []
+    rounds_by_benchmark: dict[str, list[dict[str, Any]]] = {}
     isolate_process = not args.no_isolate_process and not args.child_run
+    interleave_loops = not args.no_interleave_loops and not args.child_run
     if (args.profile_runtime or args.profile_stream) and not isolate_process:
         raise SystemExit("runtime profiling requires subprocess isolation")
     for spec in specs:
         iterations = args.iterations or spec.default_iterations
-        for loop_name in loops:
-            if loop_name == "uvloop" and uvloop is None:
-                continue
-            if isolate_process:
-                result = run_single_isolated(
-                    loop_name,
-                    spec,
-                    iterations,
-                    args.repeats,
-                    args.warmups,
-                    args.profile_runtime,
-                    args.profile_stream,
-                )
-            else:
-                result = run_single(loop_name, spec, iterations, args.repeats, args.warmups)
-            results.append(result)
-            if not args.json:
+        selected_loops = [loop_name for loop_name in loops if loop_name != "uvloop" or uvloop is not None]
+        group_results, round_records = run_benchmark_group(
+            selected_loops,
+            spec,
+            iterations,
+            args.repeats,
+            args.warmups,
+            isolate_process,
+            args.profile_runtime,
+            args.profile_stream,
+            interleave_loops,
+            max(0, args.child_retries),
+        )
+        results.extend(group_results)
+        if round_records is not None:
+            rounds_by_benchmark[spec.name] = round_records
+        if not args.json:
+            for result in group_results:
                 print(format_result(result), flush=True)
 
-    payload = result_payload(results, args.baseline)
+    payload = result_payload(
+        results,
+        args.baseline,
+        rounds_by_benchmark,
+        {
+            "isolated_process": isolate_process,
+            "interleaved_rounds": interleave_loops and len(loops) > 1,
+            "child_retries": max(0, args.child_retries),
+            "repeats": args.repeats,
+            "warmups": args.warmups,
+        },
+    )
     write_output(payload, args.output)
 
     if args.json:
         print(json.dumps(payload, indent=2))
     elif len(loops) > 1:
-        emit_summary(results, args.baseline)
+        emit_summary(results, args.baseline, rounds_by_benchmark)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,6 @@ const DEFAULT_STREAM_READ_SIZE: usize = 64 * 1024;
 const NATIVE_READEXACTLY_LIMIT: usize = 16 * 1024;
 const DIRECT_WRITE_LIMIT: usize = 0;
 const WRITEV_BATCH_LIMIT: usize = 8;
-const COALESCED_WRITE_LIMIT: usize = 4 * 1024;
 const WRITE_HIGH_WATER: usize = 64 * 1024;
 const WRITE_LOW_WATER: usize = 16 * 1024;
 static TRACE_STREAM: OnceLock<bool> = OnceLock::new();
@@ -918,35 +917,11 @@ impl StreamCore {
             return Ok(sent);
         }
 
-        let mut total = 0usize;
-        for pending in self.write_queue.iter().take(WRITEV_BATCH_LIMIT) {
-            let data = pending.data.bind(py);
-            let bytes = data.as_bytes();
-            total += bytes.len().saturating_sub(pending.sent);
-            if total > COALESCED_WRITE_LIMIT {
-                break;
-            }
-        }
-        if total != 0 && total <= COALESCED_WRITE_LIMIT {
-            let mut merged = Vec::with_capacity(total);
-            for pending in self.write_queue.iter().take(WRITEV_BATCH_LIMIT) {
-                let data = pending.data.bind(py);
-                let bytes = data.as_bytes();
-                let slice = &bytes[pending.sent..];
-                if slice.is_empty() {
-                    continue;
-                }
-                merged.extend_from_slice(slice);
-            }
-            let sent = try_send_bytes(self.fd, &merged)?;
-            if sent == 0 {
-                return Ok(0);
-            }
-            self.consume_written_bytes(py, sent);
-            return Ok(sent);
-        }
-
-        let mut iovecs = Vec::with_capacity(self.write_queue.len().min(WRITEV_BATCH_LIMIT));
+        let mut iovecs = [libc::iovec {
+            iov_base: ptr::null_mut(),
+            iov_len: 0,
+        }; WRITEV_BATCH_LIMIT];
+        let mut iovec_count = 0usize;
         for pending in self.write_queue.iter().take(WRITEV_BATCH_LIMIT) {
             let data = pending.data.bind(py);
             let bytes = data.as_bytes();
@@ -954,16 +929,17 @@ impl StreamCore {
             if slice.is_empty() {
                 continue;
             }
-            iovecs.push(libc::iovec {
+            iovecs[iovec_count] = libc::iovec {
                 iov_base: slice.as_ptr() as *mut libc::c_void,
                 iov_len: slice.len(),
-            });
+            };
+            iovec_count += 1;
         }
-        if iovecs.is_empty() {
+        if iovec_count == 0 {
             return Ok(0);
         }
 
-        let sent = unsafe { libc::writev(self.fd, iovecs.as_ptr(), iovecs.len() as i32) };
+        let sent = unsafe { libc::writev(self.fd, iovecs.as_ptr(), iovec_count as i32) };
         if sent < 0 {
             return Err(std::io::Error::last_os_error());
         }
