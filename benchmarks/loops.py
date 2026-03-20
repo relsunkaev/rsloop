@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-import kioto
+import rsloop
 
 try:
     import uvloop
@@ -304,13 +304,13 @@ def parse_runtime_profile(stderr: str) -> dict[str, Any] | None:
     stream_runs: list[dict[str, Any]] = []
     python_stream_runs: list[dict[str, Any]] = []
     for line in stderr.splitlines():
-        if line.startswith("KIOTO_PROFILE_SCHED_JSON "):
+        if line.startswith("RSLOOP_PROFILE_SCHED_JSON "):
             scheduler_runs.append(
-                json.loads(line.removeprefix("KIOTO_PROFILE_SCHED_JSON "))
+                json.loads(line.removeprefix("RSLOOP_PROFILE_SCHED_JSON "))
             )
-        elif line.startswith("KIOTO_PROFILE_STREAM_JSON "):
+        elif line.startswith("RSLOOP_PROFILE_STREAM_JSON "):
             stream_runs.append(
-                json.loads(line.removeprefix("KIOTO_PROFILE_STREAM_JSON "))
+                json.loads(line.removeprefix("RSLOOP_PROFILE_STREAM_JSON "))
             )
         elif line.startswith("BENCH_PROFILE_PY_STREAM_JSON "):
             python_stream_runs.append(
@@ -350,8 +350,8 @@ def parse_runtime_profile(stderr: str) -> dict[str, Any] | None:
 def get_loop_factory(loop_name: str) -> LoopFactory:
     if loop_name == "asyncio":
         return None
-    if loop_name == "kioto":
-        return kioto.KiotoEventLoop
+    if loop_name == "rsloop":
+        return rsloop.RsloopEventLoop
     if loop_name == "uvloop":
         if uvloop is None:
             raise RuntimeError("uvloop is not installed in this environment")
@@ -1207,11 +1207,11 @@ def run_once_isolated(
             "--json",
         ]
         env = os.environ.copy()
-        if loop_name == "kioto" and profile_runtime:
-            env["KIOTO_PROFILE_SCHED_JSON"] = "1"
-        if loop_name == "kioto" and profile_stream:
-            env["KIOTO_PROFILE_SCHED_JSON"] = "1"
-            env["KIOTO_PROFILE_STREAM_JSON"] = "1"
+        if loop_name == "rsloop" and profile_runtime:
+            env["RSLOOP_PROFILE_SCHED_JSON"] = "1"
+        if loop_name == "rsloop" and profile_stream:
+            env["RSLOOP_PROFILE_SCHED_JSON"] = "1"
+            env["RSLOOP_PROFILE_STREAM_JSON"] = "1"
         if profile_python_streams:
             env["BENCH_PROFILE_PY_STREAM_JSON"] = "1"
         try:
@@ -1426,24 +1426,24 @@ def emit_summary(
 
     print()
     print(
-        f"{'benchmark':24} {'baseline':>10} {'kioto':>10} "
-        f"{'kioto/x':>10} {'paired':>10} {'wins':>8}"
+        f"{'benchmark':24} {'baseline':>10} {'rsloop':>10} "
+        f"{'rsloop/x':>10} {'paired':>10} {'wins':>8}"
     )
     for benchmark in sorted(by_benchmark):
         row = by_benchmark[benchmark]
         baseline_result = row.get(baseline)
-        kioto_result = row.get("kioto")
-        if baseline_result is None or kioto_result is None:
+        rsloop_result = row.get("rsloop")
+        if baseline_result is None or rsloop_result is None:
             continue
-        ratio = kioto_result.median / baseline_result.median
-        paired_row = paired.get((benchmark, "kioto"))
+        ratio = rsloop_result.median / baseline_result.median
+        paired_row = paired.get((benchmark, "rsloop"))
         paired_ratio = paired_row["paired_ratio_median"] if paired_row else None
         wins = paired_row["paired_wins"] if paired_row else None
         rounds = paired_row["paired_rounds"] if paired_row else None
         print(
             f"{benchmark:24} "
             f"{baseline_result.median:10.6f} "
-            f"{kioto_result.median:10.6f} "
+            f"{rsloop_result.median:10.6f} "
             f"{ratio:10.3f}x "
             f"{(f'{paired_ratio:0.3f}x' if paired_ratio is not None else '-'):>10} "
             f"{(f'{wins}/{rounds}' if wins is not None and rounds is not None else '-'):>8}"
@@ -1470,7 +1470,7 @@ def environment_snapshot() -> dict[str, Any]:
         "cwd": os.getcwd(),
         "pid": os.getpid(),
         "versions": {
-            "kioto": maybe_version("kioto"),
+            "rsloop": maybe_version("rsloop"),
             "uvloop": maybe_version("uvloop"),
         },
         "git": git_snapshot(),
@@ -1520,25 +1520,25 @@ def write_output(payload: dict[str, Any], output: str | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--loop", choices=["asyncio", "kioto", "uvloop", "all"], default="all")
+    parser.add_argument("--loop", choices=["asyncio", "rsloop", "uvloop", "all"], default="all")
     parser.add_argument("--benchmark", choices=[*BENCHMARKS.keys(), "all"], default="all")
     parser.add_argument("--profile", choices=sorted(PROFILE_BENCHMARKS), default="default")
     parser.add_argument("--iterations", type=int, default=None)
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--warmups", type=int, default=2)
-    parser.add_argument("--baseline", choices=["asyncio", "uvloop", "kioto"], default="uvloop")
+    parser.add_argument("--baseline", choices=["asyncio", "uvloop", "rsloop"], default="uvloop")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--list", action="store_true")
     parser.add_argument(
         "--profile-runtime",
         action="store_true",
-        help="Capture Kioto scheduler/runtime profile data for isolated child runs.",
+        help="Capture Rsloop scheduler/runtime profile data for isolated child runs.",
     )
     parser.add_argument(
         "--profile-stream",
         action="store_true",
-        help="Capture Kioto stream event traces for isolated child runs.",
+        help="Capture Rsloop stream event traces for isolated child runs.",
     )
     parser.add_argument(
         "--profile-python-streams",
@@ -1575,7 +1575,7 @@ def main() -> None:
             )
         return
 
-    loops = ["asyncio", "uvloop", "kioto"] if args.loop == "all" else [args.loop]
+    loops = ["asyncio", "uvloop", "rsloop"] if args.loop == "all" else [args.loop]
     specs = selected_benchmarks(args)
 
     results: list[BenchResult] = []

@@ -1,12 +1,12 @@
 [package]
-name = "kioto"
+name = "rsloop"
 version = "0.1.0"
 edition = "2021"
 description = "Tokio-backed asyncio bridge and event-loop scaffold for Python"
 license = "MIT"
 
 [lib]
-name = "_kioto"
+name = "_rsloop"
 crate-type = ["cdylib"]
 
 [dependencies]

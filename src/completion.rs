@@ -115,7 +115,7 @@ impl Drop for CompletionPortInner {
     }
 }
 
-#[pyclass(module = "kioto._kioto")]
+#[pyclass(module = "rsloop._rsloop")]
 pub struct CompletionPort {
     inner: Arc<CompletionPortInner>,
 }
@@ -266,7 +266,7 @@ fn drain_ready_completions_into(inner: &CompletionPortInner, drained: &mut Vec<C
 
 pub(crate) fn current_completion_port(py: Python<'_>) -> PyResult<Arc<CompletionPortInner>> {
     let event_loop = py.import("asyncio")?.call_method0("get_running_loop")?;
-    let port = event_loop.getattr("_kioto_completion_port")?;
+    let port = event_loop.getattr("_rsloop_completion_port")?;
     let port = port.extract::<PyRef<'_, CompletionPort>>()?;
     Ok(port.inner())
 }

@@ -1,7 +1,7 @@
 # Profiling
 
 This repo now has a repeatable profiling entrypoint for the benchmark workloads in
-[benchmarks/loops.py](/Users/ramazan/Code/oss/kioto/benchmarks/loops.py).
+`benchmarks/loops.py`.
 
 ## Tools
 
@@ -28,9 +28,9 @@ cargo install samply
 Run from the repo root:
 
 ```bash
-.venv/bin/python profiling/run.py --tool cprofile --loop kioto --benchmark call_soon --iterations 300000 --repeats 3 --warmups 1
-.venv/bin/python profiling/run.py --tool pyinstrument --loop kioto --benchmark tcp_echo --iterations 10000 --repeats 3 --warmups 1
-.venv/bin/python profiling/run.py --tool samply --loop kioto --benchmark tcp_sock --iterations 10000 --repeats 3 --warmups 1
+.venv/bin/python profiling/run.py --tool cprofile --loop rsloop --benchmark call_soon --iterations 300000 --repeats 3 --warmups 1
+.venv/bin/python profiling/run.py --tool pyinstrument --loop rsloop --benchmark tcp_echo --iterations 10000 --repeats 3 --warmups 1
+.venv/bin/python profiling/run.py --tool samply --loop rsloop --benchmark tcp_sock --iterations 10000 --repeats 3 --warmups 1
 ```
 
 Artifacts are written to `profiling/out/` with timestamped names.
@@ -70,8 +70,8 @@ Or upload manually at https://profiler.firefox.com/
 Open directly from the runner:
 
 ```bash
-.venv/bin/python profiling/run.py --tool samply --loop kioto --benchmark tcp_echo --open
-.venv/bin/python profiling/run.py --tool samply --loop kioto --benchmark tcp_echo --open --port 43123
+.venv/bin/python profiling/run.py --tool samply --loop rsloop --benchmark tcp_echo --open
+.venv/bin/python profiling/run.py --tool samply --loop rsloop --benchmark tcp_echo --open --port 43123
 ```
 
 ## Recommended workflow
@@ -85,12 +85,12 @@ Open directly from the runner:
 - Scheduler microbenchmark:
 
 ```bash
-.venv/bin/python profiling/run.py --tool cprofile --loop kioto --benchmark call_soon --iterations 300000 --repeats 3 --warmups 1
+.venv/bin/python profiling/run.py --tool cprofile --loop rsloop --benchmark call_soon --iterations 300000 --repeats 3 --warmups 1
 ```
 
 - Stream transport workload:
 
 ```bash
-.venv/bin/python profiling/run.py --tool pyinstrument --loop kioto --benchmark tcp_echo --iterations 10000 --repeats 3 --warmups 1
-.venv/bin/python profiling/run.py --tool samply --loop kioto --benchmark tcp_echo --iterations 10000 --repeats 3 --warmups 1
+.venv/bin/python profiling/run.py --tool pyinstrument --loop rsloop --benchmark tcp_echo --iterations 10000 --repeats 3 --warmups 1
+.venv/bin/python profiling/run.py --tool samply --loop rsloop --benchmark tcp_echo --iterations 10000 --repeats 3 --warmups 1
 ```

@@ -6,8 +6,8 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
-#[pyclass(module = "kioto._kioto")]
-pub struct KiotoLoopCore {
+#[pyclass(module = "rsloop._rsloop")]
+pub struct RsloopLoopCore {
     loop_obj: Py<PyAny>,
     scheduler: Py<PyAny>,
     poller: Py<PyAny>,
@@ -20,7 +20,7 @@ pub struct KiotoLoopCore {
 }
 
 #[pymethods]
-impl KiotoLoopCore {
+impl RsloopLoopCore {
     #[new]
     #[pyo3(signature = (
         loop_obj,
@@ -247,7 +247,7 @@ impl KiotoLoopCore {
     }
 }
 
-impl KiotoLoopCore {
+impl RsloopLoopCore {
     fn ensure_open(&self) -> PyResult<()> {
         if self.closed.load(Ordering::Acquire) {
             return Err(PyRuntimeError::new_err("Event loop is closed"));
@@ -285,5 +285,5 @@ impl KiotoLoopCore {
 }
 
 pub(crate) fn add_loop_core_class(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<KiotoLoopCore>()
+    m.add_class::<RsloopLoopCore>()
 }

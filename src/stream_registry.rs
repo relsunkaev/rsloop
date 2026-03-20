@@ -13,7 +13,7 @@ const SEGMENT_BITS: usize = 8;
 const SEGMENT_SIZE: usize = 1 << SEGMENT_BITS;
 const SEGMENT_MASK: usize = SEGMENT_SIZE - 1;
 
-#[pyclass(module = "kioto._kioto", unsendable)]
+#[pyclass(module = "rsloop._rsloop", unsendable)]
 pub struct StreamTransportRegistry {
     segments: RefCell<Vec<Option<Box<[Option<StreamCoreRef>]>>>>,
     write_queue: RefCell<Vec<(RawFd, u64)>>,
@@ -213,7 +213,7 @@ impl StreamTransportRegistry {
 
 fn trace_stream_enabled() -> bool {
     static TRACE_STREAM: OnceLock<bool> = OnceLock::new();
-    *TRACE_STREAM.get_or_init(|| env::var_os("KIOTO_TRACE_STREAM").is_some())
+    *TRACE_STREAM.get_or_init(|| env::var_os("RSLOOP_TRACE_STREAM").is_some())
 }
 
 fn future_done(py: Python<'_>, future: &Py<PyAny>) -> PyResult<bool> {

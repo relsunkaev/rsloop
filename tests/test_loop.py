@@ -5,12 +5,12 @@ import socket
 import threading
 import unittest
 
-import kioto
+import rsloop
 
 
-class KiotoLoopTests(unittest.TestCase):
+class RsloopLoopTests(unittest.TestCase):
     def run_async(self, coro) -> None:
-        return kioto.run(coro)
+        return rsloop.run(coro)
 
     def test_callback_scheduling(self) -> None:
         async def main() -> None:
@@ -272,8 +272,8 @@ class KiotoLoopTests(unittest.TestCase):
             return "bridge-ok"
 
         async def main() -> None:
-            self.assertEqual(await kioto.run_in_tokio(python_work()), "bridge-ok")
-            await kioto.sleep(0.01)
+            self.assertEqual(await rsloop.run_in_tokio(python_work()), "bridge-ok")
+            await rsloop.sleep(0.01)
 
         self.run_async(main())
 

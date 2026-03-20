@@ -55,7 +55,7 @@ impl Ord for TimerEntry {
     }
 }
 
-#[pyclass(module = "kioto._kioto")]
+#[pyclass(module = "rsloop._rsloop")]
 pub struct Scheduler {
     ready_local: Mutex<Vec<Py<PyAny>>>,
     ready_remote: SegQueue<Py<PyAny>>,
@@ -332,8 +332,8 @@ impl Scheduler {
         let mut generic_fd_events = Vec::new();
         let mut _stream_fd_events = Vec::new();
         let mut ready_batch = Vec::new();
-        let profiling_json = env::var_os("KIOTO_PROFILE_SCHED_JSON").is_some();
-        let profiling = profiling_json || env::var_os("KIOTO_PROFILE_SCHED").is_some();
+        let profiling_json = env::var_os("RSLOOP_PROFILE_SCHED_JSON").is_some();
+        let profiling = profiling_json || env::var_os("RSLOOP_PROFILE_SCHED").is_some();
         let mut stats = PhaseStats::default();
         self.stopping.store(0, AtomicOrdering::Release);
         loop {
@@ -369,7 +369,7 @@ impl Scheduler {
 
         if profiling {
             eprintln!(
-                "kioto scheduler phases iterations={} direct_waits={} poll_waits={} completion_items={} ready_handles={} fd_events={} stream_fd_hits={} socket_fd_hits={} generic_fd_hits={} ready_local_items={} ready_remote_items={} select={:.6}s fd_dispatch={:.6}s completions={:.6}s timers={:.6}s ready={:.6}s writes={:.6}s",
+                "rsloop scheduler phases iterations={} direct_waits={} poll_waits={} completion_items={} ready_handles={} fd_events={} stream_fd_hits={} socket_fd_hits={} generic_fd_hits={} ready_local_items={} ready_remote_items={} select={:.6}s fd_dispatch={:.6}s completions={:.6}s timers={:.6}s ready={:.6}s writes={:.6}s",
                 stats.iterations,
                 stats.direct_waits,
                 stats.poll_waits,
@@ -390,12 +390,12 @@ impl Scheduler {
             );
         }
         if profiling_json {
-            eprintln!("KIOTO_PROFILE_SCHED_JSON {}", scheduler_profile_json(&stats));
+            eprintln!("RSLOOP_PROFILE_SCHED_JSON {}", scheduler_profile_json(&stats));
             if let Some(trace_json) = take_profile_stream_json() {
-                eprintln!("KIOTO_PROFILE_STREAM_JSON {trace_json}");
+                eprintln!("RSLOOP_PROFILE_STREAM_JSON {trace_json}");
             }
             if let Some(one_arg_json) = take_one_arg_profile_json() {
-                eprintln!("KIOTO_PROFILE_ONEARG_JSON {one_arg_json}");
+                eprintln!("RSLOOP_PROFILE_ONEARG_JSON {one_arg_json}");
             }
         }
 

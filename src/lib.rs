@@ -1,5 +1,5 @@
 #[cfg(not(unix))]
-compile_error!("kioto currently supports unix platforms only");
+compile_error!("rsloop currently supports unix platforms only");
 
 mod bridge;
 #[cfg(unix)]
@@ -49,7 +49,7 @@ use stream_registry::StreamTransportRegistry;
 use stream_transport::StreamTransport;
 
 #[pymodule]
-fn _kioto(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _rsloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Python::initialize();
     m.add_function(wrap_pyfunction!(bridge::backend_name, m)?)?;
     m.add_function(wrap_pyfunction!(bridge::sleep, m)?)?;

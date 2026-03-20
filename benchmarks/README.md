@@ -1,6 +1,6 @@
 ## Benchmark Suite
 
-`benchmarks/loops.py` is the primary performance harness for comparing `asyncio`, `uvloop`, and `kioto`.
+`benchmarks/loops.py` is the primary performance harness for comparing `asyncio`, `uvloop`, and `rsloop`.
 
 It now covers four workload classes:
 
@@ -14,7 +14,7 @@ It now covers four workload classes:
 The harness is designed to make comparisons harder to dismiss:
 
 - each measured sample runs in a fresh child process by default
-- multi-loop comparisons are interleaved round-robin, so `asyncio`, `uvloop`, and `kioto` each see the same thermal/drift conditions per round
+- multi-loop comparisons are interleaved round-robin, so `asyncio`, `uvloop`, and `rsloop` each see the same thermal/drift conditions per round
 - JSON artifacts include paired per-round samples, not just aggregate medians
 - comparisons include both median ratio and paired round data
 - environment metadata includes Python/platform details plus git commit/dirty state
@@ -57,11 +57,11 @@ List available scenarios:
 .venv/bin/python benchmarks/loops.py --list
 ```
 
-Capture Kioto scheduler shape data and stream events for an isolated run:
+Capture Rsloop scheduler shape data and stream events for an isolated run:
 
 ```bash
 .venv/bin/python benchmarks/loops.py \
-  --loop kioto \
+  --loop rsloop \
   --benchmark tcp_echo_parallel \
   --repeats 1 \
   --warmups 0 \
@@ -92,13 +92,13 @@ Capture cross-loop Python stream delivery/write shape for an isolated comparison
 
 ### Notes
 
-- Default output prints per-loop lines plus a compact summary table for Kioto vs the selected baseline, including paired round wins.
+- Default output prints per-loop lines plus a compact summary table for Rsloop vs the selected baseline, including paired round wins.
 - JSON output includes environment metadata, git state, per-sample timings, dispersion stats, paired round samples, and baseline ratios.
-- `--profile-runtime` captures Kioto scheduler per-tick summaries into the JSON artifact.
-- `--profile-stream` captures a bounded Kioto stream event trace into the JSON artifact.
+- `--profile-runtime` captures Rsloop scheduler per-tick summaries into the JSON artifact.
+- `--profile-stream` captures a bounded Rsloop stream event trace into the JSON artifact.
 - `--profile-python-streams` captures cross-loop Python stream counters for `feed_data`, `readexactly`, `write`, and `drain`.
 - `--iterations` overrides the default iteration count for the selected scenarios.
 - `--no-interleave-loops` disables round-robin pairing if you need the old run shape.
 - `--child-retries` retries transient child failures before aborting the suite.
 - Runtime profile capture requires subprocess isolation; leave `--no-isolate-process` off when using it.
-- On Kioto’s native stream fast path, Python stream counters can legitimately stay near zero. That means the workload stayed below `StreamReader`/`StreamWriter`, not that the profiler failed.
+- On Rsloop’s native stream fast path, Python stream counters can legitimately stay near zero. That means the workload stayed below `StreamReader`/`StreamWriter`, not that the profiler failed.

@@ -1,12 +1,12 @@
 import asyncio
 
-import kioto
+import rsloop
 
 
 async def main() -> None:
-    await kioto.sleep(0.01)
-    print(await kioto.run_in_tokio(asyncio.sleep(0.01, result="python future executed inside tokio")))
+    await rsloop.sleep(0.01)
+    print(await rsloop.run_in_tokio(asyncio.sleep(0.01, result="python future executed inside tokio")))
 
 
 if __name__ == "__main__":
-    kioto.run(main())
+    rsloop.run(main())

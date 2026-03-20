@@ -11,7 +11,7 @@ const SEGMENT_BITS: usize = 8;
 const SEGMENT_SIZE: usize = 1 << SEGMENT_BITS;
 const SEGMENT_MASK: usize = SEGMENT_SIZE - 1;
 
-#[pyclass(module = "kioto._kioto", unsendable)]
+#[pyclass(module = "rsloop._rsloop", unsendable)]
 pub struct SocketStateRegistry {
     segments: RefCell<Vec<Option<Box<[Option<SocketCoreRef>]>>>>,
 }

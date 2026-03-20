@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "kioto"
+name = "rsloop"
 version = "0.1.0"
 description = "Tokio-backed asyncio bridge and event-loop scaffold"
 readme = "README.md"
@@ -16,4 +16,4 @@ profiling = ["pyinstrument>=5.1"]
 
 [tool.maturin]
 python-source = "python"
-module-name = "kioto._kioto"
+module-name = "rsloop._rsloop"

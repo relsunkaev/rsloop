@@ -27,13 +27,13 @@ struct HandleState {
     source_traceback: Option<Py<PyAny>>,
 }
 
-#[pyclass(module = "kioto._kioto", weakref, freelist = 1024)]
+#[pyclass(module = "rsloop._rsloop", weakref, freelist = 1024)]
 pub struct Handle {
     cancelled: AtomicBool,
     state: Mutex<HandleState>,
 }
 
-#[pyclass(module = "kioto._kioto", weakref, freelist = 1024)]
+#[pyclass(module = "rsloop._rsloop", weakref, freelist = 1024)]
 pub struct ZeroArgHandle {
     cancelled: AtomicBool,
     scheduled: AtomicBool,
@@ -44,7 +44,7 @@ pub struct ZeroArgHandle {
     source_traceback: Option<Py<PyAny>>,
 }
 
-#[pyclass(module = "kioto._kioto", weakref, freelist = 1024)]
+#[pyclass(module = "rsloop._rsloop", weakref, freelist = 1024)]
 pub struct OneArgHandle {
     cancelled: AtomicBool,
     scheduled: AtomicBool,
@@ -99,7 +99,7 @@ struct FutureHandleState {
     op: FutureHandleOp,
 }
 
-#[pyclass(module = "kioto._kioto", weakref, freelist = 1024)]
+#[pyclass(module = "rsloop._rsloop", weakref, freelist = 1024)]
 pub struct FutureHandle {
     cancelled: AtomicBool,
     state: Mutex<FutureHandleState>,
@@ -116,10 +116,10 @@ static ONE_ARG_PROFILE: OnceLock<Option<Mutex<OneArgProfileState>>> = OnceLock::
 fn one_arg_profile_state() -> Option<&'static Mutex<OneArgProfileState>> {
     ONE_ARG_PROFILE
         .get_or_init(|| {
-            if env::var_os("KIOTO_PROFILE_ONEARG_JSON").is_none() {
+            if env::var_os("RSLOOP_PROFILE_ONEARG_JSON").is_none() {
                 return None;
             }
-            let limit = env::var("KIOTO_PROFILE_ONEARG_LIMIT")
+            let limit = env::var("RSLOOP_PROFILE_ONEARG_LIMIT")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(16);

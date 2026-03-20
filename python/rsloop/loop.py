@@ -16,14 +16,14 @@ from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import Any
 
-from . import _kioto
+from . import _rsloop
 
 
 logger = _selector_events.logger
 _ORIGINAL_STREAMWRITER = _streams.StreamWriter
 
 
-class KiotoStreamWriter:
+class RsloopStreamWriter:
     __slots__ = ("_transport", "_protocol", "_reader", "_loop", "write", "drain", "close", "wait_closed")
 
     def __init__(self, transport: Any, protocol: Any, reader: Any, loop: asyncio.AbstractEventLoop) -> None:
@@ -86,8 +86,8 @@ class KiotoStreamWriter:
 
 
 def _patch_stream_writer() -> None:
-    if _streams.StreamWriter is not KiotoStreamWriter:
-        _streams.StreamWriter = KiotoStreamWriter
+    if _streams.StreamWriter is not RsloopStreamWriter:
+        _streams.StreamWriter = RsloopStreamWriter
 
 
 @dataclass(slots=True)
@@ -134,7 +134,7 @@ class _SocketState:
         "_closed",
     )
 
-    def __init__(self, loop: "KiotoEventLoop", sock: socket.socket) -> None:
+    def __init__(self, loop: "RsloopEventLoop", sock: socket.socket) -> None:
         self._loop = loop
         self._sock = sock
         self.fd = sock.fileno()
@@ -341,27 +341,27 @@ class _SocketState:
             self._schedule_writer_disarm()
 
 
-class KiotoEventLoop(_base_events.BaseEventLoop):
+class RsloopEventLoop(_base_events.BaseEventLoop):
     """Tokio-backed asyncio loop with a native scheduling core."""
 
     def __init__(self) -> None:
         _patch_stream_writer()
         super().__init__()
-        self._poller = _kioto.TokioPoller()
-        self._scheduler = _kioto.Scheduler()
-        self._native_api = _kioto.LoopApi(self, self._scheduler, self._debug)
-        self._fd_registry = _kioto.FdCallbackRegistry()
-        self._stream_registry = _kioto.StreamTransportRegistry()
-        self._socket_registry = _kioto.SocketStateRegistry()
+        self._poller = _rsloop.TokioPoller()
+        self._scheduler = _rsloop.Scheduler()
+        self._native_api = _rsloop.LoopApi(self, self._scheduler, self._debug)
+        self._fd_registry = _rsloop.FdCallbackRegistry()
+        self._stream_registry = _rsloop.StreamTransportRegistry()
+        self._socket_registry = _rsloop.SocketStateRegistry()
         self._native_run_forever = getattr(self._scheduler, "run_forever_native", None)
         self._install_native_bindings()
         self._transports: dict[int, Any] = {}
-        self._kioto_socket_states: dict[int, Any] = {}
-        self._kioto_completion_port = _kioto.CompletionPort()
+        self._rsloop_socket_states: dict[int, Any] = {}
+        self._rsloop_completion_port = _rsloop.CompletionPort()
         self._ssock: socket.socket | None = None
         self._csock: socket.socket | None = None
         self._make_self_pipe()
-        self._poller.set_interest(self._kioto_completion_port.fileno(), True, False)
+        self._poller.set_interest(self._rsloop_completion_port.fileno(), True, False)
 
     def _bind_native_callable(self, binder_name: str, fallback: Any) -> Any:
         binder = getattr(self._native_api, binder_name, None)
@@ -404,7 +404,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
 
     def _take_fd_for_transport(self, sock: socket.socket) -> int:
         fileno = sock.fileno()
-        state = self._kioto_socket_states.pop(fileno, None)
+        state = self._rsloop_socket_states.pop(fileno, None)
         if state is not None:
             state.close()
         self._remove_reader(fileno)
@@ -474,7 +474,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
     def _add_reader(self, fd: Any, callback: Any, *args: Any) -> _events.Handle:
         self._check_closed()
         fileno = self._normalize_fd(fd)
-        handle = _kioto.make_handle(callback, args, self, None, None)
+        handle = _rsloop.make_handle(callback, args, self, None, None)
         previous = self._fd_registry.add_reader(fileno, handle)
         if previous is not None:
             previous.cancel()
@@ -503,7 +503,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
     def _add_writer(self, fd: Any, callback: Any, *args: Any) -> _events.Handle:
         self._check_closed()
         fileno = self._normalize_fd(fd)
-        handle = _kioto.make_handle(callback, args, self, None, None)
+        handle = _rsloop.make_handle(callback, args, self, None, None)
         previous = self._fd_registry.add_writer(fileno, handle)
         if previous is not None:
             previous.cancel()
@@ -548,7 +548,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
         if self._debug:
             self._check_thread()
             self._check_callback(callback, "call_soon")
-        handle = _kioto.make_handle(callback, args, self, context, None)
+        handle = _rsloop.make_handle(callback, args, self, context, None)
         try:
             self._scheduler.push_ready(handle)
         except RuntimeError as exc:
@@ -563,7 +563,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
         args: tuple[Any, ...],
         context: Any,
     ) -> _events.Handle:
-        handle = _kioto.make_handle(callback, args, self, context, None)
+        handle = _rsloop.make_handle(callback, args, self, context, None)
         self._scheduler.push_ready(handle)
         return handle
 
@@ -582,7 +582,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
         self._check_closed()
         if self._debug:
             self._check_callback(callback, "call_soon_threadsafe")
-        handle = _kioto.make_handle(callback, args, self, context, None)
+        handle = _rsloop.make_handle(callback, args, self, context, None)
         try:
             self._scheduler.push_ready(handle)
         except RuntimeError as exc:
@@ -605,7 +605,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
         if self._debug:
             self._check_thread()
             self._check_callback(callback, "call_at")
-        timer = _kioto.make_handle(callback, args, self, context, when)
+        timer = _rsloop.make_handle(callback, args, self, context, when)
         self._scheduler.push_timer(timer, when)
         return timer
 
@@ -617,7 +617,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
             self,
             self._native_api,
             self._poller,
-            self._kioto_completion_port,
+            self._rsloop_completion_port,
             self._stream_registry,
             self._socket_registry,
             self._stopping,
@@ -640,7 +640,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
                     self,
                     self._native_api,
                     self._poller,
-                    self._kioto_completion_port,
+                    self._rsloop_completion_port,
                     self._stream_registry,
                     self._socket_registry,
                     self._clock_resolution,
@@ -656,7 +656,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
         self._native_api.set_stopping(True)
 
     def _drain_completions(self) -> None:
-        for kind, target, payload, is_err in self._kioto_completion_port.drain():
+        for kind, target, payload, is_err in self._rsloop_completion_port.drain():
             if kind == 0:
                 if target.cancelled():
                     continue
@@ -671,18 +671,18 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
                 continue
             target(payload)
 
-    def _kioto_socket_state(self, sock: socket.socket) -> _SocketState:
+    def _rsloop_socket_state(self, sock: socket.socket) -> _SocketState:
         fd = sock.fileno()
-        state = self._kioto_socket_states.get(fd)
+        state = self._rsloop_socket_states.get(fd)
         if state is not None and state.sock is not sock:
             state.close()
-            self._kioto_socket_states.pop(fd, None)
+            self._rsloop_socket_states.pop(fd, None)
             state = None
         if state is None:
             self._ensure_fd_no_transport(fd)
-            state = _kioto.SocketState(sock, self)
+            state = _rsloop.SocketState(sock, self)
             self._socket_registry.register(fd, state)
-            self._kioto_socket_states[fd] = state
+            self._rsloop_socket_states[fd] = state
         return state
 
     def _check_socket(self, sock: socket.socket) -> None:
@@ -714,7 +714,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
         except (BlockingIOError, InterruptedError):
             pass
         future = self.create_future()
-        self._kioto_socket_state(sock).enqueue_recv(future, n)
+        self._rsloop_socket_state(sock).enqueue_recv(future, n)
         try:
             return await future
         finally:
@@ -728,7 +728,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
         except (BlockingIOError, InterruptedError):
             pass
         future = self.create_future()
-        self._kioto_socket_state(sock).enqueue_recv_into(future, view)
+        self._rsloop_socket_state(sock).enqueue_recv_into(future, view)
         try:
             return await future
         finally:
@@ -747,7 +747,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
         if sent == len(view):
             return
         future = self.create_future()
-        self._kioto_socket_state(sock).enqueue_sendall(future, view, sent=sent)
+        self._rsloop_socket_state(sock).enqueue_sendall(future, view, sent=sent)
         try:
             return await future
         finally:
@@ -762,7 +762,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
             return conn, address
         except (BlockingIOError, InterruptedError):
             pass
-        state = self._kioto_socket_state(sock)
+        state = self._rsloop_socket_state(sock)
         enqueue_accept = getattr(state, "enqueue_accept", None)
         if enqueue_accept is not None:
             future = self.create_future()
@@ -819,7 +819,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
         else:
             return None
         future = self.create_future()
-        self._kioto_socket_state(sock).enqueue_connect(future, address)
+        self._rsloop_socket_state(sock).enqueue_connect(future, address)
         try:
             return await future
         finally:
@@ -836,7 +836,7 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
     ) -> asyncio.Transport:
         self._ensure_fd_no_transport(sock)
         self._take_fd_for_transport(sock)
-        stream_transport_type = getattr(_kioto, "StreamTransport", None)
+        stream_transport_type = getattr(_rsloop, "StreamTransport", None)
         if (
             stream_transport_type is not None
             and isinstance(protocol, _streams.StreamReaderProtocol)
@@ -1138,13 +1138,13 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
                 self.call_exception_handler(context)
 
     def create_tokio_future(self, awaitable: Awaitable[Any]) -> Awaitable[Any]:
-        return _kioto.run_in_tokio(awaitable)
+        return _rsloop.run_in_tokio(awaitable)
 
     def wrap_tokio_future(self, awaitable: Awaitable[Any]) -> Awaitable[Any]:
-        return _kioto.wrap_future(awaitable)
+        return _rsloop.wrap_future(awaitable)
 
     async def sleep(self, delay: float) -> None:
-        await _kioto.sleep(delay)
+        await _rsloop.sleep(delay)
 
     def set_debug(self, enabled: bool) -> None:
         super().set_debug(enabled)
@@ -1163,12 +1163,12 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
         scheduler = getattr(self, "_scheduler", None)
         if scheduler is not None:
             scheduler.clear()
-        socket_states = getattr(self, "_kioto_socket_states", None)
+        socket_states = getattr(self, "_rsloop_socket_states", None)
         if socket_states is not None:
             for state in socket_states.values():
                 state.close()
             socket_states.clear()
-        completion_port = getattr(self, "_kioto_completion_port", None)
+        completion_port = getattr(self, "_rsloop_completion_port", None)
         if completion_port is not None:
             self._poller.set_interest(completion_port.fileno(), False, False)
             completion_port.close()
@@ -1187,16 +1187,16 @@ class KiotoEventLoop(_base_events.BaseEventLoop):
         super().close()
 
 
-class KiotoEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
-    """Event-loop policy that creates Kioto event loops."""
+class RsloopEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
+    """Event-loop policy that creates Rsloop event loops."""
 
-    def new_event_loop(self) -> KiotoEventLoop:
-        return KiotoEventLoop()
+    def new_event_loop(self) -> RsloopEventLoop:
+        return RsloopEventLoop()
 
 
-def install() -> KiotoEventLoopPolicy:
-    """Install Kioto as the active asyncio policy."""
+def install() -> RsloopEventLoopPolicy:
+    """Install Rsloop as the active asyncio policy."""
 
-    policy = KiotoEventLoopPolicy()
+    policy = RsloopEventLoopPolicy()
     asyncio.set_event_loop_policy(policy)
     return policy

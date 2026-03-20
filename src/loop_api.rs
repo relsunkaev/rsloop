@@ -44,7 +44,7 @@ static CALL_AT_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
     ml_doc: c"Native FASTCALL call_at implementation.".as_ptr(),
 });
 
-#[pyclass(module = "kioto._kioto")]
+#[pyclass(module = "rsloop._rsloop")]
 pub struct LoopApi {
     loop_obj: Py<PyAny>,
     scheduler: Py<Scheduler>,

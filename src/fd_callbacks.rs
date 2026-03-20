@@ -25,7 +25,7 @@ struct FdCallbackEntry {
     state: Mutex<FdCallbackState>,
 }
 
-#[pyclass(module = "kioto._kioto")]
+#[pyclass(module = "rsloop._rsloop")]
 pub struct FdCallbackRegistry {
     states: RwLock<HashMap<RawFd, Arc<FdCallbackEntry>>>,
 }

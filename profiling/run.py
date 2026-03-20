@@ -60,9 +60,9 @@ def run_subprocess(cmd: list[str], env: dict[str, str]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Profile kioto benchmark workloads")
+    parser = argparse.ArgumentParser(description="Profile rsloop benchmark workloads")
     parser.add_argument("--tool", choices=("cprofile", "pyinstrument", "samply"), required=True)
-    parser.add_argument("--loop", choices=("asyncio", "kioto", "uvloop"), default="kioto")
+    parser.add_argument("--loop", choices=("asyncio", "rsloop", "uvloop"), default="rsloop")
     parser.add_argument(
         "--benchmark",
         choices=("call_soon", "sleep_zero", "socketpair", "tcp_echo", "tcp_sock", "tcp_connect"),

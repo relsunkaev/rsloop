@@ -70,7 +70,7 @@ pub(crate) struct SocketCore {
     closed: bool,
 }
 
-#[pyclass(module = "kioto._kioto", unsendable)]
+#[pyclass(module = "rsloop._rsloop", unsendable)]
 pub struct SocketState {
     pub(crate) core: SocketCoreRef,
 }

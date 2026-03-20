@@ -116,12 +116,12 @@ pub(crate) struct StreamCore {
     pub(crate) write_queued: bool,
 }
 
-#[pyclass(module = "kioto._kioto", unsendable)]
+#[pyclass(module = "rsloop._rsloop", unsendable)]
 pub struct StreamTransport {
     pub(crate) core: StreamCoreRef,
 }
 
-#[pyclass(module = "kioto._kioto", unsendable)]
+#[pyclass(module = "rsloop._rsloop", unsendable)]
 struct ReadyAwaitable {
     result: Option<Py<PyAny>>,
     exception: Option<Py<PyAny>>,
@@ -135,7 +135,7 @@ enum StreamWaiterState {
     Finished,
 }
 
-#[pyclass(module = "kioto._kioto", unsendable)]
+#[pyclass(module = "rsloop._rsloop", unsendable)]
 pub(crate) struct StreamWaiter {
     scheduler: Py<Scheduler>,
     loop_obj: Py<PyAny>,
@@ -1393,7 +1393,7 @@ impl StreamCore {
 }
 
 fn trace_stream_enabled() -> bool {
-    *TRACE_STREAM.get_or_init(|| env::var_os("KIOTO_TRACE_STREAM").is_some())
+    *TRACE_STREAM.get_or_init(|| env::var_os("RSLOOP_TRACE_STREAM").is_some())
 }
 
 pub(crate) fn take_profile_stream_json() -> Option<String> {
@@ -1420,10 +1420,10 @@ pub(crate) fn take_profile_stream_json() -> Option<String> {
 fn stream_profile_state() -> Option<&'static Mutex<StreamProfileState>> {
     STREAM_PROFILE
         .get_or_init(|| {
-            if env::var_os("KIOTO_PROFILE_STREAM_JSON").is_none() {
+            if env::var_os("RSLOOP_PROFILE_STREAM_JSON").is_none() {
                 return None;
             }
-            let limit = env::var("KIOTO_PROFILE_STREAM_LIMIT")
+            let limit = env::var("RSLOOP_PROFILE_STREAM_LIMIT")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(256);
@@ -1466,7 +1466,7 @@ static READEXACTLY_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
         PyCFunction: stream_transport_readexactly_c,
     },
     ml_flags: ffi::METH_O,
-    ml_doc: c"Native exact-read fast path backed by the Kioto stream transport.".as_ptr(),
+    ml_doc: c"Native exact-read fast path backed by the Rsloop stream transport.".as_ptr(),
 });
 
 static DRAIN_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
@@ -1475,7 +1475,7 @@ static DRAIN_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
         PyCFunction: stream_transport_drain_c,
     },
     ml_flags: ffi::METH_NOARGS,
-    ml_doc: c"Native drain fast path backed by the Kioto stream transport.".as_ptr(),
+    ml_doc: c"Native drain fast path backed by the Rsloop stream transport.".as_ptr(),
 });
 
 static WRITE_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
@@ -1484,7 +1484,7 @@ static WRITE_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
         PyCFunction: stream_transport_write_c,
     },
     ml_flags: ffi::METH_O,
-    ml_doc: c"Native write fast path backed by the Kioto stream transport.".as_ptr(),
+    ml_doc: c"Native write fast path backed by the Rsloop stream transport.".as_ptr(),
 });
 
 static CLOSE_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
@@ -1493,7 +1493,7 @@ static CLOSE_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
         PyCFunction: stream_transport_close_c,
     },
     ml_flags: ffi::METH_NOARGS,
-    ml_doc: c"Native close fast path backed by the Kioto stream transport.".as_ptr(),
+    ml_doc: c"Native close fast path backed by the Rsloop stream transport.".as_ptr(),
 });
 
 static WAIT_CLOSED_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
@@ -1502,7 +1502,7 @@ static WAIT_CLOSED_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
         PyCFunction: stream_transport_wait_closed_c,
     },
     ml_flags: ffi::METH_NOARGS,
-    ml_doc: c"Native wait_closed fast path backed by the Kioto stream transport.".as_ptr(),
+    ml_doc: c"Native wait_closed fast path backed by the Rsloop stream transport.".as_ptr(),
 });
 
 fn create_bound_readexactly(py: Python<'_>, slf: &Py<PyAny>) -> PyResult<Py<PyAny>> {

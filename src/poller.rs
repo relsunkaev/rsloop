@@ -134,7 +134,7 @@ impl PollerState {
     }
 }
 
-#[pyclass(module = "kioto._kioto")]
+#[pyclass(module = "rsloop._rsloop")]
 pub struct TokioPoller {
     state: Mutex<PollerState>,
 }
