@@ -7,12 +7,16 @@ use std::fmt::Write as _;
 use std::os::fd::RawFd;
 use std::ptr;
 use std::rc::Rc;
-use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
 use std::time::Instant;
 
+use memchr::memmem;
 use parking_lot::Mutex;
-use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyStopIteration};
 use pyo3::buffer::PyBuffer;
+use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyStopIteration};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -57,7 +61,7 @@ struct PendingRead {
 
 enum PendingReadKind {
     Exact(usize),
-    Until(Vec<u8>),
+    Until { separator: Vec<u8>, offset: usize },
 }
 
 pub(crate) enum StreamCompletion {
@@ -233,9 +237,15 @@ impl StreamWaiter {
             return Err(cancelled_error(py, waiter.cancel_message.as_ref())?);
         }
         if let Some(exception) = waiter.exception.as_ref() {
-            return Err(PyErr::from_value(exception.clone_ref(py).into_bound(py).into_any()));
+            return Err(PyErr::from_value(
+                exception.clone_ref(py).into_bound(py).into_any(),
+            ));
         }
-        let result = waiter.result.as_ref().map(|value| value.clone_ref(py)).unwrap_or_else(|| py.None());
+        let result = waiter
+            .result
+            .as_ref()
+            .map(|value| value.clone_ref(py))
+            .unwrap_or_else(|| py.None());
         Err(PyStopIteration::new_err((result,)))
     }
 
@@ -253,7 +263,9 @@ impl StreamWaiter {
         let pending = {
             let mut waiter = slf.borrow_mut(py);
             if waiter.state == StreamWaiterState::Pending {
-                waiter.callbacks.push((callback.clone_ref(py), context.clone_ref(py)));
+                waiter
+                    .callbacks
+                    .push((callback.clone_ref(py), context.clone_ref(py)));
                 true
             } else {
                 false
@@ -309,9 +321,15 @@ impl StreamWaiter {
             StreamWaiterState::Cancelled => Err(cancelled_error(py, self.cancel_message.as_ref())?),
             StreamWaiterState::Finished => {
                 if let Some(exception) = self.exception.as_ref() {
-                    Err(PyErr::from_value(exception.clone_ref(py).into_bound(py).into_any()))
+                    Err(PyErr::from_value(
+                        exception.clone_ref(py).into_bound(py).into_any(),
+                    ))
                 } else {
-                    Ok(self.result.as_ref().map(|value| value.clone_ref(py)).unwrap_or_else(|| py.None()))
+                    Ok(self
+                        .result
+                        .as_ref()
+                        .map(|value| value.clone_ref(py))
+                        .unwrap_or_else(|| py.None()))
                 }
             }
         }
@@ -321,7 +339,9 @@ impl StreamWaiter {
         match self.state {
             StreamWaiterState::Pending => Err(invalid_state_error(py, "Exception is not set.")?),
             StreamWaiterState::Cancelled => Err(cancelled_error(py, self.cancel_message.as_ref())?),
-            StreamWaiterState::Finished => Ok(self.exception.as_ref().map(|value| value.clone_ref(py))),
+            StreamWaiterState::Finished => {
+                Ok(self.exception.as_ref().map(|value| value.clone_ref(py)))
+            }
         }
     }
 
@@ -469,42 +489,42 @@ impl StreamTransport {
                 (None, None, None, None, 64 * 1024)
             };
         let core = Rc::new(RefCell::new(StreamCore {
-                stream_token: STREAM_TOKEN.fetch_add(1, Ordering::Relaxed),
-                sock,
-                fd,
-                protocol,
-                buffered_protocol,
-                loop_obj,
-                poller,
-                registry,
-                transports,
-                extra,
-                reader,
-                reader_readexactly,
-                reader_readuntil,
-                close_waiter,
-                drain_fallback: None,
-                ready_drain: None,
-                buffer,
-                limit,
-                pending_read: None,
-                pending_drains: Vec::new(),
-                pending_close_waiters: Vec::new(),
-                read_buffer: vec![0_u8; read_size.max(1)],
-                write_queue: VecDeque::new(),
-                pending_write_bytes: 0,
-                closing: false,
-                closed: false,
-                read_paused: false,
-                reader_registered: false,
-                writer_registered: false,
-                write_waiting_for_writable: false,
-                eof_requested: false,
-                eof_sent: false,
-                protocol_paused: false,
-                connection_lost_sent: false,
-                write_queued: false,
-            }));
+            stream_token: STREAM_TOKEN.fetch_add(1, Ordering::Relaxed),
+            sock,
+            fd,
+            protocol,
+            buffered_protocol,
+            loop_obj,
+            poller,
+            registry,
+            transports,
+            extra,
+            reader,
+            reader_readexactly,
+            reader_readuntil,
+            close_waiter,
+            drain_fallback: None,
+            ready_drain: None,
+            buffer,
+            limit,
+            pending_read: None,
+            pending_drains: Vec::new(),
+            pending_close_waiters: Vec::new(),
+            read_buffer: vec![0_u8; read_size.max(1)],
+            write_queue: VecDeque::new(),
+            pending_write_bytes: 0,
+            closing: false,
+            closed: false,
+            read_paused: false,
+            reader_registered: false,
+            writer_registered: false,
+            write_waiting_for_writable: false,
+            eof_requested: false,
+            eof_sent: false,
+            protocol_paused: false,
+            connection_lost_sent: false,
+            write_queued: false,
+        }));
         Ok(Self {
             _start_tls_compatible: true,
             fd,
@@ -518,7 +538,10 @@ impl StreamTransport {
         let transports = core.borrow().transports.clone_ref(py);
         let registry = core.borrow().registry.clone_ref(py);
         transports.bind(py).set_item(fd, slf.bind(py))?;
-        registry.bind(py).borrow_mut().register_inner(fd, core.clone());
+        registry
+            .bind(py)
+            .borrow_mut()
+            .register_inner(fd, core.clone());
         let result = core.borrow_mut().sync_interest(py);
         result
     }
@@ -551,7 +574,11 @@ impl StreamTransport {
     fn set_protocol(slf: Py<Self>, py: Python<'_>, protocol: Py<PyAny>) -> PyResult<()> {
         let core = slf.borrow(py).core.clone();
         if trace_stream_enabled() {
-            eprintln!("stream-transport set_protocol fd={} type={}", core.borrow().fd, protocol.bind(py).get_type().name()?);
+            eprintln!(
+                "stream-transport set_protocol fd={} type={}",
+                core.borrow().fd,
+                protocol.bind(py).get_type().name()?
+            );
         }
         core.borrow_mut().protocol = protocol;
         Ok(())
@@ -729,14 +756,10 @@ impl StreamTransport {
                 match dispatch {
                     ReadableDispatch::WouldBlock => break,
                     ReadableDispatch::Buffered { protocol, nbytes } => {
-                        let result = protocol
-                            .bind(py)
-                            .call_method1("buffer_updated", (nbytes,));
+                        let result = protocol.bind(py).call_method1("buffer_updated", (nbytes,));
                         if let Err(err) = result {
-                            core.borrow_mut().finish_close(
-                                py,
-                                Some(err.into_value(py).into_any()),
-                            )?;
+                            core.borrow_mut()
+                                .finish_close(py, Some(err.into_value(py).into_any()))?;
                             break;
                         } else if trace_stream_enabled() {
                             eprintln!(
@@ -889,7 +912,11 @@ impl StreamCore {
             return Ok(());
         }
         if trace_stream_enabled() {
-            eprintln!("stream-transport ssl-direct-write fd={} bytes={}", self.fd, bytes.len());
+            eprintln!(
+                "stream-transport ssl-direct-write fd={} bytes={}",
+                self.fd,
+                bytes.len()
+            );
         }
         match try_send_bytes(self.fd, bytes) {
             Ok(sent) if sent == bytes.len() => Ok(()),
@@ -901,9 +928,16 @@ impl StreamCore {
         }
     }
 
-    fn write_bytes_object_inner(&mut self, py: Python<'_>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
+    fn write_bytes_object_inner(
+        &mut self,
+        py: Python<'_>,
+        data: &Bound<'_, PyBytes>,
+    ) -> PyResult<()> {
         let bytes = data.as_bytes();
-        if self.write_queue.is_empty() && !self.writer_registered && bytes.len() <= DIRECT_WRITE_LIMIT {
+        if self.write_queue.is_empty()
+            && !self.writer_registered
+            && bytes.len() <= DIRECT_WRITE_LIMIT
+        {
             match try_send_bytes(self.fd, bytes) {
                 Ok(sent) if sent == bytes.len() => {
                     record_stream_profile_event("write_direct", self.fd, sent, 0);
@@ -914,7 +948,12 @@ impl StreamCore {
                     self.queue_write_bytes(py, tail, 0)?;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    record_stream_profile_event("write_direct_would_block", self.fd, bytes.len(), 0);
+                    record_stream_profile_event(
+                        "write_direct_would_block",
+                        self.fd,
+                        bytes.len(),
+                        0,
+                    );
                     self.queue_write_bytes(py, data.clone().unbind(), 0)?;
                 }
                 Err(err) => {
@@ -941,7 +980,10 @@ impl StreamCore {
         if data.is_empty() {
             return Ok(());
         }
-        if self.write_queue.is_empty() && !self.writer_registered && data.len() <= DIRECT_WRITE_LIMIT {
+        if self.write_queue.is_empty()
+            && !self.writer_registered
+            && data.len() <= DIRECT_WRITE_LIMIT
+        {
             match try_send_bytes(self.fd, data) {
                 Ok(sent) if sent == data.len() => return Ok(()),
                 Ok(sent) => {
@@ -984,7 +1026,12 @@ impl StreamCore {
         Ok(())
     }
 
-    fn queue_write_bytes(&mut self, py: Python<'_>, data: Py<PyBytes>, sent: usize) -> PyResult<()> {
+    fn queue_write_bytes(
+        &mut self,
+        py: Python<'_>,
+        data: Py<PyBytes>,
+        sent: usize,
+    ) -> PyResult<()> {
         let len = data.bind(py).as_bytes().len();
         let sent = sent.min(len);
         let queued = len.saturating_sub(sent);
@@ -1011,8 +1058,7 @@ impl StreamCore {
                             if existing_bytes.len() <= SMALL_WRITE_CHUNK_LIMIT
                                 && existing_bytes.len() + len <= SMALL_WRITE_BUFFER_LIMIT
                             {
-                                let mut combined =
-                                    Vec::with_capacity(existing_bytes.len() + len);
+                                let mut combined = Vec::with_capacity(existing_bytes.len() + len);
                                 combined.extend_from_slice(existing_bytes);
                                 combined.extend_from_slice(bytes);
                                 last.data = PendingWriteData::Owned(combined);
@@ -1033,12 +1079,7 @@ impl StreamCore {
             data: PendingWriteData::PyBytes(data),
             sent,
         });
-        record_stream_profile_event(
-            "write_queue",
-            self.fd,
-            queued,
-            self.pending_write_bytes,
-        );
+        record_stream_profile_event("write_queue", self.fd, queued, self.pending_write_bytes);
         Ok(())
     }
 
@@ -1075,7 +1116,11 @@ impl StreamCore {
                 };
                 let slice = unsafe { cell_slice_as_bytes_mut(cells) };
                 if trace_stream_enabled() {
-                    eprintln!("stream-transport ssl-on_readable recv fd={} want={}", self.fd, slice.len());
+                    eprintln!(
+                        "stream-transport ssl-on_readable recv fd={} want={}",
+                        self.fd,
+                        slice.len()
+                    );
                 }
                 match recv_into(self.fd, slice) {
                     Ok(0) => {
@@ -1088,11 +1133,17 @@ impl StreamCore {
                     }
                     Ok(n) => {
                         if trace_stream_enabled() {
-                            eprintln!("stream-transport ssl-on_readable got fd={} bytes={}", self.fd, n);
+                            eprintln!(
+                                "stream-transport ssl-on_readable got fd={} bytes={}",
+                                self.fd, n
+                            );
                         }
                         protocol.call_method1("buffer_updated", (n,))?;
                         if trace_stream_enabled() {
-                            eprintln!("stream-transport ssl-on_readable updated fd={} bytes={}", self.fd, n);
+                            eprintln!(
+                                "stream-transport ssl-on_readable updated fd={} bytes={}",
+                                self.fd, n
+                            );
                         }
                         if self.read_paused {
                             return Ok(());
@@ -1214,7 +1265,11 @@ impl StreamCore {
         };
         let slice = unsafe { cell_slice_as_bytes_mut(cells) };
         if trace_stream_enabled() {
-            eprintln!("stream-transport ssl-read fd={} want={}", self.fd, slice.len());
+            eprintln!(
+                "stream-transport ssl-read fd={} want={}",
+                self.fd,
+                slice.len()
+            );
         }
         match recv_into(self.fd, slice) {
             Ok(0) => {
@@ -1227,7 +1282,9 @@ impl StreamCore {
                 protocol: protocol.clone_ref(py),
                 nbytes: n,
             }),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(ReadableDispatch::WouldBlock),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                Ok(ReadableDispatch::WouldBlock)
+            }
             Err(err) => Ok(ReadableDispatch::Error {
                 exc: PyRuntimeError::new_err(err.to_string())
                     .into_value(py)
@@ -1237,7 +1294,12 @@ impl StreamCore {
     }
 
     pub(crate) fn on_writable(&mut self, py: Python<'_>) -> PyResult<()> {
-        record_stream_profile_event("write_ready", self.fd, self.pending_write_bytes, self.write_queue.len());
+        record_stream_profile_event(
+            "write_ready",
+            self.fd,
+            self.pending_write_bytes,
+            self.write_queue.len(),
+        );
         self.write_waiting_for_writable = false;
         self.sync_interest(py)?;
         self.flush_write_phase(py)
@@ -1252,7 +1314,12 @@ impl StreamCore {
                 self.fd, self.pending_write_bytes
             );
         }
-        record_stream_profile_event("write_phase_start", self.fd, queued_before, self.write_queue.len());
+        record_stream_profile_event(
+            "write_phase_start",
+            self.fd,
+            queued_before,
+            self.write_queue.len(),
+        );
         while !self.write_queue.is_empty() {
             match self.flush_write_once(py) {
                 Ok(0) => {
@@ -1262,7 +1329,12 @@ impl StreamCore {
                 }
                 Ok(sent) => {
                     phase_sent += sent;
-                    record_stream_profile_event("write_flush", self.fd, sent, self.pending_write_bytes);
+                    record_stream_profile_event(
+                        "write_flush",
+                        self.fd,
+                        sent,
+                        self.pending_write_bytes,
+                    );
                     if trace_stream_enabled() {
                         eprintln!("stream-transport wrote fd={} bytes={}", self.fd, sent);
                     }
@@ -1290,7 +1362,12 @@ impl StreamCore {
                 }
             }
         }
-        record_stream_profile_event("write_phase_end", self.fd, phase_sent, self.pending_write_bytes);
+        record_stream_profile_event(
+            "write_phase_end",
+            self.fd,
+            phase_sent,
+            self.pending_write_bytes,
+        );
 
         if self.pending_write_bytes == 0 {
             self.remove_writer(py)?;
@@ -1406,10 +1483,7 @@ impl StreamCore {
         self.closing = true;
         self.write_queued = false;
         self.write_waiting_for_writable = false;
-        self.registry
-            .bind(py)
-            .borrow()
-            .unregister_inner(self.fd);
+        self.registry.bind(py).borrow().unregister_inner(self.fd);
         if self.reader_registered || self.writer_registered {
             self.disable_interest(py)?;
         }
@@ -1451,7 +1525,11 @@ impl StreamCore {
         }
         if writable != self.writer_registered {
             record_stream_profile_event(
-                if writable { "write_interest_on" } else { "write_interest_off" },
+                if writable {
+                    "write_interest_on"
+                } else {
+                    "write_interest_off"
+                },
                 self.fd,
                 self.pending_write_bytes,
                 self.write_queue.len(),
@@ -1488,7 +1566,12 @@ impl StreamCore {
         }
         self.protocol.bind(py).call_method0("pause_writing")?;
         self.protocol_paused = true;
-        record_stream_profile_event("pause_writing", self.fd, self.pending_write_bytes, self.write_queue.len());
+        record_stream_profile_event(
+            "pause_writing",
+            self.fd,
+            self.pending_write_bytes,
+            self.write_queue.len(),
+        );
         Ok(())
     }
 
@@ -1498,7 +1581,12 @@ impl StreamCore {
         }
         self.protocol.bind(py).call_method0("resume_writing")?;
         self.protocol_paused = false;
-        record_stream_profile_event("resume_writing", self.fd, self.pending_write_bytes, self.write_queue.len());
+        record_stream_profile_event(
+            "resume_writing",
+            self.fd,
+            self.pending_write_bytes,
+            self.write_queue.len(),
+        );
         self.queue_pending_drains(py, None)?;
         Ok(())
     }
@@ -1584,7 +1672,9 @@ impl StreamCore {
             );
         }
         let payload = if buffered == 0 && needed_from_chunk == size {
-            PyBytes::new(py, &self.read_buffer[..size]).into_any().unbind()
+            PyBytes::new(py, &self.read_buffer[..size])
+                .into_any()
+                .unbind()
         } else {
             join_buffered_prefix_and_chunk(
                 py,
@@ -1595,12 +1685,15 @@ impl StreamCore {
             )?
         };
         reader.setattr("_waiter", py.None())?;
-        self.queue_completion(py, StreamCompletion::ReadResult {
-            reader: reader.clone().unbind(),
-            waiter: pending.waiter,
-            payload,
-            resume_transport: true,
-        })?;
+        self.queue_completion(
+            py,
+            StreamCompletion::ReadResult {
+                reader: reader.clone().unbind(),
+                waiter: pending.waiter,
+                payload,
+                resume_transport: true,
+            },
+        )?;
         record_stream_profile_event("read_wait_done", self.fd, size, buffered);
 
         if needed_from_chunk != chunk_size || buffered != 0 {
@@ -1609,7 +1702,7 @@ impl StreamCore {
                 &self.read_buffer[needed_from_chunk..chunk_size],
             )?;
         }
-        maybe_resume_transport(reader)?;
+        self.maybe_resume_transport(py, reader)?;
         Ok(true)
     }
 
@@ -1652,7 +1745,7 @@ impl StreamCore {
 
         if try_consume_exact(buffer.as_ptr(), size)? {
             let data = consume_exact(py, buffer.as_ptr(), size)?;
-            maybe_resume_transport(&reader)?;
+            self.maybe_resume_transport(py, &reader)?;
             return ready_awaitable_result(py, data);
         }
 
@@ -1667,12 +1760,7 @@ impl StreamCore {
             ));
         }
 
-        if reader.getattr("_paused")?.is_truthy()? {
-            reader.setattr("_paused", false)?;
-            reader
-                .getattr("_transport")?
-                .call_method0("resume_reading")?;
-        }
+        self.resume_reader_if_paused(py, &reader)?;
 
         let scheduler = self
             .loop_obj
@@ -1727,11 +1815,19 @@ impl StreamCore {
             .as_ref()
             .expect("stream transport buffer")
             .bind(py);
-        if let Some(index) = find_subsequence_in_bytearray(buffer.as_ptr(), separator)? {
+        if let Some(index) = find_subsequence_in_bytearray(buffer.as_ptr(), separator, 0)? {
+            if index > self.limit {
+                return ready_awaitable_exception(py, limit_overrun_error(py, index, true)?);
+            }
             let size = index + separator.len();
             let data = consume_exact(py, buffer.as_ptr(), size)?;
-            maybe_resume_transport(&reader)?;
+            self.maybe_resume_transport(py, &reader)?;
             return ready_awaitable_result(py, data);
+        }
+
+        let offset = next_readuntil_offset(bytearray_len(buffer.as_ptr())?, separator.len());
+        if offset > self.limit {
+            return ready_awaitable_exception(py, limit_overrun_error(py, offset, false)?);
         }
 
         if reader.getattr("_eof")?.is_truthy()? {
@@ -1745,12 +1841,7 @@ impl StreamCore {
             ));
         }
 
-        if reader.getattr("_paused")?.is_truthy()? {
-            reader.setattr("_paused", false)?;
-            reader
-                .getattr("_transport")?
-                .call_method0("resume_reading")?;
-        }
+        self.resume_reader_if_paused(py, &reader)?;
 
         let scheduler = self
             .loop_obj
@@ -1761,7 +1852,10 @@ impl StreamCore {
         let waiter = StreamWaiter::new(py, scheduler, self.loop_obj.clone_ref(py))?;
         reader.setattr("_waiter", waiter.bind(py))?;
         self.pending_read = Some(PendingRead {
-            kind: PendingReadKind::Until(separator.to_vec()),
+            kind: PendingReadKind::Until {
+                separator: separator.to_vec(),
+                offset,
+            },
             waiter: waiter.clone_ref(py),
         });
         Ok(waiter.into_any())
@@ -1785,7 +1879,12 @@ impl StreamCore {
             .call_method0("create_future")?
             .unbind();
         self.pending_drains.push(future.clone_ref(py));
-        record_stream_profile_event("drain_wait", self.fd, self.pending_write_bytes, self.pending_drains.len());
+        record_stream_profile_event(
+            "drain_wait",
+            self.fd,
+            self.pending_write_bytes,
+            self.pending_drains.len(),
+        );
         Ok(future)
     }
 
@@ -1808,13 +1907,15 @@ impl StreamCore {
             Until {
                 found_index: Option<usize>,
                 separator_len: usize,
+                next_offset: usize,
             },
         }
         let state = match &pending.kind {
             PendingReadKind::Exact(size) => PendingReadState::Exact(*size),
-            PendingReadKind::Until(separator) => PendingReadState::Until {
-                found_index: find_subsequence_in_bytearray(buffer.as_ptr(), separator)?,
+            PendingReadKind::Until { separator, offset } => PendingReadState::Until {
+                found_index: find_subsequence_in_bytearray(buffer.as_ptr(), separator, *offset)?,
                 separator_len: separator.len(),
+                next_offset: next_readuntil_offset(buffered, separator.len()),
             },
         };
         match state {
@@ -1829,44 +1930,72 @@ impl StreamCore {
                 }
                 let data = consume_exact(py, buffer.as_ptr(), size)?;
                 reader.setattr("_waiter", py.None())?;
-                self.queue_completion(py, StreamCompletion::ReadResult {
-                    reader: reader.clone().unbind(),
-                    waiter: pending.waiter,
-                    payload: data,
-                    resume_transport: true,
-                })?;
+                self.queue_completion(
+                    py,
+                    StreamCompletion::ReadResult {
+                        reader: reader.clone().unbind(),
+                        waiter: pending.waiter,
+                        payload: data,
+                        resume_transport: true,
+                    },
+                )?;
                 record_stream_profile_event("read_wait_done", self.fd, size, buffered);
                 Ok(true)
             }
             PendingReadState::Until {
                 found_index,
                 separator_len,
+                next_offset,
             } => {
                 if let Some(index) = found_index {
                     let pending = self.pending_read.take().expect("pending read present");
+                    if index > self.limit {
+                        let exc = limit_overrun_error(py, index, true)?;
+                        reader.setattr("_waiter", py.None())?;
+                        self.queue_completion(
+                            py,
+                            StreamCompletion::ReadException {
+                                reader: reader.clone().unbind(),
+                                waiter: pending.waiter,
+                                exception: exc,
+                            },
+                        )?;
+                        return Ok(true);
+                    }
                     let size = index + separator_len;
                     let data = consume_exact(py, buffer.as_ptr(), size)?;
                     reader.setattr("_waiter", py.None())?;
-                    self.queue_completion(py, StreamCompletion::ReadResult {
-                        reader: reader.clone().unbind(),
-                        waiter: pending.waiter,
-                        payload: data,
-                        resume_transport: true,
-                    })?;
+                    self.queue_completion(
+                        py,
+                        StreamCompletion::ReadResult {
+                            reader: reader.clone().unbind(),
+                            waiter: pending.waiter,
+                            payload: data,
+                            resume_transport: true,
+                        },
+                    )?;
                     record_stream_profile_event("read_wait_done", self.fd, size, buffered);
                     return Ok(true);
                 }
-                if buffered <= self.limit {
+                if next_offset <= self.limit {
+                    if let Some(pending) = self.pending_read.as_mut() {
+                        if let PendingReadKind::Until { offset, .. } = &mut pending.kind {
+                            *offset = next_offset;
+                        }
+                    }
                     return Ok(false);
                 }
                 let pending = self.pending_read.take().expect("pending read present");
-                let exc = limit_overrun_error(py, buffered)?;
+                let exc = limit_overrun_error(py, next_offset, false)?;
                 reader.setattr("_waiter", py.None())?;
-                self.queue_completion(py, StreamCompletion::ReadException {
-                    reader: reader.clone().unbind(),
-                    waiter: pending.waiter,
-                    exception: exc,
-                })?;
+                self.queue_completion(
+                    py,
+                    StreamCompletion::ReadException {
+                        reader: reader.clone().unbind(),
+                        waiter: pending.waiter,
+                        exception: exc,
+                    },
+                )?;
                 Ok(true)
             }
         }
@@ -1890,31 +2019,74 @@ impl StreamCore {
         )?;
         let exc = match pending.kind {
             PendingReadKind::Exact(size) => incomplete_read_error(py, partial, Some(size))?,
-            PendingReadKind::Until(_) => incomplete_read_error(py, partial, None)?,
+            PendingReadKind::Until { .. } => incomplete_read_error(py, partial, None)?,
         };
         _reader.setattr("_waiter", py.None())?;
-        self.queue_completion(py, StreamCompletion::ReadException {
-            reader: _reader.clone().unbind(),
-            waiter: pending.waiter,
-            exception: exc,
-        })?;
+        self.queue_completion(
+            py,
+            StreamCompletion::ReadException {
+                reader: _reader.clone().unbind(),
+                waiter: pending.waiter,
+                exception: exc,
+            },
+        )?;
         Ok(())
+    }
+
+    fn resume_reader_if_paused(
+        &mut self,
+        py: Python<'_>,
+        reader: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if !reader.getattr("_paused")?.is_truthy()? {
+            return Ok(());
+        }
+
+        reader.setattr("_paused", false)?;
+        if !self.read_paused || self.closed || self.closing {
+            return Ok(());
+        }
+        if trace_stream_enabled() {
+            eprintln!("stream-transport resume_reading fd={}", self.fd);
+        }
+        self.read_paused = false;
+        self.sync_interest(py)
+    }
+
+    fn maybe_resume_transport(
+        &mut self,
+        py: Python<'_>,
+        reader: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if !reader.getattr("_paused")?.is_truthy()? {
+            return Ok(());
+        }
+        let buffer = reader.getattr("_buffer")?.cast_into::<PyByteArray>()?;
+        if bytearray_len(buffer.as_ptr())? > self.limit {
+            return Ok(());
+        }
+        self.resume_reader_if_paused(py, reader)
     }
 
     fn queue_completion(&self, py: Python<'_>, completion: StreamCompletion) -> PyResult<()> {
-        self.registry
-            .bind(py)
-            .borrow()
-            .queue_completion(completion);
+        self.registry.bind(py).borrow().queue_completion(completion);
         Ok(())
     }
 
-    fn queue_pending_drains(&mut self, py: Python<'_>, exception: Option<Py<PyAny>>) -> PyResult<()> {
+    fn queue_pending_drains(
+        &mut self,
+        py: Python<'_>,
+        exception: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
         if self.pending_drains.is_empty() {
             return Ok(());
         }
         record_stream_profile_event(
-            if exception.is_some() { "drain_fail" } else { "drain_ready" },
+            if exception.is_some() {
+                "drain_fail"
+            } else {
+                "drain_ready"
+            },
             self.fd,
             self.pending_write_bytes,
             self.pending_drains.len(),
@@ -2380,6 +2552,7 @@ fn try_consume_exact(bytearray: *mut ffi::PyObject, size: usize) -> PyResult<boo
 fn find_subsequence_in_bytearray(
     bytearray: *mut ffi::PyObject,
     needle: &[u8],
+    offset: usize,
 ) -> PyResult<Option<usize>> {
     unsafe {
         let len = ffi::PyByteArray_Size(bytearray);
@@ -2390,7 +2563,8 @@ fn find_subsequence_in_bytearray(
             return Ok(Some(0));
         }
         let len = len as usize;
-        if needle.len() > len {
+        let offset = offset.min(len);
+        if needle.len() > len.saturating_sub(offset) {
             return Ok(None);
         }
         let src = ffi::PyByteArray_AsString(bytearray) as *const u8;
@@ -2398,9 +2572,7 @@ fn find_subsequence_in_bytearray(
             return Err(PyErr::fetch(Python::assume_attached()));
         }
         let haystack = std::slice::from_raw_parts(src, len);
-        Ok(haystack
-            .windows(needle.len())
-            .position(|window| window == needle))
+        Ok(memmem::find(&haystack[offset..], needle).map(|index| index + offset))
     }
 }
 
@@ -2538,7 +2710,15 @@ fn incomplete_read_error(
     Ok(cls.bind(py).call1((partial.bind(py), expected))?.unbind())
 }
 
-fn limit_overrun_error(py: Python<'_>, consumed: usize) -> PyResult<Py<PyAny>> {
+fn next_readuntil_offset(buffered: usize, separator_len: usize) -> usize {
+    buffered.saturating_add(1).saturating_sub(separator_len)
+}
+
+fn limit_overrun_error(
+    py: Python<'_>,
+    consumed: usize,
+    separator_found: bool,
+) -> PyResult<Py<PyAny>> {
     static LIMIT_OVERRUN_ERROR: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
     let cls = LIMIT_OVERRUN_ERROR.get_or_try_init(py, || -> PyResult<_> {
         Ok(py
@@ -2546,10 +2726,12 @@ fn limit_overrun_error(py: Python<'_>, consumed: usize) -> PyResult<Py<PyAny>> {
             .getattr("LimitOverrunError")?
             .unbind())
     })?;
-    Ok(cls
-        .bind(py)
-        .call1(("Separator is not found, and chunk exceed the limit", consumed))?
-        .unbind())
+    let message = if separator_found {
+        "Separator is found, but chunk is longer than limit"
+    } else {
+        "Separator is not found, and chunk exceed the limit"
+    };
+    Ok(cls.bind(py).call1((message, consumed))?.unbind())
 }
 
 fn current_exception(reader: &Bound<'_, PyAny>) -> PyResult<Option<Py<PyAny>>> {
@@ -2581,13 +2763,6 @@ fn clear_waiter(reader: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<()> {
     reader.setattr("_waiter", py.None())
 }
 
-fn maybe_resume_transport(reader: &Bound<'_, PyAny>) -> PyResult<()> {
-    if reader.getattr("_paused")?.is_truthy()? {
-        reader.call_method0("_maybe_resume_transport")?;
-    }
-    Ok(())
-}
-
 fn copy_context_obj(py: Python<'_>) -> PyResult<Py<PyAny>> {
     static COPY_CONTEXT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
     let copy_context = COPY_CONTEXT.get_or_try_init(py, || -> PyResult<_> {
@@ -2605,7 +2780,12 @@ fn invalid_state_error(py: Python<'_>, message: &str) -> PyResult<PyErr> {
             .unbind())
     })?;
     Ok(PyErr::from_value(
-        cls.bind(py).call1((message,))?.into_any().unbind().into_bound(py).into_any(),
+        cls.bind(py)
+            .call1((message,))?
+            .into_any()
+            .unbind()
+            .into_bound(py)
+            .into_any(),
     ))
 }
 

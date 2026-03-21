@@ -272,6 +272,86 @@ class RsloopLoopTests(unittest.TestCase):
 
         self.run_async(main())
 
+    def test_native_readuntil_limit_overrun_found(self) -> None:
+        async def main() -> None:
+            release = asyncio.get_running_loop().create_future()
+
+            async def handle(
+                _reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+            ) -> None:
+                try:
+                    writer.write((b"x" * 32) + b"\n")
+                    await writer.drain()
+                    await release
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+
+            server = await asyncio.start_server(handle, "127.0.0.1", 0)
+            host, port = server.sockets[0].getsockname()[:2]
+
+            try:
+                reader, writer = await asyncio.open_connection(host, port, limit=16)
+                try:
+                    with self.assertRaises(asyncio.LimitOverrunError) as ctx:
+                        await reader.readuntil(b"\n")
+                    self.assertEqual(ctx.exception.consumed, 32)
+                    self.assertEqual(bytes(reader._buffer), (b"x" * 32) + b"\n")
+                    self.assertEqual(
+                        await reader.readexactly(33),
+                        (b"x" * 32) + b"\n",
+                    )
+                finally:
+                    if not release.done():
+                        release.set_result(None)
+                    writer.close()
+                    await writer.wait_closed()
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        self.run_async(main())
+
+    def test_native_readuntil_limit_overrun_unfound(self) -> None:
+        async def main() -> None:
+            release = asyncio.get_running_loop().create_future()
+
+            async def handle(
+                _reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+            ) -> None:
+                try:
+                    writer.write(b"x" * 40)
+                    await writer.drain()
+                    await release
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+
+            server = await asyncio.start_server(handle, "127.0.0.1", 0)
+            host, port = server.sockets[0].getsockname()[:2]
+
+            try:
+                reader, writer = await asyncio.open_connection(host, port, limit=16)
+                try:
+                    while len(reader._buffer) < 40:
+                        await asyncio.sleep(0)
+
+                    with self.assertRaises(asyncio.LimitOverrunError) as ctx:
+                        await reader.readuntil(b"\r\n\r\n")
+                    self.assertEqual(ctx.exception.consumed, 37)
+                    self.assertEqual(bytes(reader._buffer), b"x" * 40)
+                    self.assertEqual(await reader.readexactly(40), b"x" * 40)
+                finally:
+                    if not release.done():
+                        release.set_result(None)
+                    writer.close()
+                    await writer.wait_closed()
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        self.run_async(main())
+
     def test_stream_sendfile_static(self) -> None:
         payload = (b"0123456789abcdef" * 4096) + b"tail"
         offset = 1024
