@@ -51,8 +51,13 @@ struct StreamProfileState {
 }
 
 struct PendingRead {
-    size: usize,
+    kind: PendingReadKind,
     waiter: Py<StreamWaiter>,
+}
+
+enum PendingReadKind {
+    Exact(usize),
+    Until(Vec<u8>),
 }
 
 pub(crate) enum StreamCompletion {
@@ -118,6 +123,7 @@ pub(crate) struct StreamCore {
     extra: Py<PyAny>,
     reader: Option<Py<PyAny>>,
     reader_readexactly: Option<Py<PyAny>>,
+    reader_readuntil: Option<Py<PyAny>>,
     close_waiter: Option<Py<PyAny>>,
     drain_fallback: Option<Py<PyAny>>,
     ready_drain: Option<Py<PyAny>>,
@@ -441,7 +447,7 @@ impl StreamTransport {
             protocol.hasattr("get_buffer")? && protocol.hasattr("buffer_updated")?
         };
         let fd = sock.bind(py).call_method0("fileno")?.extract::<i32>()? as RawFd;
-        let (buffer, reader_readexactly, close_waiter, limit) =
+        let (buffer, reader_readexactly, reader_readuntil, close_waiter, limit) =
             if let Some(reader_ref) = reader.as_ref() {
                 let reader_ref = reader_ref.bind(py);
                 let buffer = reader_ref
@@ -449,11 +455,18 @@ impl StreamTransport {
                     .cast_into::<PyByteArray>()?
                     .unbind();
                 let reader_readexactly = reader_ref.getattr("readexactly")?.unbind();
+                let reader_readuntil = reader_ref.getattr("readuntil")?.unbind();
                 let close_waiter = protocol.bind(py).getattr("_closed").ok().map(Bound::unbind);
                 let limit = reader_ref.getattr("_limit")?.extract()?;
-                (Some(buffer), Some(reader_readexactly), close_waiter, limit)
+                (
+                    Some(buffer),
+                    Some(reader_readexactly),
+                    Some(reader_readuntil),
+                    close_waiter,
+                    limit,
+                )
             } else {
-                (None, None, None, 64 * 1024)
+                (None, None, None, None, 64 * 1024)
             };
         let core = Rc::new(RefCell::new(StreamCore {
                 stream_token: STREAM_TOKEN.fetch_add(1, Ordering::Relaxed),
@@ -468,6 +481,7 @@ impl StreamTransport {
                 extra,
                 reader,
                 reader_readexactly,
+                reader_readuntil,
                 close_waiter,
                 drain_fallback: None,
                 ready_drain: None,
@@ -511,6 +525,10 @@ impl StreamTransport {
 
     fn bind_readexactly(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
         create_bound_readexactly(slf.py(), slf.as_any().as_unbound())
+    }
+
+    fn bind_readuntil(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        create_bound_readuntil(slf.py(), slf.as_any().as_unbound())
     }
 
     fn bind_write(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
@@ -1536,9 +1554,12 @@ impl StreamCore {
         &mut self,
         py: Python<'_>,
         reader: &Bound<'_, PyAny>,
-        size: usize,
+        chunk_size: usize,
     ) -> PyResult<bool> {
         let Some(pending) = self.pending_read.as_ref() else {
+            return Ok(false);
+        };
+        let PendingReadKind::Exact(size) = &pending.kind else {
             return Ok(false);
         };
         let buffer = self
@@ -1547,16 +1568,19 @@ impl StreamCore {
             .expect("stream transport buffer")
             .bind(py);
         let buffered = bytearray_len(buffer.as_ptr())?;
-        if buffered + size < pending.size {
+        if buffered + chunk_size < *size {
             return Ok(false);
         }
 
         let pending = self.pending_read.take().expect("pending read present");
-        let needed_from_chunk = pending.size.saturating_sub(buffered);
+        let PendingReadKind::Exact(size) = pending.kind else {
+            unreachable!("checked above");
+        };
+        let needed_from_chunk = size.saturating_sub(buffered);
         if trace_stream_enabled() {
             eprintln!(
                 "stream-transport finish chunk fd={} needed={} chunk={}",
-                self.fd, needed_from_chunk, size
+                self.fd, needed_from_chunk, chunk_size
             );
         }
         let payload = if buffered == 0 && needed_from_chunk == size {
@@ -1567,7 +1591,7 @@ impl StreamCore {
                 buffer.as_ptr(),
                 buffered,
                 &self.read_buffer[..needed_from_chunk],
-                pending.size,
+                size,
             )?
         };
         reader.setattr("_waiter", py.None())?;
@@ -1577,10 +1601,13 @@ impl StreamCore {
             payload,
             resume_transport: true,
         })?;
-        record_stream_profile_event("read_wait_done", self.fd, pending.size, buffered);
+        record_stream_profile_event("read_wait_done", self.fd, size, buffered);
 
-        if needed_from_chunk != size || buffered != 0 {
-            replace_bytearray(buffer.as_ptr(), &self.read_buffer[needed_from_chunk..size])?;
+        if needed_from_chunk != chunk_size || buffered != 0 {
+            replace_bytearray(
+                buffer.as_ptr(),
+                &self.read_buffer[needed_from_chunk..chunk_size],
+            )?;
         }
         maybe_resume_transport(reader)?;
         Ok(true)
@@ -1631,7 +1658,7 @@ impl StreamCore {
 
         if reader.getattr("_eof")?.is_truthy()? {
             let partial = consume_all(py, buffer.as_ptr())?;
-            return ready_awaitable_exception(py, incomplete_read_error(py, partial, size)?);
+            return ready_awaitable_exception(py, incomplete_read_error(py, partial, Some(size))?);
         }
 
         if self.pending_read.is_some() {
@@ -1656,7 +1683,85 @@ impl StreamCore {
         let waiter = StreamWaiter::new(py, scheduler, self.loop_obj.clone_ref(py))?;
         reader.setattr("_waiter", waiter.bind(py))?;
         self.pending_read = Some(PendingRead {
-            size,
+            kind: PendingReadKind::Exact(size),
+            waiter: waiter.clone_ref(py),
+        });
+        Ok(waiter.into_any())
+    }
+
+    fn readuntil_inner(
+        &mut self,
+        py: Python<'_>,
+        separator: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let Some(reader_obj) = self.reader.as_ref().map(|reader| reader.clone_ref(py)) else {
+            return Err(PyRuntimeError::new_err(
+                "stream transport has no StreamReader attached",
+            ));
+        };
+        let reader = reader_obj.bind(py);
+        if let Some(exc) = current_exception(&reader)? {
+            return ready_awaitable_exception(py, exc);
+        }
+
+        let separator = match separator.cast::<PyBytes>() {
+            Ok(separator) => separator.clone().unbind(),
+            Err(_) => {
+                let Some(reader_readuntil) = self.reader_readuntil.as_ref() else {
+                    return Err(PyRuntimeError::new_err(
+                        "stream transport has no StreamReader.readuntil fallback",
+                    ));
+                };
+                return Ok(reader_readuntil.bind(py).call1((separator,))?.unbind());
+            }
+        };
+        let separator = separator.bind(py).as_bytes();
+        if separator.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Separator should be at least one-byte string",
+            ));
+        }
+
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("stream transport buffer")
+            .bind(py);
+        if let Some(index) = find_subsequence_in_bytearray(buffer.as_ptr(), separator)? {
+            let size = index + separator.len();
+            let data = consume_exact(py, buffer.as_ptr(), size)?;
+            maybe_resume_transport(&reader)?;
+            return ready_awaitable_result(py, data);
+        }
+
+        if reader.getattr("_eof")?.is_truthy()? {
+            let partial = consume_all(py, buffer.as_ptr())?;
+            return ready_awaitable_exception(py, incomplete_read_error(py, partial, None)?);
+        }
+
+        if self.pending_read.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "readuntil() called while another coroutine is already waiting for incoming data",
+            ));
+        }
+
+        if reader.getattr("_paused")?.is_truthy()? {
+            reader.setattr("_paused", false)?;
+            reader
+                .getattr("_transport")?
+                .call_method0("resume_reading")?;
+        }
+
+        let scheduler = self
+            .loop_obj
+            .bind(py)
+            .getattr("_scheduler")?
+            .cast_into::<Scheduler>()?
+            .unbind();
+        let waiter = StreamWaiter::new(py, scheduler, self.loop_obj.clone_ref(py))?;
+        reader.setattr("_waiter", waiter.bind(py))?;
+        self.pending_read = Some(PendingRead {
+            kind: PendingReadKind::Until(separator.to_vec()),
             waiter: waiter.clone_ref(py),
         });
         Ok(waiter.into_any())
@@ -1692,42 +1797,79 @@ impl StreamCore {
         let Some(pending) = self.pending_read.as_ref() else {
             return Ok(false);
         };
-        let buffered = bytearray_len(
-            self.buffer
-                .as_ref()
-                .expect("stream transport buffer")
-                .bind(py)
-                .as_ptr(),
-        )?;
-        if buffered < pending.size {
-            return Ok(false);
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("stream transport buffer")
+            .bind(py);
+        let buffered = bytearray_len(buffer.as_ptr())?;
+        enum PendingReadState {
+            Exact(usize),
+            Until {
+                found_index: Option<usize>,
+                separator_len: usize,
+            },
         }
+        let state = match &pending.kind {
+            PendingReadKind::Exact(size) => PendingReadState::Exact(*size),
+            PendingReadKind::Until(separator) => PendingReadState::Until {
+                found_index: find_subsequence_in_bytearray(buffer.as_ptr(), separator)?,
+                separator_len: separator.len(),
+            },
+        };
+        match state {
+            PendingReadState::Exact(size) => {
+                if buffered < size {
+                    return Ok(false);
+                }
 
-        let pending = self.pending_read.take().expect("pending read present");
-        if trace_stream_enabled() {
-            eprintln!(
-                "stream-transport finish exact fd={} size={}",
-                self.fd, pending.size
-            );
+                let pending = self.pending_read.take().expect("pending read present");
+                if trace_stream_enabled() {
+                    eprintln!("stream-transport finish exact fd={} size={}", self.fd, size);
+                }
+                let data = consume_exact(py, buffer.as_ptr(), size)?;
+                reader.setattr("_waiter", py.None())?;
+                self.queue_completion(py, StreamCompletion::ReadResult {
+                    reader: reader.clone().unbind(),
+                    waiter: pending.waiter,
+                    payload: data,
+                    resume_transport: true,
+                })?;
+                record_stream_profile_event("read_wait_done", self.fd, size, buffered);
+                Ok(true)
+            }
+            PendingReadState::Until {
+                found_index,
+                separator_len,
+            } => {
+                if let Some(index) = found_index {
+                    let pending = self.pending_read.take().expect("pending read present");
+                    let size = index + separator_len;
+                    let data = consume_exact(py, buffer.as_ptr(), size)?;
+                    reader.setattr("_waiter", py.None())?;
+                    self.queue_completion(py, StreamCompletion::ReadResult {
+                        reader: reader.clone().unbind(),
+                        waiter: pending.waiter,
+                        payload: data,
+                        resume_transport: true,
+                    })?;
+                    record_stream_profile_event("read_wait_done", self.fd, size, buffered);
+                    return Ok(true);
+                }
+                if buffered <= self.limit {
+                    return Ok(false);
+                }
+                let pending = self.pending_read.take().expect("pending read present");
+                let exc = limit_overrun_error(py, buffered)?;
+                reader.setattr("_waiter", py.None())?;
+                self.queue_completion(py, StreamCompletion::ReadException {
+                    reader: reader.clone().unbind(),
+                    waiter: pending.waiter,
+                    exception: exc,
+                })?;
+                Ok(true)
+            }
         }
-        let data = consume_exact(
-            py,
-            self.buffer
-                .as_ref()
-                .expect("stream transport buffer")
-                .bind(py)
-                .as_ptr(),
-            pending.size,
-        )?;
-        reader.setattr("_waiter", py.None())?;
-        self.queue_completion(py, StreamCompletion::ReadResult {
-            reader: reader.clone().unbind(),
-            waiter: pending.waiter,
-            payload: data,
-            resume_transport: true,
-        })?;
-        record_stream_profile_event("read_wait_done", self.fd, pending.size, buffered);
-        Ok(true)
     }
 
     fn fail_pending_read_eof(
@@ -1746,7 +1888,10 @@ impl StreamCore {
                 .bind(py)
                 .as_ptr(),
         )?;
-        let exc = incomplete_read_error(py, partial, pending.size)?;
+        let exc = match pending.kind {
+            PendingReadKind::Exact(size) => incomplete_read_error(py, partial, Some(size))?,
+            PendingReadKind::Until(_) => incomplete_read_error(py, partial, None)?,
+        };
         _reader.setattr("_waiter", py.None())?;
         self.queue_completion(py, StreamCompletion::ReadException {
             reader: _reader.clone().unbind(),
@@ -1888,6 +2033,15 @@ static READEXACTLY_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
     ml_doc: c"Native exact-read fast path backed by the Rsloop stream transport.".as_ptr(),
 });
 
+static READUNTIL_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
+    ml_name: c"readuntil".as_ptr(),
+    ml_meth: ffi::PyMethodDefPointer {
+        PyCFunction: stream_transport_readuntil_c,
+    },
+    ml_flags: ffi::METH_O,
+    ml_doc: c"Native readuntil fast path backed by the Rsloop stream transport.".as_ptr(),
+});
+
 static DRAIN_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
     ml_name: c"drain".as_ptr(),
     ml_meth: ffi::PyMethodDefPointer {
@@ -1928,6 +2082,17 @@ fn create_bound_readexactly(py: Python<'_>, slf: &Py<PyAny>) -> PyResult<Py<PyAn
     unsafe {
         let func = ffi::PyCFunction_NewEx(
             &READEXACTLY_DEF.0 as *const ffi::PyMethodDef as *mut ffi::PyMethodDef,
+            slf.as_ptr(),
+            std::ptr::null_mut(),
+        );
+        Ok(Bound::<PyAny>::from_owned_ptr_or_err(py, func)?.unbind())
+    }
+}
+
+fn create_bound_readuntil(py: Python<'_>, slf: &Py<PyAny>) -> PyResult<Py<PyAny>> {
+    unsafe {
+        let func = ffi::PyCFunction_NewEx(
+            &READUNTIL_DEF.0 as *const ffi::PyMethodDef as *mut ffi::PyMethodDef,
             slf.as_ptr(),
             std::ptr::null_mut(),
         );
@@ -1994,6 +2159,28 @@ unsafe extern "C" fn stream_transport_readexactly_c(
             ));
         }
         let result = core.borrow_mut().readexactly_inner(py, size as usize);
+        result
+    })();
+
+    match result {
+        Ok(obj) => obj.into_ptr(),
+        Err(err) => {
+            err.restore(py);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+unsafe extern "C" fn stream_transport_readuntil_c(
+    slf: *mut ffi::PyObject,
+    arg: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    let py = Python::assume_attached();
+    let result = (|| -> PyResult<Py<PyAny>> {
+        let transport = Bound::from_borrowed_ptr(py, slf).cast_into_unchecked::<StreamTransport>();
+        let core = transport.borrow().core.clone();
+        let separator = Bound::<PyAny>::from_borrowed_ptr(py, arg);
+        let result = core.borrow_mut().readuntil_inner(py, &separator);
         result
     })();
 
@@ -2190,6 +2377,33 @@ fn try_consume_exact(bytearray: *mut ffi::PyObject, size: usize) -> PyResult<boo
     Ok(len >= size as isize)
 }
 
+fn find_subsequence_in_bytearray(
+    bytearray: *mut ffi::PyObject,
+    needle: &[u8],
+) -> PyResult<Option<usize>> {
+    unsafe {
+        let len = ffi::PyByteArray_Size(bytearray);
+        if len < 0 {
+            return Err(PyErr::fetch(Python::assume_attached()));
+        }
+        if needle.is_empty() {
+            return Ok(Some(0));
+        }
+        let len = len as usize;
+        if needle.len() > len {
+            return Ok(None);
+        }
+        let src = ffi::PyByteArray_AsString(bytearray) as *const u8;
+        if src.is_null() {
+            return Err(PyErr::fetch(Python::assume_attached()));
+        }
+        let haystack = std::slice::from_raw_parts(src, len);
+        Ok(haystack
+            .windows(needle.len())
+            .position(|window| window == needle))
+    }
+}
+
 fn consume_exact(
     py: Python<'_>,
     bytearray: *mut ffi::PyObject,
@@ -2312,7 +2526,7 @@ fn ready_awaitable_exception(py: Python<'_>, exc: Py<PyAny>) -> PyResult<Py<PyAn
 fn incomplete_read_error(
     py: Python<'_>,
     partial: Py<PyAny>,
-    expected: usize,
+    expected: Option<usize>,
 ) -> PyResult<Py<PyAny>> {
     static INCOMPLETE_READ_ERROR: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
     let cls = INCOMPLETE_READ_ERROR.get_or_try_init(py, || -> PyResult<_> {
@@ -2322,6 +2536,20 @@ fn incomplete_read_error(
             .unbind())
     })?;
     Ok(cls.bind(py).call1((partial.bind(py), expected))?.unbind())
+}
+
+fn limit_overrun_error(py: Python<'_>, consumed: usize) -> PyResult<Py<PyAny>> {
+    static LIMIT_OVERRUN_ERROR: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    let cls = LIMIT_OVERRUN_ERROR.get_or_try_init(py, || -> PyResult<_> {
+        Ok(py
+            .import("asyncio.exceptions")?
+            .getattr("LimitOverrunError")?
+            .unbind())
+    })?;
+    Ok(cls
+        .bind(py)
+        .call1(("Separator is not found, and chunk exceed the limit", consumed))?
+        .unbind())
 }
 
 fn current_exception(reader: &Bound<'_, PyAny>) -> PyResult<Option<Py<PyAny>>> {

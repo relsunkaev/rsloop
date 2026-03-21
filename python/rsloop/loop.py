@@ -35,6 +35,7 @@ from . import _rsloop
 logger = _selector_events.logger
 _ORIGINAL_STREAMWRITER = _streams.StreamWriter
 _ORIGINAL_STREAMREADER_READEXACTLY = _streams.StreamReader.readexactly
+_ORIGINAL_STREAMREADER_READUNTIL = _streams.StreamReader.readuntil
 _TIMER_QUANTUM = 0.001 if sys.platform == "darwin" else 0.0
 _TIMER_IMMEDIATE_CUTOFF = _TIMER_QUANTUM * 0.75
 
@@ -157,6 +158,10 @@ class RsloopStreamWriter:
         if self._reader is not None:
             self._reader._transport = new_transport
             self._reader.readexactly = _ORIGINAL_STREAMREADER_READEXACTLY.__get__(
+                self._reader,
+                type(self._reader),
+            )
+            self._reader.readuntil = _ORIGINAL_STREAMREADER_READUNTIL.__get__(
                 self._reader,
                 type(self._reader),
             )
@@ -1309,6 +1314,9 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
                 bind_readexactly = getattr(transport, "bind_readexactly", None)
                 if bind_readexactly is not None:
                     reader.readexactly = bind_readexactly()
+                bind_readuntil = getattr(transport, "bind_readuntil", None)
+                if bind_readuntil is not None:
+                    reader.readuntil = bind_readuntil()
             protocol.connection_made(transport)
             stream_writer = getattr(protocol, "_stream_writer", None)
             if stream_writer is not None and not isinstance(
