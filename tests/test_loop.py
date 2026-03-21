@@ -4,6 +4,8 @@ import asyncio
 import socket
 import threading
 import unittest
+import tempfile
+from pathlib import Path
 
 import rsloop
 
@@ -229,6 +231,61 @@ class RsloopLoopTests(unittest.TestCase):
             finally:
                 server.close()
                 await server.wait_closed()
+
+        self.run_async(main())
+
+    def test_stream_sendfile_static(self) -> None:
+        payload = (b"0123456789abcdef" * 4096) + b"tail"
+        offset = 1024
+        count = 32 * 1024
+        expected = payload[offset : offset + count]
+
+        async def roundtrip(use_loop_sendfile: bool) -> None:
+            with tempfile.TemporaryDirectory(prefix="rsloop-sendfile-") as tmpdir:
+                path = Path(tmpdir) / "payload.bin"
+                path.write_bytes(payload)
+                loop = asyncio.get_running_loop()
+
+                async def handle(
+                    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+                ) -> None:
+                    try:
+                        with path.open("rb") as file:
+                            if use_loop_sendfile:
+                                sent = await loop.sendfile(
+                                    writer.transport,
+                                    file,
+                                    offset=offset,
+                                    count=count,
+                                )
+                            else:
+                                sent = await writer.sendfile_static(
+                                    file,
+                                    offset=offset,
+                                    count=count,
+                                )
+                        self.assertEqual(sent, len(expected))
+                    finally:
+                        writer.close()
+                        await writer.wait_closed()
+
+                server = await asyncio.start_server(handle, "127.0.0.1", 0)
+                host, port = server.sockets[0].getsockname()[:2]
+
+                try:
+                    reader, writer = await asyncio.open_connection(host, port)
+                    try:
+                        self.assertEqual(await reader.readexactly(len(expected)), expected)
+                    finally:
+                        writer.close()
+                        await writer.wait_closed()
+                finally:
+                    server.close()
+                    await server.wait_closed()
+
+        async def main() -> None:
+            await roundtrip(use_loop_sendfile=False)
+            await roundtrip(use_loop_sendfile=True)
 
         self.run_async(main())
 

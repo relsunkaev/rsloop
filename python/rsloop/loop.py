@@ -14,7 +14,7 @@ from asyncio import events as _events
 from asyncio import selector_events as _selector_events
 from asyncio import sslproto as _sslproto
 from asyncio import streams as _streams
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,7 +28,17 @@ _TIMER_IMMEDIATE_CUTOFF = _TIMER_QUANTUM * 0.75
 
 
 class RsloopStreamWriter:
-    __slots__ = ("_transport", "_protocol", "_reader", "_loop", "write", "drain", "close", "wait_closed")
+    __slots__ = (
+        "_transport",
+        "_protocol",
+        "_reader",
+        "_loop",
+        "write",
+        "drain",
+        "close",
+        "wait_closed",
+        "sendfile_static",
+    )
 
     def __init__(self, transport: Any, protocol: Any, reader: Any, loop: asyncio.AbstractEventLoop) -> None:
         self._transport = transport
@@ -44,6 +54,7 @@ class RsloopStreamWriter:
         self.close = bind_close() if bind_close is not None else self._close
         bind_wait_closed = getattr(transport, "bind_wait_closed", None)
         self.wait_closed = bind_wait_closed() if bind_wait_closed is not None else self._wait_closed
+        self.sendfile_static = self._sendfile_static_fallback
 
     def __repr__(self) -> str:
         info = [self.__class__.__name__, f"transport={self._transport!r}"]
@@ -88,10 +99,58 @@ class RsloopStreamWriter:
             await asyncio.sleep(0)
         await self._protocol._drain_helper()
 
+    async def _sendfile_static_fallback(
+        self,
+        file: Any,
+        offset: int = 0,
+        count: int | None = None,
+    ) -> int:
+        return await _sendfile_static_impl(
+            self.write,
+            self.drain,
+            file,
+            offset=offset,
+            count=count,
+        )
+
 
 def _patch_stream_writer() -> None:
     if _streams.StreamWriter is not RsloopStreamWriter:
         _streams.StreamWriter = RsloopStreamWriter
+
+
+async def _sendfile_static_impl(
+    write: Callable[[bytes], None],
+    drain: Callable[[], Awaitable[None]],
+    file: Any,
+    offset: int = 0,
+    count: int | None = None,
+) -> int:
+    if offset:
+        await asyncio.to_thread(file.seek, offset)
+
+    total_sent = 0
+    remaining = count
+    block_size = 16 * 1024
+
+    while True:
+        if remaining is not None:
+            if remaining <= 0:
+                break
+            current = min(block_size, remaining)
+        else:
+            current = block_size
+        chunk = await asyncio.to_thread(file.read, current)
+        if not chunk:
+            break
+        write(chunk)
+        await drain()
+        sent = len(chunk)
+        total_sent += sent
+        if remaining is not None:
+            remaining -= sent
+
+    return total_sent
 
 
 @dataclass(slots=True)
@@ -890,18 +949,21 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
                     reader.readexactly = bind_readexactly()
             protocol.connection_made(transport)
             stream_writer = getattr(protocol, "_stream_writer", None)
-            bind_write = getattr(transport, "bind_write", None)
-            if stream_writer is not None and bind_write is not None:
-                stream_writer.write = bind_write()
-            bind_close = getattr(transport, "bind_close", None)
-            if stream_writer is not None and bind_close is not None:
-                stream_writer.close = bind_close()
-            bind_drain = getattr(transport, "bind_drain", None)
-            if stream_writer is not None and bind_drain is not None:
-                stream_writer.drain = bind_drain(stream_writer.drain)
-            bind_wait_closed = getattr(transport, "bind_wait_closed", None)
-            if stream_writer is not None and bind_wait_closed is not None:
-                stream_writer.wait_closed = bind_wait_closed()
+            if stream_writer is not None and not isinstance(
+                stream_writer, RsloopStreamWriter
+            ):
+                bind_write = getattr(transport, "bind_write", None)
+                if bind_write is not None:
+                    stream_writer.write = bind_write()
+                bind_close = getattr(transport, "bind_close", None)
+                if bind_close is not None:
+                    stream_writer.close = bind_close()
+                bind_drain = getattr(transport, "bind_drain", None)
+                if bind_drain is not None:
+                    stream_writer.drain = bind_drain(stream_writer.drain)
+                bind_wait_closed = getattr(transport, "bind_wait_closed", None)
+                if bind_wait_closed is not None:
+                    stream_writer.wait_closed = bind_wait_closed()
             activate = getattr(transport, "activate", None)
             if activate is not None:
                 activate()
@@ -1174,6 +1236,26 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
 
     async def sleep(self, delay: float) -> None:
         await _rsloop.sleep(delay)
+
+    async def sendfile(
+        self,
+        transport: Any,
+        file: Any,
+        offset: int = 0,
+        count: int | None = None,
+        *,
+        fallback: bool = True,
+    ) -> int:
+        sendfile_static = getattr(transport, "sendfile_static", None)
+        if sendfile_static is not None:
+            return await sendfile_static(file, offset=offset, count=count)
+        return await super().sendfile(
+            transport,
+            file,
+            offset=offset,
+            count=count,
+            fallback=fallback,
+        )
 
     def set_debug(self, enabled: bool) -> None:
         super().set_debug(enabled)

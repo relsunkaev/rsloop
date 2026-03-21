@@ -15,7 +15,7 @@ use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyStopIteration};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyAny, PyByteArray, PyBytes, PyDict};
+use pyo3::types::{PyAny, PyByteArray, PyBytes, PyDict, PyModule};
 
 use crate::handles::OneArgHandle;
 use crate::poller::TokioPoller;
@@ -507,6 +507,27 @@ impl StreamTransport {
 
     fn bind_wait_closed(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
         create_bound_wait_closed(slf.py(), slf.as_any().as_unbound())
+    }
+
+    fn drain(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let core = slf.borrow(py).core.clone();
+        let result = core.borrow_mut().drain_inner(py);
+        result
+    }
+
+    #[pyo3(signature = (file, offset=0, count=None))]
+    fn sendfile_static(
+        slf: Py<Self>,
+        py: Python<'_>,
+        file: Py<PyAny>,
+        offset: usize,
+        count: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        let helper = PyModule::import(py, "rsloop.loop")?.getattr("_sendfile_static_impl")?;
+        let transport = slf.bind(py);
+        let write = transport.getattr("write")?;
+        let drain = transport.getattr("drain")?;
+        Ok(helper.call1((write, drain, file, offset, count))?.unbind())
     }
 
     fn drain_fast(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
@@ -1089,7 +1110,9 @@ impl StreamCore {
             .bind(py)
             .borrow()
             .unregister_inner(self.fd);
-        self.disable_interest(py)?;
+        if self.reader_registered || self.writer_registered {
+            self.disable_interest(py)?;
+        }
         self.pending_write_bytes = 0;
         self.write_queue.clear();
         self.transports.bind(py).del_item(self.fd).ok();
