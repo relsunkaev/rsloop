@@ -5,15 +5,26 @@ import collections
 import errno
 import functools
 import math
+import os
 import selectors
+import signal
+import stat
 import socket
+import threading
 import sys
+import ssl
 from asyncio import base_events as _base_events
+from asyncio import base_subprocess as _base_subprocess
 from asyncio import constants as _constants
+from asyncio import coroutines as _coroutines
+from asyncio import exceptions as _exceptions
 from asyncio import events as _events
+from asyncio import futures as _futures
 from asyncio import selector_events as _selector_events
 from asyncio import sslproto as _sslproto
 from asyncio import streams as _streams
+from asyncio import tasks as _tasks
+from asyncio import unix_events as _unix_events
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +36,10 @@ logger = _selector_events.logger
 _ORIGINAL_STREAMWRITER = _streams.StreamWriter
 _TIMER_QUANTUM = 0.001 if sys.platform == "darwin" else 0.0
 _TIMER_IMMEDIATE_CUTOFF = _TIMER_QUANTUM * 0.75
+
+
+def _signal_noop(_sig: int, _frame: Any = None) -> None:
+    return None
 
 
 class RsloopStreamWriter:
@@ -112,6 +127,29 @@ class RsloopStreamWriter:
             offset=offset,
             count=count,
         )
+
+    async def start_tls(
+        self,
+        sslcontext: ssl.SSLContext,
+        *,
+        server_hostname: str | None = None,
+        ssl_handshake_timeout: float | None = None,
+        ssl_shutdown_timeout: float | None = None,
+    ) -> None:
+        server_side = self._protocol._client_connected_cb is not None
+        protocol = self._protocol
+        await self.drain()
+        new_transport = await self._loop.start_tls(
+            self._transport,
+            protocol,
+            sslcontext,
+            server_side=server_side,
+            server_hostname=server_hostname,
+            ssl_handshake_timeout=ssl_handshake_timeout,
+            ssl_shutdown_timeout=ssl_shutdown_timeout,
+        )
+        self._transport = new_transport
+        protocol._replace_transport(new_transport)
 
 
 def _patch_stream_writer() -> None:
@@ -416,6 +454,13 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         self._fd_registry = _rsloop.FdCallbackRegistry()
         self._stream_registry = _rsloop.StreamTransportRegistry()
         self._socket_registry = _rsloop.SocketStateRegistry()
+        self._signal_handlers: dict[int, _events.Handle] = {}
+        self._unix_server_sockets: dict[socket.socket, int] = {}
+        self._watcher = (
+            _unix_events._PidfdChildWatcher()
+            if hasattr(os, "pidfd_open") and _unix_events.can_use_pidfd()
+            else _unix_events._ThreadedChildWatcher()
+        )
         self._native_run_forever = getattr(self._scheduler, "run_forever_native", None)
         self._install_native_bindings()
         self._transports: dict[int, Any] = {}
@@ -501,7 +546,25 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         self._internal_fds -= 1
 
     def _process_self_data(self, _data: bytes) -> None:
-        return
+        for signum in _data:
+            if not signum:
+                continue
+            self._handle_signal(signum)
+
+    def _check_signal(self, sig: int) -> None:
+        if not isinstance(sig, int):
+            raise TypeError(f"sig must be an int, not {sig!r}")
+        if sig not in signal.valid_signals():
+            raise ValueError(f"invalid signal number {sig}")
+
+    def _handle_signal(self, sig: int) -> None:
+        handle = self._signal_handlers.get(sig)
+        if handle is None:
+            return
+        if handle._cancelled:
+            self.remove_signal_handler(sig)
+        else:
+            self._add_callback_signalsafe(handle)
 
     def _read_from_self(self) -> None:
         if self._ssock is None:
@@ -565,6 +628,54 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
     def remove_writer(self, fd: Any) -> bool:
         self._ensure_fd_no_transport(fd)
         return self._remove_writer(fd)
+
+    def add_signal_handler(self, sig: int, callback: Any, *args: Any) -> None:
+        if _coroutines.iscoroutine(callback) or _coroutines._iscoroutinefunction(callback):
+            raise TypeError("coroutines cannot be used with add_signal_handler()")
+        self._check_signal(sig)
+        self._check_closed()
+        try:
+            signal.set_wakeup_fd(self._csock.fileno() if self._csock is not None else -1)
+        except (ValueError, OSError) as exc:
+            raise RuntimeError(str(exc))
+
+        handle = _events.Handle(callback, args, self, None)
+        self._signal_handlers[sig] = handle
+        try:
+            signal.signal(sig, _signal_noop)
+            signal.siginterrupt(sig, False)
+        except OSError as exc:
+            del self._signal_handlers[sig]
+            if not self._signal_handlers:
+                try:
+                    signal.set_wakeup_fd(-1)
+                except (ValueError, OSError) as wake_exc:
+                    logger.info("set_wakeup_fd(-1) failed: %s", wake_exc)
+            if exc.errno == errno.EINVAL:
+                raise RuntimeError(f"sig {sig} cannot be caught") from None
+            raise
+
+    def remove_signal_handler(self, sig: int) -> bool:
+        self._check_signal(sig)
+        try:
+            del self._signal_handlers[sig]
+        except KeyError:
+            return False
+
+        handler = signal.default_int_handler if sig == signal.SIGINT else signal.SIG_DFL
+        try:
+            signal.signal(sig, handler)
+        except OSError as exc:
+            if exc.errno == errno.EINVAL:
+                raise RuntimeError(f"sig {sig} cannot be caught") from None
+            raise
+
+        if not self._signal_handlers:
+            try:
+                signal.set_wakeup_fd(-1)
+            except (ValueError, OSError) as exc:
+                logger.info("set_wakeup_fd(-1) failed: %s", exc)
+        return True
 
     def _add_writer(self, fd: Any, callback: Any, *args: Any) -> _events.Handle:
         self._check_closed()
@@ -913,6 +1024,246 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         finally:
             future = None
 
+    async def sock_recvfrom(self, sock: socket.socket, bufsize: int) -> tuple[bytes, Any]:
+        _base_events._check_ssl_socket(sock)
+        if self._debug and sock.gettimeout() != 0:
+            raise ValueError("the socket must be non-blocking")
+        try:
+            return sock.recvfrom(bufsize)
+        except (BlockingIOError, InterruptedError):
+            pass
+        future = self.create_future()
+        fd = sock.fileno()
+        self._ensure_fd_no_transport(fd)
+        handle = self._add_reader(fd, self._sock_recvfrom, future, sock, bufsize)
+        future.add_done_callback(
+            functools.partial(self._sock_read_done, fd, handle=handle)
+        )
+        return await future
+
+    async def sock_recvfrom_into(
+        self, sock: socket.socket, buf: Any, nbytes: int = 0
+    ) -> tuple[int, Any]:
+        _base_events._check_ssl_socket(sock)
+        if self._debug and sock.gettimeout() != 0:
+            raise ValueError("the socket must be non-blocking")
+        if not nbytes:
+            nbytes = len(buf)
+        try:
+            return sock.recvfrom_into(buf, nbytes)
+        except (BlockingIOError, InterruptedError):
+            pass
+        future = self.create_future()
+        fd = sock.fileno()
+        self._ensure_fd_no_transport(fd)
+        handle = self._add_reader(fd, self._sock_recvfrom_into, future, sock, buf, nbytes)
+        future.add_done_callback(
+            functools.partial(self._sock_read_done, fd, handle=handle)
+        )
+        return await future
+
+    async def sock_sendto(
+        self, sock: socket.socket, data: bytes | bytearray | memoryview, address: Any
+    ) -> int:
+        _base_events._check_ssl_socket(sock)
+        if self._debug and sock.gettimeout() != 0:
+            raise ValueError("the socket must be non-blocking")
+        try:
+            return sock.sendto(data, address)
+        except (BlockingIOError, InterruptedError):
+            pass
+        future = self.create_future()
+        fd = sock.fileno()
+        self._ensure_fd_no_transport(fd)
+        handle = self._add_writer(fd, self._sock_sendto, future, sock, data, address)
+        future.add_done_callback(
+            functools.partial(self._sock_write_done, fd, handle=handle)
+        )
+        return await future
+
+    def _sock_read_done(
+        self, fd: int, fut: asyncio.Future[Any], handle: _events.Handle | None = None
+    ) -> None:
+        if handle is None or not handle.cancelled():
+            self.remove_reader(fd)
+
+    def _sock_write_done(
+        self, fd: int, fut: asyncio.Future[Any], handle: _events.Handle | None = None
+    ) -> None:
+        if handle is None or not handle.cancelled():
+            self.remove_writer(fd)
+
+    def _sock_recvfrom(
+        self, fut: asyncio.Future[Any], sock: socket.socket, bufsize: int
+    ) -> None:
+        if fut.done():
+            return
+        try:
+            result = sock.recvfrom(bufsize)
+        except (BlockingIOError, InterruptedError):
+            return
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as exc:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(result)
+
+    def _sock_recvfrom_into(
+        self, fut: asyncio.Future[Any], sock: socket.socket, buf: Any, bufsize: int
+    ) -> None:
+        if fut.done():
+            return
+        try:
+            result = sock.recvfrom_into(buf, bufsize)
+        except (BlockingIOError, InterruptedError):
+            return
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as exc:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(result)
+
+    def _sock_sendto(
+        self,
+        fut: asyncio.Future[Any],
+        sock: socket.socket,
+        data: bytes | bytearray | memoryview,
+        address: Any,
+    ) -> None:
+        if fut.done():
+            return
+        try:
+            n = sock.sendto(data, address)
+        except (BlockingIOError, InterruptedError):
+            return
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as exc:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(n)
+
+    def _sock_add_cancellation_callback(self, fut: asyncio.Future[Any], sock: socket.socket) -> None:
+        def cb(done: asyncio.Future[Any]) -> None:
+            if done.cancelled():
+                fd = sock.fileno()
+                if fd != -1:
+                    self.remove_writer(fd)
+
+        fut.add_done_callback(cb)
+
+    def _sock_sendfile_update_filepos(self, fileno: int, offset: int, total_sent: int) -> None:
+        if total_sent > 0:
+            os.lseek(fileno, offset, os.SEEK_SET)
+
+    def _sock_sendfile_native_impl(
+        self,
+        fut: asyncio.Future[Any],
+        registered_fd: int | None,
+        sock: socket.socket,
+        fileno: int,
+        offset: int,
+        count: int | None,
+        blocksize: int,
+        total_sent: int,
+    ) -> None:
+        fd = sock.fileno()
+        if registered_fd is not None:
+            self.remove_writer(registered_fd)
+        if fut.cancelled():
+            self._sock_sendfile_update_filepos(fileno, offset, total_sent)
+            return
+        if count:
+            blocksize = count - total_sent
+            if blocksize <= 0:
+                self._sock_sendfile_update_filepos(fileno, offset, total_sent)
+                fut.set_result(total_sent)
+                return
+        blocksize = min(blocksize, sys.maxsize // 2 + 1)
+        try:
+            sent = os.sendfile(fd, fileno, offset, blocksize)
+        except (BlockingIOError, InterruptedError):
+            if registered_fd is None:
+                self._sock_add_cancellation_callback(fut, sock)
+            self.add_writer(
+                fd,
+                self._sock_sendfile_native_impl,
+                fut,
+                fd,
+                sock,
+                fileno,
+                offset,
+                count,
+                blocksize,
+                total_sent,
+            )
+        except OSError as exc:
+            if (
+                registered_fd is not None
+                and exc.errno == errno.ENOTCONN
+                and type(exc) is not ConnectionError
+            ):
+                new_exc = ConnectionError("socket is not connected", errno.ENOTCONN)
+                new_exc.__cause__ = exc
+                exc = new_exc
+            if total_sent == 0:
+                err = _exceptions.SendfileNotAvailableError("os.sendfile call failed")
+                self._sock_sendfile_update_filepos(fileno, offset, total_sent)
+                fut.set_exception(err)
+            else:
+                self._sock_sendfile_update_filepos(fileno, offset, total_sent)
+                fut.set_exception(exc)
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as exc:
+            self._sock_sendfile_update_filepos(fileno, offset, total_sent)
+            fut.set_exception(exc)
+        else:
+            if sent == 0:
+                self._sock_sendfile_update_filepos(fileno, offset, total_sent)
+                fut.set_result(total_sent)
+            else:
+                offset += sent
+                total_sent += sent
+                if registered_fd is None:
+                    self._sock_add_cancellation_callback(fut, sock)
+                self.add_writer(
+                    fd,
+                    self._sock_sendfile_native_impl,
+                    fut,
+                    fd,
+                    sock,
+                    fileno,
+                    offset,
+                    count,
+                    blocksize,
+                    total_sent,
+                )
+
+    async def _sock_sendfile_native(
+        self, sock: socket.socket, file: Any, offset: int, count: int | None
+    ) -> int:
+        try:
+            os.sendfile
+        except AttributeError:
+            raise _exceptions.SendfileNotAvailableError("os.sendfile() is not available")
+        try:
+            fileno = file.fileno()
+        except (AttributeError, OSError):
+            raise _exceptions.SendfileNotAvailableError("not a regular file")
+        try:
+            fsize = os.fstat(fileno).st_size
+        except OSError:
+            raise _exceptions.SendfileNotAvailableError("not a regular file")
+        blocksize = count if count else fsize
+        if not blocksize:
+            return 0
+        fut = self.create_future()
+        self._sock_sendfile_native_impl(fut, None, sock, fileno, offset, count, blocksize, 0)
+        return await fut
+
     def _make_socket_transport(
         self,
         sock: socket.socket,
@@ -973,6 +1324,88 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         return _selector_events._SelectorSocketTransport(
             self, sock, protocol, waiter, extra, server
         )
+
+    def _make_datagram_transport(
+        self,
+        sock: socket.socket,
+        protocol: asyncio.Protocol,
+        address: Any = None,
+        waiter: asyncio.Future[Any] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> asyncio.Transport:
+        self._ensure_fd_no_transport(sock)
+        return _selector_events._SelectorDatagramTransport(
+            self,
+            sock,
+            protocol,
+            address,
+            waiter,
+            extra,
+        )
+
+    def _make_read_pipe_transport(
+        self,
+        pipe: Any,
+        protocol: asyncio.Protocol,
+        waiter: asyncio.Future[Any] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> asyncio.Transport:
+        return _unix_events._UnixReadPipeTransport(self, pipe, protocol, waiter, extra)
+
+    def _make_write_pipe_transport(
+        self,
+        pipe: Any,
+        protocol: asyncio.Protocol,
+        waiter: asyncio.Future[Any] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> asyncio.Transport:
+        return _unix_events._UnixWritePipeTransport(self, pipe, protocol, waiter, extra)
+
+    async def _make_subprocess_transport(
+        self,
+        protocol: asyncio.BaseProtocol,
+        args: Any,
+        shell: bool,
+        stdin: Any,
+        stdout: Any,
+        stderr: Any,
+        bufsize: int,
+        extra: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> asyncio.Transport:
+        waiter = self.create_future()
+        transport = _unix_events._UnixSubprocessTransport(
+            self,
+            protocol,
+            args,
+            shell,
+            stdin,
+            stdout,
+            stderr,
+            bufsize,
+            waiter=waiter,
+            extra=extra,
+            **kwargs,
+        )
+        self._watcher.add_child_handler(
+            transport.get_pid(),
+            self._child_watcher_callback,
+            transport,
+        )
+        try:
+            await waiter
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException:
+            transport.close()
+            await transport._wait()
+            raise
+        return transport
+
+    def _child_watcher_callback(
+        self, pid: int, returncode: int, transp: Any
+    ) -> None:
+        self.call_soon_threadsafe(transp._process_exited, returncode)
 
     def _make_ssl_transport(
         self,
@@ -1285,6 +1718,9 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
             completion_port.close()
         if getattr(self, "_ssock", None) is not None or getattr(self, "_csock", None) is not None:
             self._close_self_pipe()
+        if self._signal_handlers:
+            for sig in list(self._signal_handlers):
+                self.remove_signal_handler(sig)
         poller = getattr(self, "_poller", None)
         if poller is not None:
             poller.close()

@@ -2,11 +2,14 @@
 
 `benchmarks/loops.py` is the primary performance harness for comparing `asyncio`, `uvloop`, and `rsloop`.
 
-It now covers five workload classes:
+It now covers eight workload classes:
 
 - `scheduler`: callback, timer, cancellation, and cross-thread scheduling churn
 - `raw-socket`: `loop.sock_*` helpers, socketpair/TCP/AF_UNIX raw I/O, reusable recv-into buffers, and UDP datagrams
-- `stream`: asyncio streams on small, large, fragmented, bursty, concurrent, asymmetric upload/download, request/response, pipelined, half-close, backpressured, mixed-payload, HTTP/1.1, and TLS traffic
+- `datagram`: `create_datagram_endpoint()`, `sock_sendto()`, `sock_recvfrom()`, and `sock_recvfrom_into()` UDP echo paths
+- `ipc`: `connect_read_pipe()`, `connect_write_pipe()`, and subprocess spawn/communicate churn
+- `signals`: `add_signal_handler()` / `remove_signal_handler()` registration and delivery churn
+- `stream`: asyncio streams on small, large, fragmented, bursty, concurrent, asymmetric upload/download, request/response, pipelined, half-close, backpressured, mixed-payload, HTTP/1.1, TLS, `start_tls()`, and `sock_sendfile()` traffic
 - `application`: websocket, JSON request/response, and framed unary RPC workloads
 - `connection`: sequential and parallel connect/close churn, burst accept, small-I/O churn, and idle fanout
 
@@ -89,8 +92,9 @@ Capture cross-loop Python stream delivery/write shape for an isolated comparison
 
 - `smoke`: fast sanity checks
 - `default`: balanced comparison set for routine iteration
-- `full`: all scenarios, including heavier mixed-payload stream cases
-- The expanded `full` profile also includes control-plane task/future/timer storms, AF_UNIX raw-socket cases, HTTP/1.1 request/response cases, TLS handshakes, websocket workloads, and application-shaped request/response cases.
+- `full`: all runnable scenarios, including heavier mixed-payload stream cases
+- The expanded `full` profile also includes control-plane task/future/timer storms, AF_UNIX raw-socket cases, datagram endpoint and `sock_sendto` / `sock_recvfrom` coverage, pipe and subprocess churn, signal handler churn, HTTP/1.1 request/response cases, TLS handshakes, `sock_sendfile()` transfers, websocket workloads, and application-shaped request/response cases.
+- `start_tls_upgrade` is available as a standalone benchmark for targeted debugging. It is currently excluded from `full` because the rsloop path hangs in the current build.
 
 ### Notes
 

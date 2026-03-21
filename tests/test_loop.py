@@ -1,13 +1,51 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 import socket
+import ssl
+import subprocess
+import sys
 import threading
 import unittest
 import tempfile
 from pathlib import Path
 
 import rsloop
+
+
+def make_tls_contexts() -> tuple[ssl.SSLContext, ssl.SSLContext]:
+    tempdir = Path(tempfile.mkdtemp(prefix="rsloop-test-tls-"))
+    certfile = tempdir / "cert.pem"
+    keyfile = tempdir / "key.pem"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(keyfile),
+            "-out",
+            str(certfile),
+            "-subj",
+            "/CN=localhost",
+            "-days",
+            "1",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(certfile=str(certfile), keyfile=str(keyfile))
+    client_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    client_context.check_hostname = False
+    client_context.verify_mode = ssl.CERT_NONE
+    return server_context, client_context
 
 
 class RsloopLoopTests(unittest.TestCase):
@@ -286,6 +324,175 @@ class RsloopLoopTests(unittest.TestCase):
         async def main() -> None:
             await roundtrip(use_loop_sendfile=False)
             await roundtrip(use_loop_sendfile=True)
+
+        self.run_async(main())
+
+    def test_native_datagram_and_signal_coverage(self) -> None:
+        async def main() -> None:
+            loop = asyncio.get_running_loop()
+            server_ready = loop.create_future()
+
+            class Echo(asyncio.DatagramProtocol):
+                transport: asyncio.DatagramTransport | None = None
+
+                def connection_made(self, transport: asyncio.BaseTransport) -> None:
+                    self.transport = transport  # type: ignore[assignment]
+                    if not server_ready.done():
+                        server_ready.set_result(transport)
+
+                def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+                    assert self.transport is not None
+                    self.transport.sendto(data, addr)
+
+            transport, _protocol = await loop.create_datagram_endpoint(
+                Echo, local_addr=("127.0.0.1", 0)
+            )
+            server_transport = await server_ready
+            server_addr = server_transport.get_extra_info("sockname")
+
+            client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            client.setblocking(False)
+            try:
+                await loop.sock_sendto(client, b"ping", server_addr)
+                recv_buf = bytearray(8)
+                nbytes, addr = await loop.sock_recvfrom_into(client, recv_buf)
+                self.assertEqual(bytes(recv_buf[:nbytes]), b"ping")
+                self.assertEqual(addr, server_addr)
+
+                await loop.sock_sendto(client, b"pong", server_addr)
+                data, addr = await loop.sock_recvfrom(client, 8)
+                self.assertEqual(data, b"pong")
+                self.assertEqual(addr, server_addr)
+            finally:
+                client.close()
+                transport.close()
+
+            done = loop.create_future()
+            sig = signal.SIGUSR1
+            loop.add_signal_handler(sig, done.set_result, "signal-ok")
+            try:
+                os.kill(os.getpid(), sig)
+                self.assertEqual(await done, "signal-ok")
+            finally:
+                loop.remove_signal_handler(sig)
+
+        self.run_async(main())
+
+    def test_native_subprocess_pipes(self) -> None:
+        async def main() -> None:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import sys; data = sys.stdin.buffer.read(); sys.stdout.buffer.write(data[::-1])",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+            )
+            stdout, _stderr = await proc.communicate(b"abc123")
+            self.assertEqual(stdout, b"321cba")
+            self.assertEqual(await proc.wait(), 0)
+
+            shell_proc = await asyncio.create_subprocess_shell(
+                "printf shell-ok",
+                stdout=asyncio.subprocess.PIPE,
+            )
+            shell_stdout, _stderr = await shell_proc.communicate()
+            self.assertEqual(shell_stdout, b"shell-ok")
+            self.assertEqual(await shell_proc.wait(), 0)
+
+        self.run_async(main())
+
+    def test_native_sock_sendfile(self) -> None:
+        payload = (b"sendfile-native-" * 2048) + b"tail"
+        offset = 128
+        count = 24 * 1024
+        expected = payload[offset : offset + count]
+
+        async def main() -> None:
+            with tempfile.TemporaryDirectory(prefix="rsloop-sock-sendfile-") as tmpdir:
+                path = Path(tmpdir) / "payload.bin"
+                path.write_bytes(payload)
+                loop = asyncio.get_running_loop()
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind(("127.0.0.1", 0))
+                listener.listen()
+                listener.setblocking(False)
+                host, port = listener.getsockname()[:2]
+
+                server_done = loop.create_future()
+
+                async def server() -> None:
+                    conn, _ = await loop.sock_accept(listener)
+                    conn.setblocking(False)
+                    try:
+                        with path.open("rb") as file:
+                            sent = await loop.sock_sendfile(conn, file, offset=offset, count=count)
+                        self.assertEqual(sent, len(expected))
+                    finally:
+                        conn.close()
+                        listener.close()
+                        if not server_done.done():
+                            server_done.set_result(None)
+
+                server_task = asyncio.create_task(server())
+                client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                client.setblocking(False)
+                try:
+                    await loop.sock_connect(client, (host, port))
+                    chunks: list[bytes] = []
+                    remaining = len(expected)
+                    while remaining:
+                        chunk = await loop.sock_recv(client, remaining)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    self.assertEqual(b"".join(chunks), expected)
+                    await server_done
+                finally:
+                    client.close()
+                    await server_task
+
+        self.run_async(main())
+
+    def test_native_start_tls(self) -> None:
+        server_context, client_context = make_tls_contexts()
+
+        async def main() -> None:
+            loop = asyncio.get_running_loop()
+
+            async def handle(
+                reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+            ) -> None:
+                try:
+                    self.assertEqual(await reader.readexactly(9), b"STARTTLS\n")
+                    writer.write(b"READY\n")
+                    await writer.drain()
+                    await writer.start_tls(server_context)
+                    self.assertEqual(await reader.readexactly(4), b"ping")
+                    writer.write(b"pong")
+                    await writer.drain()
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+
+            server = await asyncio.start_server(handle, "127.0.0.1", 0)
+            host, port = server.sockets[0].getsockname()[:2]
+
+            try:
+                reader, writer = await asyncio.open_connection(host, port)
+                writer.write(b"STARTTLS\n")
+                await writer.drain()
+                self.assertEqual(await reader.readexactly(6), b"READY\n")
+                await writer.start_tls(client_context, server_hostname="localhost")
+                writer.write(b"ping")
+                await writer.drain()
+                self.assertEqual(await reader.readexactly(4), b"pong")
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                server.close()
+                await server.wait_closed()
 
         self.run_async(main())
 

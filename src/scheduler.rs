@@ -522,10 +522,7 @@ impl Scheduler {
                 for (fd, mask) in fd_events.iter().copied() {
                     tick.fd_events += 1;
                     if self_pipe_fd.is_some_and(|self_pipe_fd| fd == self_pipe_fd) {
-                        drain_self_pipe_fd(fd)?;
-                        if let Some(native_api) = native_api {
-                            native_api.bind(py).borrow().clear_wakeup();
-                        }
+                        loop_obj.bind(py).call_method0("_read_from_self")?;
                         continue;
                     }
                     if stream_registry.dispatch_one(py, fd, mask)? {
@@ -557,10 +554,7 @@ impl Scheduler {
                 for (fd, mask) in fd_events.iter().copied() {
                     tick.fd_events += 1;
                     if self_pipe_fd.is_some_and(|self_pipe_fd| fd == self_pipe_fd) {
-                        drain_self_pipe_fd(fd)?;
-                        if let Some(native_api) = native_api {
-                            native_api.bind(py).borrow().clear_wakeup();
-                        }
+                        loop_obj.bind(py).call_method0("_read_from_self")?;
                         continue;
                     }
                     if !socket_registry.dispatch_one(py, fd, mask)? {
@@ -584,10 +578,7 @@ impl Scheduler {
                 for (fd, mask) in fd_events.iter().copied() {
                     tick.fd_events += 1;
                     if self_pipe_fd.is_some_and(|self_pipe_fd| fd == self_pipe_fd) {
-                        drain_self_pipe_fd(fd)?;
-                        if let Some(native_api) = native_api {
-                            native_api.bind(py).borrow().clear_wakeup();
-                        }
+                        loop_obj.bind(py).call_method0("_read_from_self")?;
                         continue;
                     }
                     tick.generic_fd_hits += 1;

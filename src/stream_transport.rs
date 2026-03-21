@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyStopIteration};
+use pyo3::buffer::PyBuffer;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -86,6 +87,13 @@ struct PendingWrite {
     sent: usize,
 }
 
+enum ReadableDispatch {
+    WouldBlock,
+    Buffered { protocol: Py<PyAny>, nbytes: usize },
+    Eof { protocol: Py<PyAny> },
+    Error { exc: Py<PyAny> },
+}
+
 impl PendingWrite {
     fn len(&self, py: Python<'_>) -> usize {
         match &self.data {
@@ -135,6 +143,9 @@ pub(crate) struct StreamCore {
 
 #[pyclass(module = "rsloop._rsloop", unsendable)]
 pub struct StreamTransport {
+    #[pyo3(get)]
+    _start_tls_compatible: bool,
+    fd: RawFd,
     pub(crate) core: StreamCoreRef,
 }
 
@@ -474,7 +485,11 @@ impl StreamTransport {
                 connection_lost_sent: false,
                 write_queued: false,
             }));
-        Ok(Self { core })
+        Ok(Self {
+            _start_tls_compatible: true,
+            fd,
+            core,
+        })
     }
 
     fn activate(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
@@ -509,6 +524,19 @@ impl StreamTransport {
         create_bound_wait_closed(slf.py(), slf.as_any().as_unbound())
     }
 
+    fn set_protocol(slf: Py<Self>, py: Python<'_>, protocol: Py<PyAny>) -> PyResult<()> {
+        let core = slf.borrow(py).core.clone();
+        if trace_stream_enabled() {
+            eprintln!("stream-transport set_protocol fd={} type={}", core.borrow().fd, protocol.bind(py).get_type().name()?);
+        }
+        core.borrow_mut().protocol = protocol;
+        Ok(())
+    }
+
+    fn get_protocol(&self, py: Python<'_>) -> Py<PyAny> {
+        self.core.borrow().protocol.clone_ref(py)
+    }
+
     fn drain(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let core = slf.borrow(py).core.clone();
         let result = core.borrow_mut().drain_inner(py);
@@ -539,7 +567,25 @@ impl StreamTransport {
     }
 
     fn write(&mut self, py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
-        self.core.borrow_mut().write(py, data)
+        match self.core.try_borrow_mut() {
+            Ok(mut core) => core.write(py, data),
+            Err(_) => {
+                let bytes = if let Ok(bytes) = data.cast::<PyBytes>() {
+                    bytes.as_bytes().to_vec()
+                } else {
+                    let bytes = coerce_bytes(py, &data)?;
+                    bytes.bind(py).as_bytes().to_vec()
+                };
+                match try_send_bytes(self.fd, &bytes) {
+                    Ok(sent) if sent == bytes.len() => Ok(()),
+                    Ok(sent) => Err(PyRuntimeError::new_err(format!(
+                        "reentrant write was only able to send {sent} of {} bytes",
+                        bytes.len()
+                    ))),
+                    Err(err) => Err(PyRuntimeError::new_err(err.to_string())),
+                }
+            }
+        }
     }
 
     fn writelines(&mut self, py: Python<'_>, list_of_data: Bound<'_, PyAny>) -> PyResult<()> {
@@ -637,13 +683,64 @@ impl StreamTransport {
         if !transport.read_paused || transport.closed || transport.closing {
             return Ok(());
         }
+        if trace_stream_enabled() {
+            eprintln!("stream-transport resume_reading fd={}", transport.fd);
+        }
         transport.read_paused = false;
         transport.sync_interest(py)?;
-        transport.on_readable(py)
+        drop(transport);
+        slf.call_method0(py, "_on_readable")?;
+        Ok(())
     }
 
     fn _on_readable(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
         let core = slf.borrow(py).core.clone();
+        let buffered = {
+            let core = core.borrow();
+            let protocol = core.protocol.bind(py);
+            protocol.hasattr("get_buffer")? && protocol.hasattr("buffer_updated")?
+        };
+        if buffered {
+            loop {
+                let dispatch = {
+                    let mut transport = core.borrow_mut();
+                    transport.poll_ssl_readable(py)?
+                };
+                match dispatch {
+                    ReadableDispatch::WouldBlock => break,
+                    ReadableDispatch::Buffered { protocol, nbytes } => {
+                        let result = protocol
+                            .bind(py)
+                            .call_method1("buffer_updated", (nbytes,));
+                        if let Err(err) = result {
+                            core.borrow_mut().finish_close(
+                                py,
+                                Some(err.into_value(py).into_any()),
+                            )?;
+                            break;
+                        } else if trace_stream_enabled() {
+                            eprintln!(
+                                "stream-transport ssl-wrapper updated fd={} bytes={}",
+                                core.borrow().fd,
+                                nbytes
+                            );
+                        }
+                        if core.borrow().closed || core.borrow().read_paused {
+                            break;
+                        }
+                    }
+                    ReadableDispatch::Eof { protocol } => {
+                        protocol.bind(py).call_method0("eof_received")?;
+                        break;
+                    }
+                    ReadableDispatch::Error { exc } => {
+                        core.borrow_mut().finish_close(py, Some(exc))?;
+                        break;
+                    }
+                }
+            }
+            return Ok(());
+        }
         let result = core.borrow_mut().on_readable(py);
         result
     }
@@ -674,7 +771,16 @@ impl StreamCore {
 
     pub(crate) fn on_events(&mut self, py: Python<'_>, mask: u8) -> PyResult<()> {
         if mask & 0x01 != 0 {
-            self.on_readable(py)?;
+            if self.is_buffered_protocol(py)? {
+                if let Some(transport) = self.transports.bind(py).get_item(self.fd)? {
+                    let callback = transport.getattr("_on_readable")?;
+                    self.loop_obj
+                        .bind(py)
+                        .call_method1("call_soon", (callback,))?;
+                }
+            } else {
+                self.on_readable(py)?;
+            }
         }
         if !self.closed && mask & 0x02 != 0 {
             self.on_writable(py)?;
@@ -726,6 +832,13 @@ impl StreamCore {
 
     fn write(&mut self, py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
         self.ensure_can_write()?;
+        if self.is_buffered_protocol(py)? {
+            if let Ok(bytes) = data.cast::<PyBytes>() {
+                return self.write_direct_bytes(py, bytes.as_bytes());
+            }
+            let bytes = coerce_bytes(py, &data)?;
+            return self.write_direct_bytes(py, bytes.bind(py).as_bytes());
+        }
         if let Ok(bytes) = data.cast::<PyBytes>() {
             self.write_bytes_object_inner(py, &bytes)?;
         } else {
@@ -745,6 +858,28 @@ impl StreamCore {
             ));
         }
         Ok(())
+    }
+
+    fn is_buffered_protocol(&self, py: Python<'_>) -> PyResult<bool> {
+        let protocol = self.protocol.bind(py);
+        Ok(protocol.hasattr("buffer_updated")? && protocol.hasattr("get_buffer")?)
+    }
+
+    fn write_direct_bytes(&mut self, _py: Python<'_>, bytes: &[u8]) -> PyResult<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if trace_stream_enabled() {
+            eprintln!("stream-transport ssl-direct-write fd={} bytes={}", self.fd, bytes.len());
+        }
+        match try_send_bytes(self.fd, bytes) {
+            Ok(sent) if sent == bytes.len() => Ok(()),
+            Ok(sent) => Err(PyRuntimeError::new_err(format!(
+                "direct write sent {sent} of {} bytes",
+                bytes.len()
+            ))),
+            Err(err) => Err(PyRuntimeError::new_err(err.to_string())),
+        }
     }
 
     fn write_bytes_object_inner(&mut self, py: Python<'_>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
@@ -889,8 +1024,71 @@ impl StreamCore {
     }
 
     pub(crate) fn on_readable(&mut self, py: Python<'_>) -> PyResult<()> {
+        if trace_stream_enabled() {
+            eprintln!(
+                "stream-transport on_readable fd={} closing={} closed={} paused={} proto={}",
+                self.fd,
+                self.closing,
+                self.closed,
+                self.read_paused,
+                self.protocol.bind(py).get_type().name()?
+            );
+        }
         if self.closing || self.closed || self.read_paused {
             return Ok(());
+        }
+        let protocol = self.protocol.clone_ref(py);
+        let protocol = protocol.bind(py);
+        if protocol.hasattr("get_buffer")? && protocol.hasattr("buffer_updated")? {
+            if trace_stream_enabled() {
+                eprintln!("stream-transport ssl-on_readable fd={}", self.fd);
+            }
+            loop {
+                let buffer = protocol.call_method1("get_buffer", (self.read_buffer.len(),))?;
+                let buffer = PyBuffer::<u8>::get(&buffer)?;
+                let Some(cells) = buffer.as_mut_slice(py) else {
+                    return Err(PyRuntimeError::new_err(
+                        "buffer_updated() requires a writable C-contiguous buffer",
+                    ));
+                };
+                let slice = unsafe { cell_slice_as_bytes_mut(cells) };
+                if trace_stream_enabled() {
+                    eprintln!("stream-transport ssl-on_readable recv fd={} want={}", self.fd, slice.len());
+                }
+                match recv_into(self.fd, slice) {
+                    Ok(0) => {
+                        if trace_stream_enabled() {
+                            eprintln!("stream-transport ssl-on_readable eof fd={}", self.fd);
+                        }
+                        self.remove_reader(py)?;
+                        protocol.call_method0("eof_received")?;
+                        return Ok(());
+                    }
+                    Ok(n) => {
+                        if trace_stream_enabled() {
+                            eprintln!("stream-transport ssl-on_readable got fd={} bytes={}", self.fd, n);
+                        }
+                        protocol.call_method1("buffer_updated", (n,))?;
+                        if trace_stream_enabled() {
+                            eprintln!("stream-transport ssl-on_readable updated fd={} bytes={}", self.fd, n);
+                        }
+                        if self.read_paused {
+                            return Ok(());
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(err) => {
+                        return self.finish_close(
+                            py,
+                            Some(
+                                PyRuntimeError::new_err(err.to_string())
+                                    .into_value(py)
+                                    .into_any(),
+                            ),
+                        );
+                    }
+                }
+            }
         }
         if trace_stream_enabled() {
             eprintln!(
@@ -933,6 +1131,47 @@ impl StreamCore {
                     );
                 }
             }
+        }
+    }
+
+    fn poll_ssl_readable(&mut self, py: Python<'_>) -> PyResult<ReadableDispatch> {
+        if self.closing || self.closed || self.read_paused {
+            return Ok(ReadableDispatch::WouldBlock);
+        }
+        let protocol = self.protocol.clone_ref(py);
+        let protocol_bound = protocol.bind(py);
+        let buffer = protocol_bound.call_method1("get_buffer", (self.read_buffer.len(),))?;
+        let buffer = PyBuffer::<u8>::get(&buffer)?;
+        let Some(cells) = buffer.as_mut_slice(py) else {
+            return Ok(ReadableDispatch::Error {
+                exc: PyRuntimeError::new_err(
+                    "buffer_updated() requires a writable C-contiguous buffer",
+                )
+                .into_value(py)
+                .into_any(),
+            });
+        };
+        let slice = unsafe { cell_slice_as_bytes_mut(cells) };
+        if trace_stream_enabled() {
+            eprintln!("stream-transport ssl-read fd={} want={}", self.fd, slice.len());
+        }
+        match recv_into(self.fd, slice) {
+            Ok(0) => {
+                self.remove_reader(py)?;
+                Ok(ReadableDispatch::Eof {
+                    protocol: protocol.clone_ref(py),
+                })
+            }
+            Ok(n) => Ok(ReadableDispatch::Buffered {
+                protocol: protocol.clone_ref(py),
+                nbytes: n,
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(ReadableDispatch::WouldBlock),
+            Err(err) => Ok(ReadableDispatch::Error {
+                exc: PyRuntimeError::new_err(err.to_string())
+                    .into_value(py)
+                    .into_any(),
+            }),
         }
     }
 
@@ -1821,6 +2060,10 @@ fn recv_into(fd: RawFd, buffer: &mut [u8]) -> std::io::Result<usize> {
         return Ok(result as usize);
     }
     Err(std::io::Error::last_os_error())
+}
+
+unsafe fn cell_slice_as_bytes_mut(cells: &[std::cell::Cell<u8>]) -> &mut [u8] {
+    std::slice::from_raw_parts_mut(cells.as_ptr() as *mut u8, cells.len())
 }
 
 fn try_send_bytes(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {

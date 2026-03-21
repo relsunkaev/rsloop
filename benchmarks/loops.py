@@ -9,6 +9,8 @@ import importlib.metadata as importlib_metadata
 import json
 import os
 import platform
+import shlex
+import signal
 import ssl
 import struct
 import subprocess
@@ -939,7 +941,14 @@ async def bench_tcp_accept_burst(count: int) -> None:
 
     clients: list[asyncio.StreamWriter] = []
     try:
-        clients = list(await asyncio.gather(*(client() for _ in range(count))))
+        batch_size = 32
+        for start in range(0, count, batch_size):
+            clients.extend(
+                await asyncio.gather(
+                    *(client() for _ in range(min(batch_size, count - start)))
+                )
+            )
+            await asyncio.sleep(0)
         await done
     finally:
         await close_writers(clients)
@@ -2028,7 +2037,7 @@ async def http1_roundtrip(
 
     async def client(iterations: int) -> None:
         if close_each_request:
-            for _ in range(iterations):
+            for index in range(iterations):
                 reader, writer = await asyncio.open_connection(
                     host,
                     port,
@@ -2056,6 +2065,8 @@ async def http1_roundtrip(
                 finally:
                     writer.close()
                     await writer.wait_closed()
+                if index % 4 == 0:
+                    await asyncio.sleep(0)
             return
 
         reader, writer = await asyncio.open_connection(
@@ -2449,11 +2460,13 @@ async def bench_uds_connect_close(count: int) -> None:
         client.setblocking(False)
 
         try:
-            for _ in range(count):
+            for index in range(count):
                 await asyncio.get_running_loop().sock_connect(client, str(path))
                 client.close()
                 client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 client.setblocking(False)
+                if index % 4 == 0:
+                    await asyncio.sleep(0)
             await done
         finally:
             client.close()
@@ -2492,7 +2505,12 @@ async def bench_uds_connect_parallel(count: int) -> None:
 
         server_task = asyncio.create_task(server())
         try:
-            await asyncio.gather(*(client() for _ in range(count)))
+            batch_size = 16
+            for start in range(0, count, batch_size):
+                await asyncio.gather(
+                    *(client() for _ in range(min(batch_size, count - start)))
+                )
+                await asyncio.sleep(0)
             await done
         finally:
             await server_task
@@ -2742,6 +2760,344 @@ async def bench_grpc_like_unary(count: int) -> None:
         request_size=64,
         response_size=128,
     )
+
+
+async def bench_udp_datagram_endpoint(count: int) -> None:
+    loop = asyncio.get_running_loop()
+    payload = b"x" * 64
+    completed = 0
+    done = loop.create_future()
+    server_transport: asyncio.DatagramTransport | None = None
+
+    class ServerProtocol(asyncio.DatagramProtocol):
+        def connection_made(self, transport: asyncio.BaseTransport) -> None:
+            nonlocal server_transport
+            server_transport = transport  # type: ignore[assignment]
+
+        def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+            nonlocal completed
+            assert server_transport is not None
+            server_transport.sendto(data, addr)
+            completed += 1
+            if completed == count and not done.done():
+                done.set_result(None)
+
+    class ClientProtocol(asyncio.DatagramProtocol):
+        transport: asyncio.DatagramTransport | None = None
+        pending: asyncio.Future[bytes] | None = None
+
+        def connection_made(self, transport: asyncio.BaseTransport) -> None:
+            self.transport = transport  # type: ignore[assignment]
+
+        def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+            if self.pending is not None and not self.pending.done():
+                self.pending.set_result(data)
+
+    server_transport_obj, _server_protocol = await loop.create_datagram_endpoint(
+        ServerProtocol, local_addr=("127.0.0.1", 0)
+    )
+    server_addr = server_transport_obj.get_extra_info("sockname")
+    assert server_addr is not None
+    client_transport, client_protocol = await loop.create_datagram_endpoint(
+        ClientProtocol, remote_addr=server_addr
+    )
+
+    try:
+        for _ in range(count):
+            response = loop.create_future()
+            client_protocol.pending = response
+            assert client_transport is not None
+            client_transport.sendto(payload)
+            data = await response
+            if data != payload:
+                raise RuntimeError(f"unexpected datagram size={len(data)}")
+        await done
+    finally:
+        client_transport.close()
+        server_transport_obj.close()
+
+
+async def bench_udp_sock_sendto_recvfrom(count: int) -> None:
+    loop = asyncio.get_running_loop()
+    payload = b"x" * 64
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("127.0.0.1", 0))
+    client.bind(("127.0.0.1", 0))
+    server.setblocking(False)
+    client.setblocking(False)
+    server_addr = server.getsockname()
+
+    async def server_loop() -> None:
+        for _ in range(count):
+            data, addr = await loop.sock_recvfrom(server, 1024)
+            if data != payload:
+                raise RuntimeError(f"unexpected datagram size={len(data)}")
+            await loop.sock_sendto(server, data, addr)
+
+    server_task = asyncio.create_task(server_loop())
+    try:
+        for _ in range(count):
+            await loop.sock_sendto(client, payload, server_addr)
+            data, addr = await loop.sock_recvfrom(client, 1024)
+            if data != payload or addr != server_addr:
+                raise RuntimeError(f"unexpected datagram size={len(data)}")
+        await server_task
+    finally:
+        server.close()
+        client.close()
+        await server_task
+
+
+async def bench_udp_sock_sendto_recvfrom_into(count: int) -> None:
+    loop = asyncio.get_running_loop()
+    payload = b"x" * 64
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("127.0.0.1", 0))
+    client.bind(("127.0.0.1", 0))
+    server.setblocking(False)
+    client.setblocking(False)
+    server_addr = server.getsockname()
+    server_buf = bytearray(1024)
+    client_buf = bytearray(1024)
+
+    async def server_loop() -> None:
+        for _ in range(count):
+            nbytes, addr = await loop.sock_recvfrom_into(server, server_buf)
+            if bytes(server_buf[:nbytes]) != payload:
+                raise RuntimeError(f"unexpected datagram size={nbytes}")
+            await loop.sock_sendto(server, memoryview(server_buf)[:nbytes], addr)
+
+    server_task = asyncio.create_task(server_loop())
+    try:
+        for _ in range(count):
+            await loop.sock_sendto(client, payload, server_addr)
+            nbytes, addr = await loop.sock_recvfrom_into(client, client_buf)
+            if bytes(client_buf[:nbytes]) != payload or addr != server_addr:
+                raise RuntimeError(f"unexpected datagram size={nbytes}")
+        await server_task
+    finally:
+        server.close()
+        client.close()
+        await server_task
+
+
+async def bench_pipe_read(count: int) -> None:
+    loop = asyncio.get_running_loop()
+    payload = b"x" * 64
+    expected = len(payload) * count
+    received = 0
+    done = loop.create_future()
+
+    class ReaderProtocol(asyncio.Protocol):
+        def data_received(self, data: bytes) -> None:
+            nonlocal received
+            received += len(data)
+            if received >= expected and not done.done():
+                done.set_result(None)
+
+    read_fd, write_fd = os.pipe()
+    read_file = os.fdopen(read_fd, "rb", buffering=0)
+
+    def writer() -> None:
+        with os.fdopen(write_fd, "wb", buffering=0) as write_file:
+            for _ in range(count):
+                write_file.write(payload)
+
+    writer_task = asyncio.create_task(asyncio.to_thread(writer))
+    transport, _protocol = await loop.connect_read_pipe(lambda: ReaderProtocol(), read_file)
+    try:
+        await done
+    finally:
+        transport.close()
+        await writer_task
+    if received != expected:
+        raise RuntimeError(f"unexpected pipe byte count={received}")
+
+
+async def bench_pipe_write(count: int) -> None:
+    payload = b"x" * 64
+    expected = len(payload) * count
+    received = 0
+    read_fd, write_fd = os.pipe()
+
+    def reader() -> None:
+        nonlocal received
+        with os.fdopen(read_fd, "rb", buffering=0) as read_file:
+            while True:
+                chunk = read_file.read(8192)
+                if not chunk:
+                    break
+                received += len(chunk)
+
+    reader_task = asyncio.create_task(asyncio.to_thread(reader))
+    write_file = os.fdopen(write_fd, "wb", buffering=0)
+    transport, _protocol = await asyncio.get_running_loop().connect_write_pipe(
+        asyncio.Protocol,
+        write_file,
+    )
+    try:
+        for index in range(count):
+            transport.write(payload)
+            if index % 64 == 0:
+                await asyncio.sleep(0)
+        transport.close()
+        await reader_task
+    finally:
+        transport.close()
+        await reader_task
+    if received != expected:
+        raise RuntimeError(f"unexpected pipe byte count={received}")
+
+
+async def bench_subprocess_exec(count: int) -> None:
+    payload = b"subprocess-exec"
+    script = (
+        "import sys; "
+        "data = sys.stdin.buffer.read(); "
+        "sys.stdout.buffer.write(data[::-1])"
+    )
+    for _ in range(count):
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            script,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+        stdout, _stderr = await proc.communicate(payload)
+        if stdout != payload[::-1]:
+            raise RuntimeError(f"unexpected subprocess stdout size={len(stdout)}")
+        if await proc.wait() != 0:
+            raise RuntimeError("subprocess_exec exited non-zero")
+
+
+async def bench_subprocess_shell(count: int) -> None:
+    payload = b"subprocess-shell"
+    script = (
+        "import sys; "
+        "data = sys.stdin.buffer.read(); "
+        "sys.stdout.buffer.write(data[::-1])"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    for _ in range(count):
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+        stdout, _stderr = await proc.communicate(payload)
+        if stdout != payload[::-1]:
+            raise RuntimeError(f"unexpected subprocess stdout size={len(stdout)}")
+        if await proc.wait() != 0:
+            raise RuntimeError("subprocess_shell exited non-zero")
+
+
+async def bench_signal_handler_churn(count: int) -> None:
+    loop = asyncio.get_running_loop()
+    sig = signal.SIGUSR1
+    for _ in range(count):
+        done = loop.create_future()
+        loop.add_signal_handler(sig, done.set_result, None)
+        try:
+            os.kill(os.getpid(), sig)
+            await done
+        finally:
+            loop.remove_signal_handler(sig)
+
+
+async def bench_start_tls_upgrade(count: int) -> None:
+    server_context, client_context = tls_contexts()
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            await reader.readexactly(9)
+            writer.write(b"READY\n")
+            await writer.drain()
+            await writer.start_tls(server_context)
+            await reader.readexactly(4)
+            writer.write(b"pong")
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    try:
+        for _ in range(count):
+            reader, writer = await asyncio.open_connection(host, port)
+            try:
+                writer.write(b"STARTTLS\n")
+                await writer.drain()
+                if await reader.readexactly(6) != b"READY\n":
+                    raise RuntimeError("unexpected start_tls readiness banner")
+                await writer.start_tls(client_context, server_hostname="localhost")
+                writer.write(b"ping")
+                await writer.drain()
+                if await reader.readexactly(4) != b"pong":
+                    raise RuntimeError("unexpected start_tls response")
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def bench_sock_sendfile(count: int) -> None:
+    payload = (b"sendfile-native-" * 4096) + b"tail"
+    expected = payload
+    loop = asyncio.get_running_loop()
+
+    with tempfile.TemporaryDirectory(prefix="rsloop-sendfile-") as tmpdir:
+        path = Path(tmpdir) / "payload.bin"
+        path.write_bytes(payload)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(max(128, count))
+        listener.setblocking(False)
+        host, port = listener.getsockname()[:2]
+
+        async def server() -> None:
+            try:
+                for _ in range(count):
+                    conn, _ = await loop.sock_accept(listener)
+                    conn.setblocking(False)
+                    try:
+                        with path.open("rb") as file:
+                            sent = await loop.sock_sendfile(conn, file)
+                        if sent != len(expected):
+                            raise RuntimeError(f"unexpected sendfile byte count={sent}")
+                    finally:
+                        conn.close()
+            finally:
+                listener.close()
+
+        server_task = asyncio.create_task(server())
+        try:
+            for _ in range(count):
+                reader, writer = await asyncio.open_connection(host, port)
+                received = bytearray()
+                while len(received) < len(expected):
+                    chunk = await reader.read(len(expected) - len(received))
+                    if not chunk:
+                        break
+                    received.extend(chunk)
+                if bytes(received) != expected:
+                    raise RuntimeError(f"unexpected sendfile payload size={len(received)}")
+                writer.close()
+                await writer.wait_closed()
+            await server_task
+        finally:
+            listener.close()
+            await server_task
 
 
 BENCHMARKS: dict[str, BenchmarkSpec] = {
@@ -3049,6 +3405,30 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         unit="messages",
         func=bench_udp_fanout,
     ),
+    "udp_datagram_endpoint": BenchmarkSpec(
+        name="udp_datagram_endpoint",
+        description="Datagram endpoint echo using create_datagram_endpoint()",
+        category="datagram",
+        default_iterations=8_192,
+        unit="messages",
+        func=bench_udp_datagram_endpoint,
+    ),
+    "udp_sock_sendto_recvfrom": BenchmarkSpec(
+        name="udp_sock_sendto_recvfrom",
+        description="UDP echo using loop.sock_sendto() and loop.sock_recvfrom()",
+        category="datagram",
+        default_iterations=8_192,
+        unit="messages",
+        func=bench_udp_sock_sendto_recvfrom,
+    ),
+    "udp_sock_sendto_recvfrom_into": BenchmarkSpec(
+        name="udp_sock_sendto_recvfrom_into",
+        description="UDP echo using loop.sock_sendto() and loop.sock_recvfrom_into()",
+        category="datagram",
+        default_iterations=8_192,
+        unit="messages",
+        func=bench_udp_sock_sendto_recvfrom_into,
+    ),
     "tcp_connect": BenchmarkSpec(
         name="tcp_connect",
         description="Connection open/close churn against a local server",
@@ -3141,7 +3521,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         name="uds_connect",
         description="Sequential AF_UNIX connect/close churn against a local listener",
         category="raw-socket",
-        default_iterations=256,
+        default_iterations=64,
         unit="connections",
         func=bench_uds_connect_close,
     ),
@@ -3149,7 +3529,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         name="uds_connect_parallel",
         description="Many AF_UNIX connections opened and closed concurrently",
         category="raw-socket",
-        default_iterations=256,
+        default_iterations=64,
         unit="connections",
         func=bench_uds_connect_parallel,
     ),
@@ -3165,15 +3545,55 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         name="uds_idle_fanout",
         description="Open many idle AF_UNIX connections and tear them down",
         category="raw-socket",
-        default_iterations=256,
+        default_iterations=64,
         unit="connections",
         func=bench_uds_idle_fanout,
+    ),
+    "pipe_read": BenchmarkSpec(
+        name="pipe_read",
+        description="Read through connect_read_pipe() from an in-memory pipe producer",
+        category="ipc",
+        default_iterations=8_192,
+        unit="chunks",
+        func=bench_pipe_read,
+    ),
+    "pipe_write": BenchmarkSpec(
+        name="pipe_write",
+        description="Write through connect_write_pipe() into a draining pipe reader",
+        category="ipc",
+        default_iterations=8_192,
+        unit="chunks",
+        func=bench_pipe_write,
+    ),
+    "subprocess_exec": BenchmarkSpec(
+        name="subprocess_exec",
+        description="Spawn short-lived subprocesses with create_subprocess_exec()",
+        category="ipc",
+        default_iterations=64,
+        unit="processes",
+        func=bench_subprocess_exec,
+    ),
+    "subprocess_shell": BenchmarkSpec(
+        name="subprocess_shell",
+        description="Spawn short-lived subprocesses with create_subprocess_shell()",
+        category="ipc",
+        default_iterations=64,
+        unit="processes",
+        func=bench_subprocess_shell,
+    ),
+    "signal_handler_churn": BenchmarkSpec(
+        name="signal_handler_churn",
+        description="Register, deliver, and remove a signal handler each iteration",
+        category="signals",
+        default_iterations=256,
+        unit="signals",
+        func=bench_signal_handler_churn,
     ),
     "http1_connect_per_request": BenchmarkSpec(
         name="http1_connect_per_request",
         description="HTTP/1.1 request-per-connection churn with small responses",
         category="stream",
-        default_iterations=2_048,
+        default_iterations=256,
         unit="requests",
         func=bench_http1_connect_per_request,
     ),
@@ -3216,6 +3636,22 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         default_iterations=2_048,
         unit="requests",
         func=bench_tls_http1_keepalive,
+    ),
+    "start_tls_upgrade": BenchmarkSpec(
+        name="start_tls_upgrade",
+        description="Plaintext to TLS connection upgrades via StreamWriter.start_tls()",
+        category="stream",
+        default_iterations=1,
+        unit="connections",
+        func=bench_start_tls_upgrade,
+    ),
+    "sock_sendfile": BenchmarkSpec(
+        name="sock_sendfile",
+        description="TCP file transfer through loop.sock_sendfile()",
+        category="stream",
+        default_iterations=64,
+        unit="transfers",
+        func=bench_sock_sendfile,
     ),
     "websocket_echo_parallel": BenchmarkSpec(
         name="websocket_echo_parallel",
@@ -3284,7 +3720,7 @@ PROFILE_BENCHMARKS = {
         "tcp_sock_1b",
         "tcp_connect",
     ],
-    "full": list(BENCHMARKS),
+    "full": [name for name in BENCHMARKS if name != "start_tls_upgrade"],
 }
 
 
