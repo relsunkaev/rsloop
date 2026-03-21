@@ -125,6 +125,7 @@ pub(crate) struct StreamCore {
     read_paused: bool,
     reader_registered: bool,
     writer_registered: bool,
+    write_waiting_for_writable: bool,
     eof_requested: bool,
     eof_sent: bool,
     protocol_paused: bool,
@@ -466,6 +467,7 @@ impl StreamTransport {
                 read_paused: false,
                 reader_registered: false,
                 writer_registered: false,
+                write_waiting_for_writable: false,
                 eof_requested: false,
                 eof_sent: false,
                 protocol_paused: false,
@@ -615,7 +617,8 @@ impl StreamTransport {
             return Ok(());
         }
         transport.read_paused = false;
-        transport.sync_interest(py)
+        transport.sync_interest(py)?;
+        transport.on_readable(py)
     }
 
     fn _on_readable(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
@@ -736,6 +739,7 @@ impl StreamCore {
                     self.queue_write_bytes(py, tail, sent)?;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    record_stream_profile_event("write_direct_would_block", self.fd, bytes.len(), 0);
                     self.queue_write_bytes(py, data.clone().unbind(), 0)?;
                 }
                 Err(err) => {
@@ -769,6 +773,7 @@ impl StreamCore {
                     self.queue_write_bytes(py, PyBytes::new(py, &data[sent..]).unbind(), sent)?;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    record_stream_profile_event("write_direct_would_block", self.fd, data.len(), 0);
                     self.queue_write_bytes(py, PyBytes::new(py, data).unbind(), 0)?;
                 }
                 Err(err) => {
@@ -911,26 +916,47 @@ impl StreamCore {
     }
 
     pub(crate) fn on_writable(&mut self, py: Python<'_>) -> PyResult<()> {
+        record_stream_profile_event("write_ready", self.fd, self.pending_write_bytes, self.write_queue.len());
+        self.write_waiting_for_writable = false;
+        self.sync_interest(py)?;
         self.schedule_write_phase(py)
     }
 
     pub(crate) fn flush_write_phase(&mut self, py: Python<'_>) -> PyResult<()> {
+        let queued_before = self.pending_write_bytes;
+        let mut phase_sent = 0usize;
         if trace_stream_enabled() {
             eprintln!(
                 "stream-transport writable fd={} queued={}",
                 self.fd, self.pending_write_bytes
             );
         }
+        record_stream_profile_event("write_phase_start", self.fd, queued_before, self.write_queue.len());
         while !self.write_queue.is_empty() {
             match self.flush_write_once(py) {
-                Ok(0) => break,
+                Ok(0) => {
+                    self.write_waiting_for_writable = true;
+                    self.sync_interest(py)?;
+                    break;
+                }
                 Ok(sent) => {
+                    phase_sent += sent;
                     record_stream_profile_event("write_flush", self.fd, sent, self.pending_write_bytes);
                     if trace_stream_enabled() {
                         eprintln!("stream-transport wrote fd={} bytes={}", self.fd, sent);
                     }
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.write_waiting_for_writable = true;
+                    self.sync_interest(py)?;
+                    record_stream_profile_event(
+                        "write_would_block",
+                        self.fd,
+                        self.pending_write_bytes,
+                        self.write_queue.len(),
+                    );
+                    break;
+                }
                 Err(err) => {
                     return self.finish_close(
                         py,
@@ -943,6 +969,7 @@ impl StreamCore {
                 }
             }
         }
+        record_stream_profile_event("write_phase_end", self.fd, phase_sent, self.pending_write_bytes);
 
         if self.pending_write_bytes == 0 {
             self.remove_writer(py)?;
@@ -1057,6 +1084,7 @@ impl StreamCore {
         self.closed = true;
         self.closing = true;
         self.write_queued = false;
+        self.write_waiting_for_writable = false;
         self.registry
             .bind(py)
             .borrow()
@@ -1094,10 +1122,17 @@ impl StreamCore {
 
     fn sync_interest(&mut self, py: Python<'_>) -> PyResult<()> {
         let readable = !self.read_paused && !self.closed && !self.closing;
-        let writable =
-            !self.closed && (self.pending_write_bytes != 0 || (self.closing && !self.closed));
+        let writable = !self.closed && self.write_waiting_for_writable;
         if readable == self.reader_registered && writable == self.writer_registered {
             return Ok(());
+        }
+        if writable != self.writer_registered {
+            record_stream_profile_event(
+                if writable { "write_interest_on" } else { "write_interest_off" },
+                self.fd,
+                self.pending_write_bytes,
+                self.write_queue.len(),
+            );
         }
         if trace_stream_enabled() {
             eprintln!(
@@ -1130,6 +1165,7 @@ impl StreamCore {
         }
         self.protocol.bind(py).call_method0("pause_writing")?;
         self.protocol_paused = true;
+        record_stream_profile_event("pause_writing", self.fd, self.pending_write_bytes, self.write_queue.len());
         Ok(())
     }
 
@@ -1139,6 +1175,7 @@ impl StreamCore {
         }
         self.protocol.bind(py).call_method0("resume_writing")?;
         self.protocol_paused = false;
+        record_stream_profile_event("resume_writing", self.fd, self.pending_write_bytes, self.write_queue.len());
         self.queue_pending_drains(py, None)?;
         Ok(())
     }
@@ -1338,6 +1375,7 @@ impl StreamCore {
             .call_method0("create_future")?
             .unbind();
         self.pending_drains.push(future.clone_ref(py));
+        record_stream_profile_event("drain_wait", self.fd, self.pending_write_bytes, self.pending_drains.len());
         Ok(future)
     }
 
@@ -1425,6 +1463,12 @@ impl StreamCore {
         if self.pending_drains.is_empty() {
             return Ok(());
         }
+        record_stream_profile_event(
+            if exception.is_some() { "drain_fail" } else { "drain_ready" },
+            self.fd,
+            self.pending_write_bytes,
+            self.pending_drains.len(),
+        );
         let completions = std::mem::take(&mut self.pending_drains);
         let value = py.None();
         for future in completions {
