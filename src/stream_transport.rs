@@ -110,6 +110,7 @@ pub(crate) struct StreamCore {
     sock: Py<PyAny>,
     fd: RawFd,
     protocol: Py<PyAny>,
+    buffered_protocol: bool,
     loop_obj: Py<PyAny>,
     poller: Py<TokioPoller>,
     registry: Py<StreamTransportRegistry>,
@@ -435,6 +436,10 @@ impl StreamTransport {
             Some(extra) => extra,
             None => PyDict::new(py).into_any().unbind(),
         };
+        let buffered_protocol = {
+            let protocol = protocol.bind(py);
+            protocol.hasattr("get_buffer")? && protocol.hasattr("buffer_updated")?
+        };
         let fd = sock.bind(py).call_method0("fileno")?.extract::<i32>()? as RawFd;
         let (buffer, reader_readexactly, close_waiter, limit) =
             if let Some(reader_ref) = reader.as_ref() {
@@ -455,6 +460,7 @@ impl StreamTransport {
                 sock,
                 fd,
                 protocol,
+                buffered_protocol,
                 loop_obj,
                 poller,
                 registry,
@@ -695,11 +701,7 @@ impl StreamTransport {
 
     fn _on_readable(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
         let core = slf.borrow(py).core.clone();
-        let buffered = {
-            let core = core.borrow();
-            let protocol = core.protocol.bind(py);
-            protocol.hasattr("get_buffer")? && protocol.hasattr("buffer_updated")?
-        };
+        let buffered = core.borrow().buffered_protocol;
         if buffered {
             loop {
                 let dispatch = {
@@ -860,9 +862,8 @@ impl StreamCore {
         Ok(())
     }
 
-    fn is_buffered_protocol(&self, py: Python<'_>) -> PyResult<bool> {
-        let protocol = self.protocol.bind(py);
-        Ok(protocol.hasattr("buffer_updated")? && protocol.hasattr("get_buffer")?)
+    fn is_buffered_protocol(&self, _py: Python<'_>) -> PyResult<bool> {
+        Ok(self.buffered_protocol)
     }
 
     fn write_direct_bytes(&mut self, _py: Python<'_>, bytes: &[u8]) -> PyResult<()> {
