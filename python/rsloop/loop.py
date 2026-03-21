@@ -34,6 +34,7 @@ from . import _rsloop
 
 logger = _selector_events.logger
 _ORIGINAL_STREAMWRITER = _streams.StreamWriter
+_ORIGINAL_STREAMREADER_READEXACTLY = _streams.StreamReader.readexactly
 _TIMER_QUANTUM = 0.001 if sys.platform == "darwin" else 0.0
 _TIMER_IMMEDIATE_CUTOFF = _TIMER_QUANTUM * 0.75
 
@@ -149,6 +150,16 @@ class RsloopStreamWriter:
             ssl_shutdown_timeout=ssl_shutdown_timeout,
         )
         self._transport = new_transport
+        self.write = new_transport.write
+        self.close = new_transport.close
+        self.drain = self._drain_fallback
+        self.wait_closed = self._wait_closed
+        if self._reader is not None:
+            self._reader._transport = new_transport
+            self._reader.readexactly = _ORIGINAL_STREAMREADER_READEXACTLY.__get__(
+                self._reader,
+                type(self._reader),
+            )
         protocol._replace_transport(new_transport)
 
 
