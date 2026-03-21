@@ -736,7 +736,7 @@ impl StreamCore {
                 }
                 Ok(sent) => {
                     let tail = PyBytes::new(py, &bytes[sent..]).unbind();
-                    self.queue_write_bytes(py, tail, sent)?;
+                    self.queue_write_bytes(py, tail, 0)?;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     record_stream_profile_event("write_direct_would_block", self.fd, bytes.len(), 0);
@@ -770,7 +770,7 @@ impl StreamCore {
             match try_send_bytes(self.fd, data) {
                 Ok(sent) if sent == data.len() => return Ok(()),
                 Ok(sent) => {
-                    self.queue_write_bytes(py, PyBytes::new(py, &data[sent..]).unbind(), sent)?;
+                    self.queue_write_bytes(py, PyBytes::new(py, &data[sent..]).unbind(), 0)?;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     record_stream_profile_event("write_direct_would_block", self.fd, data.len(), 0);
@@ -919,7 +919,7 @@ impl StreamCore {
         record_stream_profile_event("write_ready", self.fd, self.pending_write_bytes, self.write_queue.len());
         self.write_waiting_for_writable = false;
         self.sync_interest(py)?;
-        self.schedule_write_phase(py)
+        self.flush_write_phase(py)
     }
 
     pub(crate) fn flush_write_phase(&mut self, py: Python<'_>) -> PyResult<()> {

@@ -16,15 +16,9 @@ const WRITABLE: u8 = 0x02;
 const ALL_INTERESTS: u8 = READABLE | WRITABLE;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-struct FileIdentity {
-    dev: libc::dev_t,
-    ino: libc::ino_t,
-}
-
 struct Registration {
     token: Token,
     interest: u8,
-    identity: FileIdentity,
 }
 
 struct PollerState {
@@ -57,33 +51,54 @@ impl PollerState {
             return Ok(());
         }
 
-        let identity = file_identity(fd)?;
-        if let Some(existing) = self.registrations.get_mut(&fd) {
-            if existing.identity != identity {
-                self.remove(fd)?;
-            } else if existing.interest != mask {
-                let mut source = SourceFd(&fd);
-                self.poll
-                    .registry()
-                    .reregister(&mut source, existing.token, to_interest(mask))?;
-                existing.interest = mask;
+        if let Some((token, interest)) = self
+            .registrations
+            .get(&fd)
+            .map(|existing| (existing.token, existing.interest))
+        {
+            if interest == mask {
                 return Ok(());
-            } else {
-                return Ok(());
+            }
+
+            let mut source = SourceFd(&fd);
+            match self
+                .poll
+                .registry()
+                .reregister(&mut source, token, to_interest(mask))
+            {
+                Ok(()) => {
+                    if let Some(existing) = self.registrations.get_mut(&fd) {
+                        existing.interest = mask;
+                    }
+                    return Ok(());
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    self.registrations.remove(&fd);
+                }
+                Err(err) => return Err(err),
             }
         }
 
         let token = token_for_fd(fd);
         let mut source = SourceFd(&fd);
-        self.poll
+        match self
+            .poll
             .registry()
-            .register(&mut source, token, to_interest(mask))?;
+            .register(&mut source, token, to_interest(mask))
+        {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                self.poll
+                    .registry()
+                    .reregister(&mut source, token, to_interest(mask))?;
+            }
+            Err(err) => return Err(err),
+        }
         self.registrations.insert(
             fd,
             Registration {
                 token,
                 interest: mask,
-                identity,
             },
         );
         Ok(())
@@ -229,17 +244,4 @@ fn duration_from_secs(timeout: f64) -> Option<Duration> {
     } else {
         Some(Duration::from_secs_f64(timeout))
     }
-}
-
-fn file_identity(fd: RawFd) -> io::Result<FileIdentity> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let stat = unsafe { stat.assume_init() };
-    Ok(FileIdentity {
-        dev: stat.st_dev,
-        ino: stat.st_ino,
-    })
 }

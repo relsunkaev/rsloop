@@ -4,8 +4,10 @@ import asyncio
 import collections
 import errno
 import functools
+import math
 import selectors
 import socket
+import sys
 from asyncio import base_events as _base_events
 from asyncio import constants as _constants
 from asyncio import events as _events
@@ -21,6 +23,8 @@ from . import _rsloop
 
 logger = _selector_events.logger
 _ORIGINAL_STREAMWRITER = _streams.StreamWriter
+_TIMER_QUANTUM = 0.001 if sys.platform == "darwin" else 0.0
+_TIMER_IMMEDIATE_CUTOFF = _TIMER_QUANTUM * 0.75
 
 
 class RsloopStreamWriter:
@@ -475,18 +479,18 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         self._check_closed()
         fileno = self._normalize_fd(fd)
         handle = _rsloop.make_handle(callback, args, self, None, None)
-        previous = self._fd_registry.add_reader(fileno, handle)
+        previous, readable, writable = self._fd_registry.add_reader(fileno, handle)
         if previous is not None:
             previous.cancel()
-        self._sync_fd_state(fileno)
+        self._poller.set_interest(fileno, readable, writable)
         return handle
 
     def _remove_reader(self, fd: Any) -> bool:
         if self.is_closed():
             return False
         fileno = self._normalize_fd(fd)
-        handle = self._fd_registry.remove_reader(fileno)
-        self._sync_fd_state(fileno)
+        handle, readable, writable = self._fd_registry.remove_reader(fileno)
+        self._poller.set_interest(fileno, readable, writable)
         if handle is not None:
             handle.cancel()
             return True
@@ -504,18 +508,18 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         self._check_closed()
         fileno = self._normalize_fd(fd)
         handle = _rsloop.make_handle(callback, args, self, None, None)
-        previous = self._fd_registry.add_writer(fileno, handle)
+        previous, readable, writable = self._fd_registry.add_writer(fileno, handle)
         if previous is not None:
             previous.cancel()
-        self._sync_fd_state(fileno)
+        self._poller.set_interest(fileno, readable, writable)
         return handle
 
     def _remove_writer(self, fd: Any) -> bool:
         if self.is_closed():
             return False
         fileno = self._normalize_fd(fd)
-        handle = self._fd_registry.remove_writer(fileno)
-        self._sync_fd_state(fileno)
+        handle, readable, writable = self._fd_registry.remove_writer(fileno)
+        self._poller.set_interest(fileno, readable, writable)
         if handle is not None:
             handle.cancel()
             return True
@@ -572,6 +576,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
     ) -> _events.TimerHandle:
         if delay is None:
             raise TypeError("delay must not be None")
+        delay = self._quantize_timer_delay(delay)
         if delay <= 0:
             return self.call_soon(callback, *args, context=context)
         return self.call_at(self.time() + delay, callback, *args, context=context)
@@ -609,6 +614,13 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         self._scheduler.push_timer(timer, when)
         return timer
 
+    def _quantize_timer_delay(self, delay: float) -> float:
+        if _TIMER_QUANTUM <= 0.0:
+            return delay
+        if delay < _TIMER_IMMEDIATE_CUTOFF:
+            return 0.0
+        return math.ceil(delay / _TIMER_QUANTUM) * _TIMER_QUANTUM
+
     def _timer_handle_cancelled(self, handle: _events.TimerHandle) -> None:
         return
 
@@ -618,6 +630,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
             self._native_api,
             self._poller,
             self._rsloop_completion_port,
+            self._fd_registry,
             self._stream_registry,
             self._socket_registry,
             self._stopping,
@@ -641,6 +654,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
                     self._native_api,
                     self._poller,
                     self._rsloop_completion_port,
+                    self._fd_registry,
                     self._stream_registry,
                     self._socket_registry,
                     self._clock_resolution,
@@ -802,14 +816,26 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         if sock.family == socket.AF_INET or (
             _base_events._HAS_IPv6 and sock.family == socket.AF_INET6
         ):
-            resolved = await self._ensure_resolved(
-                address,
-                family=sock.family,
-                type=sock.type,
-                proto=sock.proto,
-                loop=self,
+            host, port = address[:2]
+            info = _base_events._ipaddr_info(
+                host,
+                port,
+                sock.family,
+                sock.type,
+                sock.proto,
+                *address[2:],
             )
-            _, _, _, _, address = resolved[0]
+            if info is None:
+                resolved = await self._ensure_resolved(
+                    address,
+                    family=sock.family,
+                    type=sock.type,
+                    proto=sock.proto,
+                    loop=self,
+                )
+                _, _, _, _, address = resolved[0]
+            else:
+                _, _, _, _, address = info
         try:
             sock.connect(address)
         except (BlockingIOError, InterruptedError):

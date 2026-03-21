@@ -14,6 +14,7 @@ use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 
 use crate::completion::{Completion, CompletionPort};
+use crate::fd_callbacks::FdCallbackRegistry;
 use crate::handles::{
     NativeHandleKind, is_native_cancelled, mark_native_unscheduled, native_handle_kind,
     run_native_handle, take_one_arg_profile_json,
@@ -58,6 +59,7 @@ impl Ord for TimerEntry {
 #[pyclass(module = "rsloop._rsloop")]
 pub struct Scheduler {
     ready_local: Mutex<Vec<Py<PyAny>>>,
+    ready_local_len: AtomicUsize,
     ready_remote: SegQueue<Py<PyAny>>,
     ready_remote_len: AtomicUsize,
     timers: Mutex<BinaryHeap<TimerEntry>>,
@@ -176,6 +178,7 @@ impl Scheduler {
     fn new() -> Self {
         Self {
             ready_local: Mutex::new(Vec::new()),
+            ready_local_len: AtomicUsize::new(0),
             ready_remote: SegQueue::new(),
             ready_remote_len: AtomicUsize::new(0),
             timers: Mutex::new(BinaryHeap::new()),
@@ -198,11 +201,14 @@ impl Scheduler {
     }
 
     fn has_ready(&self) -> bool {
-        self.ready_remote_len.load(AtomicOrdering::Acquire) != 0 || !self.ready_local.lock().is_empty()
+        self.ready_remote_len.load(AtomicOrdering::Acquire) != 0
+            || self.ready_local_len.load(AtomicOrdering::Acquire) != 0
     }
 
     fn pop_ready(&self) -> Vec<Py<PyAny>> {
-        if self.ready_remote_len.load(AtomicOrdering::Acquire) == 0 && self.ready_local.lock().is_empty() {
+        if self.ready_remote_len.load(AtomicOrdering::Acquire) == 0
+            && self.ready_local_len.load(AtomicOrdering::Acquire) == 0
+        {
             return Vec::new();
         }
         let mut batch = Vec::new();
@@ -210,6 +216,7 @@ impl Scheduler {
             let mut ready_local = self.ready_local.lock();
             if !ready_local.is_empty() {
                 batch = std::mem::take(&mut *ready_local);
+                self.ready_local_len.store(0, AtomicOrdering::Release);
             }
         }
         let mut drained_remote = 0usize;
@@ -249,6 +256,7 @@ impl Scheduler {
 
     fn clear(&self, py: Python<'_>) -> PyResult<()> {
         self.ready_local.lock().clear();
+        self.ready_local_len.store(0, AtomicOrdering::Release);
         while self.ready_remote.pop().is_some() {}
         self.ready_remote_len.store(0, AtomicOrdering::Release);
         let mut timers = self.timers.lock();
@@ -264,7 +272,7 @@ impl Scheduler {
             .store(usize::from(stopping), AtomicOrdering::Release);
     }
 
-    #[pyo3(signature = (loop_obj, native_api, poller, completion_port, stream_registry, socket_registry, stopping, clock_resolution, debug, slow_callback_duration))]
+    #[pyo3(signature = (loop_obj, native_api, poller, completion_port, fd_registry, stream_registry, socket_registry, stopping, clock_resolution, debug, slow_callback_duration))]
     fn run_once(
         &self,
         py: Python<'_>,
@@ -272,6 +280,7 @@ impl Scheduler {
         native_api: Option<Py<LoopApi>>,
         poller: PyRef<'_, TokioPoller>,
         completion_port: PyRef<'_, CompletionPort>,
+        fd_registry: Option<Py<FdCallbackRegistry>>,
         stream_registry: Option<Py<StreamTransportRegistry>>,
         socket_registry: Option<Py<SocketStateRegistry>>,
         stopping: bool,
@@ -292,6 +301,7 @@ impl Scheduler {
             &completion_port,
             self_pipe_fd,
             native_api.as_ref(),
+            fd_registry.as_ref(),
             stream_registry.as_ref(),
             socket_registry.as_ref(),
             stopping,
@@ -308,7 +318,7 @@ impl Scheduler {
         )
     }
 
-    #[pyo3(signature = (loop_obj, native_api, poller, completion_port, stream_registry, socket_registry, clock_resolution, debug, slow_callback_duration))]
+    #[pyo3(signature = (loop_obj, native_api, poller, completion_port, fd_registry, stream_registry, socket_registry, clock_resolution, debug, slow_callback_duration))]
     fn run_forever_native(
         &self,
         py: Python<'_>,
@@ -316,6 +326,7 @@ impl Scheduler {
         native_api: Option<Py<LoopApi>>,
         poller: PyRef<'_, TokioPoller>,
         completion_port: PyRef<'_, CompletionPort>,
+        fd_registry: Option<Py<FdCallbackRegistry>>,
         stream_registry: Option<Py<StreamTransportRegistry>>,
         socket_registry: Option<Py<SocketStateRegistry>>,
         clock_resolution: f64,
@@ -344,6 +355,7 @@ impl Scheduler {
                 &completion_port,
                 self_pipe_fd,
                 native_api.as_ref(),
+                fd_registry.as_ref(),
                 stream_registry.as_ref(),
                 socket_registry.as_ref(),
                 false,
@@ -412,6 +424,7 @@ impl Scheduler {
         completion_port: &CompletionPort,
         self_pipe_fd: Option<i32>,
         native_api: Option<&Py<LoopApi>>,
+        fd_registry: Option<&Py<FdCallbackRegistry>>,
         stream_registry: Option<&Py<StreamTransportRegistry>>,
         socket_registry: Option<&Py<SocketStateRegistry>>,
         stopping: bool,
@@ -428,6 +441,7 @@ impl Scheduler {
     ) -> PyResult<()> {
         let mut stats = stats;
         let mut tick = TickSample::default();
+        let mut generic_ready_handles = Vec::new();
         if let Some(native_api) = native_api {
             let native_api = native_api.bind(py);
             let mut fallback = native_api.borrow().drain_ready_fallback();
@@ -453,7 +467,7 @@ impl Scheduler {
             self.next_timer_inner(py)?
         };
         let timeout = if has_ready || stopping {
-                    Some(0.0)
+            Some(0.0)
         } else {
             match next_timer {
                 Some(when) => {
@@ -528,9 +542,13 @@ impl Scheduler {
                     generic_fd_events.push((fd, mask));
                 }
                 if !generic_fd_events.is_empty() {
-                    loop_obj
-                        .bind(py)
-                        .call_method1("_process_fd_events", (&*generic_fd_events,))?;
+                    collect_generic_fd_events(
+                        py,
+                        loop_obj,
+                        fd_registry,
+                        &*generic_fd_events,
+                        &mut generic_ready_handles,
+                    )?;
                 }
             } else if let Some(socket_registry) = socket_registry {
                 let socket_registry = socket_registry.bind(py);
@@ -553,9 +571,13 @@ impl Scheduler {
                     }
                 }
                 if !generic_fd_events.is_empty() {
-                    loop_obj
-                        .bind(py)
-                        .call_method1("_process_fd_events", (&*generic_fd_events,))?;
+                    collect_generic_fd_events(
+                        py,
+                        loop_obj,
+                        fd_registry,
+                        &*generic_fd_events,
+                        &mut generic_ready_handles,
+                    )?;
                 }
             } else {
                 let mut python_fd_events = Vec::new();
@@ -572,9 +594,13 @@ impl Scheduler {
                     python_fd_events.push((fd, mask));
                 }
                 if !python_fd_events.is_empty() {
-                    loop_obj
-                        .bind(py)
-                        .call_method1("_process_fd_events", (&*python_fd_events,))?;
+                    collect_generic_fd_events(
+                        py,
+                        loop_obj,
+                        fd_registry,
+                        &*python_fd_events,
+                        &mut generic_ready_handles,
+                    )?;
                 }
             }
             if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
@@ -607,6 +633,9 @@ impl Scheduler {
             if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
                 stats.timers += started.elapsed();
             }
+        }
+        for handle in generic_ready_handles.drain(..) {
+            run_ready_handle(py, loop_obj, &handle, debug, slow_callback_duration)?;
         }
         let ready_started = stats.as_ref().map(|_| Instant::now());
         self.run_ready_inner(
@@ -656,6 +685,7 @@ impl Scheduler {
     }
     pub(crate) fn push_ready_inner(&self, handle: Py<PyAny>) {
         self.ready_local.lock().push(handle);
+        self.ready_local_len.fetch_add(1, AtomicOrdering::AcqRel);
     }
 
     pub(crate) fn push_ready_threadsafe_inner(&self, handle: Py<PyAny>) {
@@ -707,7 +737,10 @@ impl Scheduler {
         }
 
         if !due.is_empty() {
+            let due_len = due.len();
             self.ready_local.lock().extend(due);
+            self.ready_local_len
+                .fetch_add(due_len, AtomicOrdering::AcqRel);
         }
 
         Ok(())
@@ -722,7 +755,9 @@ impl Scheduler {
         ready_batch: &mut Vec<Py<PyAny>>,
         tick: &mut TickSample,
     ) -> PyResult<()> {
-        if self.ready_remote_len.load(AtomicOrdering::Acquire) == 0 && self.ready_local.lock().is_empty() {
+        if self.ready_remote_len.load(AtomicOrdering::Acquire) == 0
+            && self.ready_local_len.load(AtomicOrdering::Acquire) == 0
+        {
             return Ok(());
         }
         ready_batch.clear();
@@ -732,6 +767,7 @@ impl Scheduler {
             if !ready_local.is_empty() {
                 ready_local_items = ready_local.len();
                 std::mem::swap(&mut *ready_local, ready_batch);
+                self.ready_local_len.store(0, AtomicOrdering::Release);
             }
         }
         let mut drained_remote = 0usize;
@@ -857,6 +893,26 @@ fn percentile(sorted: &[u32], pct: f64) -> u32 {
     }
     let index = ((sorted.len() - 1) as f64 * pct).round() as usize;
     sorted[index.min(sorted.len() - 1)]
+}
+
+fn collect_generic_fd_events(
+    py: Python<'_>,
+    loop_obj: &Py<PyAny>,
+    fd_registry: Option<&Py<FdCallbackRegistry>>,
+    events: &[(i32, u8)],
+    ready: &mut Vec<Py<PyAny>>,
+) -> PyResult<()> {
+    if let Some(fd_registry) = fd_registry {
+        fd_registry
+            .bind(py)
+            .borrow()
+            .dispatch_handles(py, events, ready)?;
+        return Ok(());
+    }
+    loop_obj
+        .bind(py)
+        .call_method1("_process_fd_events", (events,))?;
+    Ok(())
 }
 
 fn is_cancelled(py: Python<'_>, handle: &Py<PyAny>) -> PyResult<bool> {

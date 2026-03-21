@@ -127,6 +127,7 @@ impl StreamTransportRegistry {
 
     pub(crate) fn flush_write_queue(&self, py: Python<'_>) -> PyResult<usize> {
         let mut flushed = 0usize;
+        let mut pending = Vec::new();
         loop {
             let drained = {
                 let mut queued = self.write_queue.borrow_mut();
@@ -135,10 +136,12 @@ impl StreamTransportRegistry {
                 }
                 std::mem::take(&mut *queued)
             };
-            for (fd, token) in drained {
-                let index = fd as usize;
-                let transport = {
-                    let segments = self.segments.borrow();
+            pending.clear();
+            pending.reserve(drained.len());
+            {
+                let segments = self.segments.borrow();
+                for (fd, token) in drained {
+                    let index = fd as usize;
                     let Some(segment) = segments
                         .get(index >> SEGMENT_BITS)
                         .and_then(|segment| segment.as_ref())
@@ -148,8 +151,10 @@ impl StreamTransportRegistry {
                     let Some(transport) = segment[index & SEGMENT_MASK].as_ref() else {
                         continue;
                     };
-                    transport.clone()
-                };
+                    pending.push((transport.clone(), token));
+                }
+            }
+            for (transport, token) in pending.drain(..) {
                 let mut transport = transport.borrow_mut();
                 if transport.stream_token != token || transport.closed {
                     continue;

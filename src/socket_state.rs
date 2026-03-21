@@ -22,7 +22,7 @@ struct PendingRecv {
 
 struct PendingRecvInto {
     future: Py<PyAny>,
-    buffer: Py<PyAny>,
+    buffer: PyBuffer<u8>,
 }
 
 struct PendingAccept {
@@ -47,7 +47,7 @@ impl PendingRead {
 
 struct PendingSend {
     future: Py<PyAny>,
-    data: Py<PyAny>,
+    data: PyBuffer<u8>,
     len: usize,
     sent: usize,
 }
@@ -124,8 +124,7 @@ impl SocketState {
         future: Py<PyAny>,
         buffer: Py<PyAny>,
     ) -> PyResult<()> {
-        // Validate once up front so the async path doesn't fail after registration.
-        let _ = bytes_like_len(buffer.bind(py))?;
+        let buffer = writable_buffer(&buffer.bind(py))?;
         self.core.borrow_mut().reads
             .push_back(PendingRead::RecvInto(PendingRecvInto { future, buffer }));
         self.core.borrow().sync_interest(py)
@@ -144,7 +143,8 @@ impl SocketState {
         data: Bound<'_, PyAny>,
         sent: usize,
     ) -> PyResult<()> {
-        let data_len = bytes_like_len(&data)?;
+        let buffer = readable_buffer(&data)?;
+        let data_len = buffer.len_bytes();
         let sent = sent.min(data_len);
         if sent == data_len {
             if !future_done(py, &future)? {
@@ -154,7 +154,7 @@ impl SocketState {
         }
         self.core.borrow_mut().writes.push_back(PendingSend {
             future,
-            data: data.unbind(),
+            data: buffer,
             len: data_len,
             sent,
         });
@@ -233,7 +233,7 @@ impl SocketCore {
                         }
                     }
                 }
-                PendingRead::RecvInto(op) => match recv_into_object(py, self.fd, &op.buffer)? {
+                PendingRead::RecvInto(op) => match recv_into_buffer(py, self.fd, &op.buffer)? {
                     Ok(0) => {
                         let PendingRead::RecvInto(op) =
                             self.reads.pop_front().expect("front above")
@@ -349,7 +349,7 @@ impl SocketCore {
                 self.writes.pop_front();
                 continue;
             }
-            match send_from_object(py, self.fd, &op.data, op.sent, op.len)? {
+            match send_from_buffer(py, self.fd, &op.data, op.sent, op.len)? {
                 Ok(0) => break,
                 Ok(n) => {
                     op.sent += n;
@@ -424,16 +424,11 @@ fn future_done(py: Python<'_>, future: &Py<PyAny>) -> PyResult<bool> {
     future.bind(py).call_method0("done")?.is_truthy()
 }
 
-fn bytes_like_len(obj: &Bound<'_, PyAny>) -> PyResult<usize> {
-    Ok(PyBuffer::<u8>::get(obj)?.len_bytes())
-}
-
-fn recv_into_object(
+fn recv_into_buffer(
     py: Python<'_>,
     fd: RawFd,
-    buffer_obj: &Py<PyAny>,
+    buffer: &PyBuffer<u8>,
 ) -> PyResult<io::Result<usize>> {
-    let buffer = PyBuffer::<u8>::get(&buffer_obj.bind(py))?;
     let Some(cells) = buffer.as_mut_slice(py) else {
         return Err(PyRuntimeError::new_err(
             "recv_into() requires a writable C-contiguous buffer",
@@ -443,15 +438,14 @@ fn recv_into_object(
     Ok(recv_into(fd, slice))
 }
 
-fn send_from_object(
+fn send_from_buffer(
     py: Python<'_>,
     fd: RawFd,
-    data: &Py<PyAny>,
+    data: &PyBuffer<u8>,
     sent: usize,
     len: usize,
 ) -> PyResult<io::Result<usize>> {
-    let buffer = PyBuffer::<u8>::get(&data.bind(py))?;
-    let Some(cells) = buffer.as_slice(py) else {
+    let Some(cells) = data.as_slice(py) else {
         return Err(PyRuntimeError::new_err(
             "sock_sendall() requires a C-contiguous bytes-like object",
         ));
@@ -462,6 +456,26 @@ fn send_from_object(
         return Ok(Ok(0));
     }
     Ok(send_from(fd, &bytes[sent..end]))
+}
+
+fn writable_buffer(obj: &Bound<'_, PyAny>) -> PyResult<PyBuffer<u8>> {
+    let buffer = PyBuffer::<u8>::get(obj)?;
+    if buffer.as_mut_slice(obj.py()).is_none() {
+        return Err(PyRuntimeError::new_err(
+            "recv_into() requires a writable C-contiguous buffer",
+        ));
+    }
+    Ok(buffer)
+}
+
+fn readable_buffer(obj: &Bound<'_, PyAny>) -> PyResult<PyBuffer<u8>> {
+    let buffer = PyBuffer::<u8>::get(obj)?;
+    if buffer.as_slice(obj.py()).is_none() {
+        return Err(PyRuntimeError::new_err(
+            "sock_sendall() requires a C-contiguous bytes-like object",
+        ));
+    }
+    Ok(buffer)
 }
 
 fn accept_socket(py: Python<'_>, sock: &Py<PyAny>) -> PyResult<Py<PyAny>> {
