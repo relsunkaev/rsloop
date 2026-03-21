@@ -1444,9 +1444,28 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
             ssl_handshake_timeout=ssl_handshake_timeout,
             ssl_shutdown_timeout=ssl_shutdown_timeout,
         )
-        _selector_events._SelectorSocketTransport(
-            self, rawsock, ssl_protocol, None, extra, server
-        )
+        stream_transport_type = getattr(_rsloop, "StreamTransport", None)
+        if stream_transport_type is not None:
+            extra = {} if extra is None else dict(extra)
+            low_level_transport = stream_transport_type(
+                rawsock,
+                ssl_protocol,
+                self,
+                self._poller,
+                self._stream_registry,
+                self._transports,
+                extra,
+                None,
+                65536,
+            )
+            ssl_protocol.connection_made(low_level_transport)
+            activate = getattr(low_level_transport, "activate", None)
+            if activate is not None:
+                activate()
+        else:
+            _selector_events._SelectorSocketTransport(
+                self, rawsock, ssl_protocol, None, extra, server
+            )
         return ssl_protocol._app_transport
 
     async def _create_connection_transport(

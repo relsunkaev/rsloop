@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import base64
 import datetime as dt
+import errno
 import hashlib
 import importlib.metadata as importlib_metadata
 import json
@@ -281,6 +282,10 @@ class BenchmarkSpec:
     default_iterations: int
     unit: str
     func: BenchFn
+
+
+class BenchmarkSkipped(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -936,12 +941,22 @@ async def bench_tcp_accept_burst(count: int) -> None:
     host, port = server.sockets[0].getsockname()[:2]
 
     async def client() -> asyncio.StreamWriter:
-        _reader, writer = await asyncio.open_connection(host, port)
-        return writer
+        while True:
+            try:
+                _reader, writer = await asyncio.open_connection(host, port)
+            except TimeoutError:
+                await asyncio.sleep(0)
+                continue
+            except OSError as exc:
+                if exc.errno in {errno.ETIMEDOUT, errno.ECONNREFUSED, 60}:
+                    await asyncio.sleep(0)
+                    continue
+                raise
+            return writer
 
     clients: list[asyncio.StreamWriter] = []
     try:
-        batch_size = 32
+        batch_size = 8
         for start in range(0, count, batch_size):
             clients.extend(
                 await asyncio.gather(
@@ -2004,6 +2019,24 @@ async def http1_roundtrip(
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         label_stream_endpoint(reader, writer, "server")
         try:
+            if close_each_request:
+                await read_http_request_headers(reader)
+                if request_body_size:
+                    body = await read_fixed_body(reader, request_body_size, request_chunk_size)
+                    if body != request_body:
+                        raise RuntimeError(f"unexpected request body size={len(body)}")
+                writer.write(response_head)
+                if response_chunk_size is None:
+                    writer.write(response_body)
+                    await writer.drain()
+                else:
+                    await write_fixed_body(
+                        writer,
+                        response_body,
+                        response_chunk_size,
+                        flush=True,
+                    )
+                return
             while True:
                 await read_http_request_headers(reader)
                 if request_body_size:
@@ -2031,19 +2064,33 @@ async def http1_roundtrip(
         handle,
         "127.0.0.1",
         0,
+        backlog=max(256, count),
         ssl=server_sslcontext,
     )
     host, port = server.sockets[0].getsockname()[:2]
 
-    async def client(iterations: int) -> None:
-        if close_each_request:
-            for index in range(iterations):
-                reader, writer = await asyncio.open_connection(
+    async def open_client_connection() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        while True:
+            try:
+                return await asyncio.open_connection(
                     host,
                     port,
                     ssl=client_sslcontext,
                     server_hostname=server_hostname,
                 )
+            except TimeoutError:
+                await asyncio.sleep(0)
+                continue
+            except OSError as exc:
+                if exc.errno in {errno.ETIMEDOUT, errno.ECONNREFUSED, 60}:
+                    await asyncio.sleep(0)
+                    continue
+                raise
+
+    async def client(iterations: int) -> None:
+        if close_each_request:
+            for index in range(iterations):
+                reader, writer = await open_client_connection()
                 label_stream_endpoint(reader, writer, "client")
                 try:
                     writer.write(request_head)
@@ -2069,12 +2116,7 @@ async def http1_roundtrip(
                     await asyncio.sleep(0)
             return
 
-        reader, writer = await asyncio.open_connection(
-            host,
-            port,
-            ssl=client_sslcontext,
-            server_hostname=server_hostname,
-        )
+        reader, writer = await open_client_connection()
         label_stream_endpoint(reader, writer, "client")
         try:
             for _ in range(iterations):
@@ -2668,22 +2710,37 @@ async def bench_tls_handshake_parallel(count: int) -> None:
         writer.close()
         await writer.wait_closed()
 
-    server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=server_context)
+    server = await asyncio.start_server(
+        handle, "127.0.0.1", 0, backlog=max(256, count), ssl=server_context
+    )
     host, port = server.sockets[0].getsockname()[:2]
 
     async def client() -> None:
-        reader, writer = await asyncio.open_connection(
-            host,
-            port,
-            ssl=client_context,
-            server_hostname="localhost",
-        )
+        while True:
+            try:
+                reader, writer = await asyncio.open_connection(
+                    host,
+                    port,
+                    ssl=client_context,
+                    server_hostname="localhost",
+                )
+                break
+            except TimeoutError:
+                await asyncio.sleep(0)
+            except OSError as exc:
+                if exc.errno in {errno.ETIMEDOUT, errno.ECONNREFUSED, 60}:
+                    await asyncio.sleep(0)
+                    continue
+                raise
         label_stream_endpoint(reader, writer, "client")
         writer.close()
         await writer.wait_closed()
 
     try:
-        await asyncio.gather(*(client() for _ in range(count)))
+        batch_size = 8
+        for start in range(0, count, batch_size):
+            await asyncio.gather(*(client() for _ in range(min(batch_size, count - start))))
+            await asyncio.sleep(0)
         await done
     finally:
         server.close()
@@ -3720,7 +3777,7 @@ PROFILE_BENCHMARKS = {
         "tcp_sock_1b",
         "tcp_connect",
     ],
-    "full": [name for name in BENCHMARKS if name != "start_tls_upgrade"],
+    "full": list(BENCHMARKS),
 }
 
 
@@ -3736,7 +3793,10 @@ def run_once(
 ) -> tuple[float, dict[str, Any] | None, int]:
     if not isolate_process:
         started = time.perf_counter()
-        run_on_loop(loop_name, spec.func(iterations))
+        try:
+            run_on_loop(loop_name, spec.func(iterations))
+        except BenchmarkSkipped:
+            raise
         return time.perf_counter() - started, None, 0
     return run_once_isolated(
         loop_name,
@@ -3798,11 +3858,15 @@ def run_once_isolated(
             )
         except subprocess.CalledProcessError as exc:
             last_error = exc
-            if attempts <= child_retries:
-                continue
             stderr = (exc.stderr or "").strip()
             stdout = (exc.stdout or "").strip()
             detail = stderr or stdout or "<no child output>"
+            if "NotImplementedError" in detail or "NotImplemented" in detail:
+                raise BenchmarkSkipped(
+                    f"benchmark unsupported for loop={loop_name} benchmark={spec.name}: {detail}"
+                ) from exc
+            if attempts <= child_retries:
+                continue
             raise RuntimeError(
                 f"benchmark child failed for loop={loop_name} benchmark={spec.name} "
                 f"after {attempts} attempt(s): {detail}"
@@ -3844,16 +3908,19 @@ def run_benchmark_group(
         for warmup_index in range(warmups):
             order = rotated_order(loops, warmup_index)
             for loop_name in order:
-                run_once(
-                    loop_name,
-                    spec,
-                    iterations,
-                    profile_runtime,
-                    profile_stream,
-                    profile_python_streams,
-                    isolate_process,
-                    child_retries,
-                )
+                try:
+                    run_once(
+                        loop_name,
+                        spec,
+                        iterations,
+                        profile_runtime,
+                        profile_stream,
+                        profile_python_streams,
+                        isolate_process,
+                        child_retries,
+                    )
+                except BenchmarkSkipped:
+                    continue
 
         for repeat_index in range(repeats):
             order = rotated_order(loops, repeat_index)
@@ -3864,16 +3931,21 @@ def run_benchmark_group(
             }
             retries_used: dict[str, int] = {}
             for loop_name in order:
-                sample, profile, retries_used_count = run_once(
-                    loop_name,
-                    spec,
-                    iterations,
-                    profile_runtime,
-                    profile_stream,
-                    profile_python_streams,
-                    isolate_process,
-                    child_retries,
-                )
+                try:
+                    sample, profile, retries_used_count = run_once(
+                        loop_name,
+                        spec,
+                        iterations,
+                        profile_runtime,
+                        profile_stream,
+                        profile_python_streams,
+                        isolate_process,
+                        child_retries,
+                    )
+                except BenchmarkSkipped:
+                    round_record["samples"][loop_name] = None
+                    retries_used[loop_name] = -1
+                    continue
                 sample_map[loop_name].append(sample)
                 round_record["samples"][loop_name] = sample
                 if retries_used_count:
@@ -3886,27 +3958,33 @@ def run_benchmark_group(
     else:
         for loop_name in loops:
             for _ in range(warmups):
-                run_once(
-                    loop_name,
-                    spec,
-                    iterations,
-                    profile_runtime,
-                    profile_stream,
-                    profile_python_streams,
-                    isolate_process,
-                    child_retries,
-                )
+                try:
+                    run_once(
+                        loop_name,
+                        spec,
+                        iterations,
+                        profile_runtime,
+                        profile_stream,
+                        profile_python_streams,
+                        isolate_process,
+                        child_retries,
+                    )
+                except BenchmarkSkipped:
+                    continue
             for repeat_index in range(repeats):
-                sample, profile, retries_used_count = run_once(
-                    loop_name,
-                    spec,
-                    iterations,
-                    profile_runtime,
-                    profile_stream,
-                    profile_python_streams,
-                    isolate_process,
-                    child_retries,
-                )
+                try:
+                    sample, profile, retries_used_count = run_once(
+                        loop_name,
+                        spec,
+                        iterations,
+                        profile_runtime,
+                        profile_stream,
+                        profile_python_streams,
+                        isolate_process,
+                        child_retries,
+                    )
+                except BenchmarkSkipped:
+                    continue
                 sample_map[loop_name].append(sample)
                 if profile is not None:
                     profile_map[loop_name].append(profile)
@@ -3928,10 +4006,11 @@ def run_benchmark_group(
             iterations=iterations,
             repeats=repeats,
             unit=spec.unit,
-            samples=sample_map[loop_name],
+            samples=samples,
             profiles=profile_map[loop_name] or None,
         )
-        for loop_name in loops
+        for loop_name, samples in sample_map.items()
+        if samples
     ]
     return results, round_records or None
 

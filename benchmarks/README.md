@@ -94,7 +94,7 @@ Capture cross-loop Python stream delivery/write shape for an isolated comparison
 - `default`: balanced comparison set for routine iteration
 - `full`: all runnable scenarios, including heavier mixed-payload stream cases
 - The expanded `full` profile also includes control-plane task/future/timer storms, AF_UNIX raw-socket cases, datagram endpoint and `sock_sendto` / `sock_recvfrom` coverage, pipe and subprocess churn, signal handler churn, HTTP/1.1 request/response cases, TLS handshakes, `sock_sendfile()` transfers, websocket workloads, and application-shaped request/response cases.
-- `start_tls_upgrade` is available as a standalone benchmark for targeted debugging. It is currently excluded from `full` because the rsloop path hangs in the current build.
+- `start_tls_upgrade` exercises plaintext-to-TLS upgrades via `StreamWriter.start_tls()`.
 
 ### Notes
 

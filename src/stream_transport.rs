@@ -1038,6 +1038,9 @@ impl StreamCore {
         if self.closing || self.closed || self.read_paused {
             return Ok(());
         }
+        if self.reader.is_none() {
+            return self.on_readable_protocol(py);
+        }
         let protocol = self.protocol.clone_ref(py);
         let protocol = protocol.bind(py);
         if protocol.hasattr("get_buffer")? && protocol.hasattr("buffer_updated")? {
@@ -1117,6 +1120,45 @@ impl StreamCore {
                     }
                     self.feed_read_buffer_inner(py, n)?;
                     if self.read_paused {
+                        return Ok(());
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) => {
+                    return self.finish_close(
+                        py,
+                        Some(
+                            PyRuntimeError::new_err(err.to_string())
+                                .into_value(py)
+                                .into_any(),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    fn on_readable_protocol(&mut self, py: Python<'_>) -> PyResult<()> {
+        let protocol = self.protocol.clone_ref(py);
+        loop {
+            match recv_into(self.fd, &mut self.read_buffer) {
+                Ok(0) => {
+                    self.remove_reader(py)?;
+                    let keep_open = protocol.bind(py).call_method0("eof_received")?;
+                    if !keep_open.is_truthy()? {
+                        self.finish_close(py, None)?;
+                    }
+                    return Ok(());
+                }
+                Ok(n) => {
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    let payload = PyBytes::new(py, &self.read_buffer[..n]);
+                    if let Err(err) = protocol.bind(py).call_method1("data_received", (payload,)) {
+                        return self.finish_close(py, Some(err.into_value(py).into_any()));
+                    }
+                    if self.closed || self.read_paused {
                         return Ok(());
                     }
                 }
