@@ -5,10 +5,10 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::thread::ThreadId;
 
 use crossbeam_queue::SegQueue;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyCFunction, PyTuple};
+use pyo3::types::{PyAny, PyCFunction, PyDict, PyTuple};
 
 use crate::handles::{make_handle, make_handle_fastcall};
 use crate::scheduler::Scheduler;
@@ -43,6 +43,21 @@ static CALL_AT_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
     ml_flags: ffi::METH_FASTCALL | ffi::METH_KEYWORDS,
     ml_doc: c"Native FASTCALL call_at implementation.".as_ptr(),
 });
+
+static CALL_LATER_DEF: SyncPyMethodDef = SyncPyMethodDef(ffi::PyMethodDef {
+    ml_name: c"call_later".as_ptr(),
+    ml_meth: ffi::PyMethodDefPointer {
+        PyCFunctionFastWithKeywords: loop_api_call_later_fast,
+    },
+    ml_flags: ffi::METH_FASTCALL | ffi::METH_KEYWORDS,
+    ml_doc: c"Native FASTCALL call_later implementation.".as_ptr(),
+});
+
+#[cfg(target_os = "macos")]
+const TIMER_QUANTUM: f64 = 0.001;
+#[cfg(not(target_os = "macos"))]
+const TIMER_QUANTUM: f64 = 0.0;
+const TIMER_IMMEDIATE_CUTOFF: f64 = TIMER_QUANTUM * 0.75;
 
 #[pyclass(module = "rsloop._rsloop")]
 pub struct LoopApi {
@@ -117,6 +132,10 @@ impl LoopApi {
 
     fn bind_call_at(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
         create_bound_fastcall(slf.py(), slf.as_any().as_unbound(), &CALL_AT_DEF.0)
+    }
+
+    fn bind_call_later(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        create_bound_fastcall(slf.py(), slf.as_any().as_unbound(), &CALL_LATER_DEF.0)
     }
 
     fn set_debug(&self, enabled: bool) {
@@ -264,11 +283,21 @@ unsafe extern "C" fn loop_api_call_at_fast(
     run_fastcall(slf, args, nargsf, kwnames, FastcallMode::CallAt)
 }
 
+unsafe extern "C" fn loop_api_call_later_fast(
+    slf: *mut ffi::PyObject,
+    args: *const *mut ffi::PyObject,
+    nargsf: ffi::Py_ssize_t,
+    kwnames: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    run_fastcall(slf, args, nargsf, kwnames, FastcallMode::CallLater)
+}
+
 #[derive(Clone, Copy)]
 enum FastcallMode {
     CallSoon,
     CallSoonThreadsafe,
     CallAt,
+    CallLater,
 }
 
 unsafe fn run_fastcall(
@@ -304,6 +333,7 @@ unsafe fn run_fastcall(
                         FastcallMode::CallSoon => "call_soon",
                         FastcallMode::CallSoonThreadsafe => "call_soon_threadsafe",
                         FastcallMode::CallAt => unreachable!(),
+                        FastcallMode::CallLater => unreachable!(),
                     },
                 )
             }
@@ -316,6 +346,25 @@ unsafe fn run_fastcall(
                 let when = Bound::from_borrowed_ptr(py, *args.add(0)).extract::<f64>()?;
                 (Some(when), 1usize, 2usize, "call_at")
             }
+            FastcallMode::CallLater => {
+                if nargs < 2 {
+                    return Err(PyRuntimeError::new_err(
+                        "call_later requires at least 2 positional arguments",
+                    ));
+                }
+                let delay_obj = Bound::from_borrowed_ptr(py, *args.add(0));
+                if delay_obj.is_none() {
+                    return Err(PyTypeError::new_err("delay must not be None"));
+                }
+                let delay = delay_obj.extract::<f64>()?;
+                let quantized_delay = quantize_timer_delay(delay);
+                if !quantized_delay.is_finite() || quantized_delay > 0.0 {
+                    let loop_obj = api_ref.loop_obj.clone_ref(py);
+                    drop(api_ref);
+                    return call_later_fallback(py, loop_obj, args, nargs, kwcount);
+                }
+                (None, 1usize, 2usize, "call_later")
+            }
         };
 
         let context = parse_context_keyword(py, args, nargs, kwnames, kwcount)?;
@@ -324,7 +373,10 @@ unsafe fn run_fastcall(
 
         let debug = api_ref.debug.load(Ordering::Acquire);
         if debug {
-            if matches!(mode, FastcallMode::CallSoon | FastcallMode::CallAt) {
+            if matches!(
+                mode,
+                FastcallMode::CallSoon | FastcallMode::CallAt | FastcallMode::CallLater
+            ) {
                 api_ref.loop_obj.bind(py).call_method0("_check_thread")?;
             }
             api_ref
@@ -398,6 +450,42 @@ fn keyword_count(kwnames: *mut ffi::PyObject) -> PyResult<usize> {
         return Ok(0);
     }
     Ok(unsafe { ffi::PyTuple_GET_SIZE(kwnames) as usize })
+}
+
+fn quantize_timer_delay(delay: f64) -> f64 {
+    if TIMER_QUANTUM <= 0.0 {
+        return delay;
+    }
+    if delay < TIMER_IMMEDIATE_CUTOFF {
+        return 0.0;
+    }
+    (delay / TIMER_QUANTUM).ceil() * TIMER_QUANTUM
+}
+
+unsafe fn call_later_fallback(
+    py: Python<'_>,
+    loop_obj: Py<PyAny>,
+    raw_args: *const *mut ffi::PyObject,
+    nargs: usize,
+    kwcount: usize,
+) -> PyResult<Py<PyAny>> {
+    let mut positional = Vec::with_capacity(nargs);
+    for index in 0..nargs {
+        positional.push(Bound::from_borrowed_ptr(py, *raw_args.add(index)).unbind());
+    }
+    let args = PyTuple::new(py, positional)?;
+    let kwargs = if kwcount == 0 {
+        None
+    } else {
+        let kwargs = PyDict::new(py);
+        let context = Bound::from_borrowed_ptr(py, *raw_args.add(nargs));
+        kwargs.set_item("context", context)?;
+        Some(kwargs)
+    };
+    loop_obj
+        .bind(py)
+        .call_method("_compat_call_later", args, kwargs.as_ref())
+        .map(Bound::unbind)
 }
 
 unsafe fn parse_context_keyword(

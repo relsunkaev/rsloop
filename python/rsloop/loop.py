@@ -384,6 +384,9 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         self.call_at = self._bind_native_callable(
             "bind_call_at", self._compat_call_at
         )
+        self.call_later = self._bind_native_callable(
+            "bind_call_later", self._compat_call_later
+        )
 
     def _normalize_fd(self, fd: Any) -> int:
         fileno = fd
@@ -571,7 +574,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         self._scheduler.push_ready(handle)
         return handle
 
-    def call_later(
+    def _compat_call_later(
         self, delay: float, callback: Any, *args: Any, context: Any = None
     ) -> _events.TimerHandle:
         if delay is None:
