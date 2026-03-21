@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import datetime as dt
+import hashlib
 import importlib.metadata as importlib_metadata
 import json
 import os
 import platform
+import ssl
+import struct
 import subprocess
 import socket
 import statistics
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -27,6 +32,9 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
 
 LoopFactory = Callable[[], asyncio.AbstractEventLoop] | None
 BenchFn = Callable[[int], Awaitable[None]]
+ABORTIVE_LINGER = struct.pack("ii", 1, 0)
+ISOLATED_CONNECTION_COOLDOWN = 0.1
+CONNECTION_BENCHMARK_COOLDOWN = 0.5
 
 
 class PythonStreamProfiler:
@@ -165,6 +173,44 @@ def label_stream_endpoint(
 ) -> None:
     setattr(reader, "_bench_stream_role", role)
     STREAM_WRITER_ROLES[id(writer)] = role
+
+
+def enable_abortive_close(writer: asyncio.StreamWriter) -> None:
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, ABORTIVE_LINGER)
+    except (AttributeError, OSError, ValueError):
+        return
+
+
+async def close_writer(
+    writer: asyncio.StreamWriter, *, abortive: bool = False
+) -> None:
+    if abortive:
+        enable_abortive_close(writer)
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        if not abortive:
+            raise
+
+
+async def close_writers(
+    writers: list[asyncio.StreamWriter], *, abortive: bool = False
+) -> None:
+    for writer in writers:
+        if abortive:
+            enable_abortive_close(writer)
+        writer.close()
+    for writer in writers:
+        try:
+            await writer.wait_closed()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            if not abortive:
+                raise
 
 
 def percentile(samples: list[float], fraction: float) -> float:
@@ -825,8 +871,7 @@ async def bench_tcp_connect_close(count: int) -> None:
     ) -> None:
         nonlocal accepted
         accepted += 1
-        writer.close()
-        await writer.wait_closed()
+        await close_writer(writer)
         if accepted == count and not done.done():
             done.set_result(None)
 
@@ -836,8 +881,7 @@ async def bench_tcp_connect_close(count: int) -> None:
     try:
         for _ in range(count):
             reader, writer = await asyncio.open_connection(host, port)
-            writer.close()
-            await writer.wait_closed()
+            await close_writer(writer)
         await done
     finally:
         server.close()
@@ -853,8 +897,7 @@ async def bench_tcp_connect_parallel(count: int) -> None:
     ) -> None:
         nonlocal accepted
         accepted += 1
-        writer.close()
-        await writer.wait_closed()
+        await close_writer(writer)
         if accepted == count and not done.done():
             done.set_result(None)
 
@@ -863,8 +906,7 @@ async def bench_tcp_connect_parallel(count: int) -> None:
 
     async def client() -> None:
         _reader, writer = await asyncio.open_connection(host, port)
-        writer.close()
-        await writer.wait_closed()
+        await close_writer(writer)
 
     try:
         await asyncio.gather(*(client() for _ in range(count)))
@@ -900,14 +942,8 @@ async def bench_tcp_accept_burst(count: int) -> None:
         clients = list(await asyncio.gather(*(client() for _ in range(count))))
         await done
     finally:
-        for writer in clients:
-            writer.close()
-        for writer in clients:
-            await writer.wait_closed()
-        for writer in peers:
-            writer.close()
-        for writer in peers:
-            await writer.wait_closed()
+        await close_writers(clients)
+        await close_writers(peers)
         server.close()
         await server.wait_closed()
 
@@ -923,8 +959,7 @@ async def bench_tcp_churn_small_io(count: int) -> None:
             writer.write(data)
             await writer.drain()
         finally:
-            writer.close()
-            await writer.wait_closed()
+            await close_writer(writer)
 
     server = await asyncio.start_server(handle, "127.0.0.1", 0, backlog=max(256, count))
     host, port = server.sockets[0].getsockname()[:2]
@@ -937,8 +972,7 @@ async def bench_tcp_churn_small_io(count: int) -> None:
             data = await reader.readexactly(1)
             if data != payload:
                 raise RuntimeError(f"unexpected payload size={len(data)}")
-            writer.close()
-            await writer.wait_closed()
+            await close_writer(writer)
     finally:
         server.close()
         await server.wait_closed()
@@ -968,14 +1002,8 @@ async def bench_tcp_idle_fanout(count: int) -> None:
             writers.append(writer)
         await done
     finally:
-        for writer in writers:
-            writer.close()
-        for writer in writers:
-            await writer.wait_closed()
-        for writer in peers:
-            writer.close()
-        for writer in peers:
-            await writer.wait_closed()
+        await close_writers(writers, abortive=True)
+        await close_writers(peers, abortive=True)
         server.close()
         await server.wait_closed()
 
@@ -1727,6 +1755,995 @@ async def recv_exact(
     return b"".join(chunks)
 
 
+def build_http1_request_head(
+    method: bytes,
+    path: bytes,
+    body_size: int,
+    *,
+    keep_alive: bool = True,
+    content_type: bytes = b"application/octet-stream",
+) -> bytes:
+    connection = b"keep-alive" if keep_alive else b"close"
+    return (
+        method
+        + b" "
+        + path
+        + b" HTTP/1.1\r\nHost: localhost\r\nConnection: "
+        + connection
+        + b"\r\nContent-Length: "
+        + str(body_size).encode()
+        + b"\r\nContent-Type: "
+        + content_type
+        + b"\r\n\r\n"
+    )
+
+
+def build_http1_response_head(
+    body_size: int,
+    *,
+    keep_alive: bool = True,
+    content_type: bytes = b"application/octet-stream",
+) -> bytes:
+    connection = b"keep-alive" if keep_alive else b"close"
+    return (
+        b"HTTP/1.1 200 OK\r\nConnection: "
+        + connection
+        + b"\r\nContent-Length: "
+        + str(body_size).encode()
+        + b"\r\nContent-Type: "
+        + content_type
+        + b"\r\n\r\n"
+    )
+
+
+async def read_http_request_headers(
+    reader: asyncio.StreamReader,
+) -> tuple[bytes, bytes]:
+    headers = await reader.readuntil(b"\r\n\r\n")
+    request_line = headers.split(b"\r\n", 1)[0]
+    parts = request_line.split(b" ", 2)
+    if len(parts) != 3:
+        raise RuntimeError(f"malformed HTTP request line: {request_line!r}")
+    return headers, parts[1]
+
+
+def http_header_value(headers: bytes, name: bytes) -> bytes:
+    prefix = name.lower() + b": "
+    for line in headers.split(b"\r\n")[1:]:
+        lower = line.lower()
+        if lower.startswith(prefix):
+            return line[len(prefix) :]
+    raise RuntimeError(f"missing HTTP header: {name!r}")
+
+
+async def read_fixed_body(
+    reader: asyncio.StreamReader,
+    size: int,
+    chunk_size: int | None = None,
+) -> bytes:
+    if size == 0:
+        return b""
+    if chunk_size is None or chunk_size >= size:
+        return await reader.readexactly(size)
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        current = min(chunk_size, remaining)
+        chunk = await reader.readexactly(current)
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+async def write_fixed_body(
+    writer: asyncio.StreamWriter,
+    body: bytes,
+    chunk_size: int | None = None,
+    *,
+    flush: bool = False,
+) -> None:
+    if not body:
+        return
+    if chunk_size is None or chunk_size >= len(body):
+        writer.write(body)
+        if flush:
+            await writer.drain()
+        return
+    for offset in range(0, len(body), chunk_size):
+        writer.write(body[offset : offset + chunk_size])
+        if flush:
+            await writer.drain()
+
+
+_TLS_CONTEXTS: tuple[ssl.SSLContext, ssl.SSLContext] | None = None
+
+
+def tls_contexts() -> tuple[ssl.SSLContext, ssl.SSLContext]:
+    global _TLS_CONTEXTS
+    if _TLS_CONTEXTS is not None:
+        return _TLS_CONTEXTS
+
+    tempdir = Path(tempfile.mkdtemp(prefix="rsloop-bench-tls-"))
+    certfile = tempdir / "cert.pem"
+    keyfile = tempdir / "key.pem"
+    completed = subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(keyfile),
+            "-out",
+            str(certfile),
+            "-subj",
+            "/CN=localhost",
+            "-days",
+            "1",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("failed to generate TLS test certificate")
+
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(certfile=str(certfile), keyfile=str(keyfile))
+    client_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    client_context.check_hostname = False
+    client_context.verify_mode = ssl.CERT_NONE
+    _TLS_CONTEXTS = (server_context, client_context)
+    return _TLS_CONTEXTS
+
+
+WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WS_MASK_KEY = b"rswp"
+
+
+def build_websocket_handshake_request(path: bytes) -> tuple[bytes, bytes]:
+    key = base64.b64encode(path + b":rsloop").rstrip(b"=")
+    request = (
+        b"GET "
+        + path
+        + b" HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: "
+        + key
+        + b"\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    )
+    return request, key
+
+
+def build_websocket_accept(key: bytes) -> bytes:
+    return base64.b64encode(hashlib.sha1(key + WS_GUID).digest())
+
+
+def encode_websocket_frame(payload: bytes, *, masked: bool) -> bytes:
+    opcode = 0x1
+    first = 0x80 | opcode
+    length = len(payload)
+    mask_bit = 0x80 if masked else 0x00
+    header = bytearray([first])
+    if length < 126:
+        header.append(mask_bit | length)
+    elif length < 65536:
+        header.append(mask_bit | 126)
+        header.extend(length.to_bytes(2, "big"))
+    else:
+        header.append(mask_bit | 127)
+        header.extend(length.to_bytes(8, "big"))
+    if not masked:
+        return bytes(header) + payload
+    masked_payload = bytes(
+        byte ^ WS_MASK_KEY[index % len(WS_MASK_KEY)]
+        for index, byte in enumerate(payload)
+    )
+    return bytes(header) + WS_MASK_KEY + masked_payload
+
+
+async def read_websocket_frame(reader: asyncio.StreamReader) -> bytes:
+    header = await reader.readexactly(2)
+    masked = bool(header[1] & 0x80)
+    length = header[1] & 0x7F
+    if length == 126:
+        length = int.from_bytes(await reader.readexactly(2), "big")
+    elif length == 127:
+        length = int.from_bytes(await reader.readexactly(8), "big")
+    mask_key = await reader.readexactly(4) if masked else b""
+    payload = await reader.readexactly(length)
+    if masked:
+        payload = bytes(
+            byte ^ mask_key[index % len(mask_key)] for index, byte in enumerate(payload)
+        )
+    return payload
+
+
+async def http1_roundtrip(
+    count: int,
+    *,
+    clients: int = 1,
+    request_method: bytes = b"POST",
+    request_path: bytes = b"/",
+    request_body_size: int,
+    response_body_size: int,
+    request_chunk_size: int | None = None,
+    response_chunk_size: int | None = None,
+    request_content_type: bytes = b"application/octet-stream",
+    response_content_type: bytes = b"application/octet-stream",
+    close_each_request: bool = False,
+    server_sslcontext: ssl.SSLContext | None = None,
+    client_sslcontext: ssl.SSLContext | None = None,
+    server_hostname: str | None = None,
+) -> None:
+    request_body = b"r" * request_body_size
+    response_body = b"s" * response_body_size
+    request_head = build_http1_request_head(
+        request_method,
+        request_path,
+        request_body_size,
+        keep_alive=not close_each_request,
+        content_type=request_content_type,
+    )
+    response_head = build_http1_response_head(
+        response_body_size,
+        keep_alive=not close_each_request,
+        content_type=response_content_type,
+    )
+    per_client_counts = split_evenly(count, clients)
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        label_stream_endpoint(reader, writer, "server")
+        try:
+            while True:
+                await read_http_request_headers(reader)
+                if request_body_size:
+                    body = await read_fixed_body(reader, request_body_size, request_chunk_size)
+                    if body != request_body:
+                        raise RuntimeError(f"unexpected request body size={len(body)}")
+                writer.write(response_head)
+                if response_chunk_size is None:
+                    writer.write(response_body)
+                    await writer.drain()
+                else:
+                    await write_fixed_body(
+                        writer,
+                        response_body,
+                        response_chunk_size,
+                        flush=True,
+                    )
+        except asyncio.IncompleteReadError:
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(
+        handle,
+        "127.0.0.1",
+        0,
+        ssl=server_sslcontext,
+    )
+    host, port = server.sockets[0].getsockname()[:2]
+
+    async def client(iterations: int) -> None:
+        if close_each_request:
+            for _ in range(iterations):
+                reader, writer = await asyncio.open_connection(
+                    host,
+                    port,
+                    ssl=client_sslcontext,
+                    server_hostname=server_hostname,
+                )
+                label_stream_endpoint(reader, writer, "client")
+                try:
+                    writer.write(request_head)
+                    await write_fixed_body(
+                        writer,
+                        request_body,
+                        request_chunk_size,
+                        flush=request_chunk_size is not None,
+                    )
+                    await writer.drain()
+                    await read_http_request_headers(reader)
+                    body = await read_fixed_body(
+                        reader,
+                        response_body_size,
+                        response_chunk_size,
+                    )
+                    if body != response_body:
+                        raise RuntimeError(f"unexpected response body size={len(body)}")
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+            return
+
+        reader, writer = await asyncio.open_connection(
+            host,
+            port,
+            ssl=client_sslcontext,
+            server_hostname=server_hostname,
+        )
+        label_stream_endpoint(reader, writer, "client")
+        try:
+            for _ in range(iterations):
+                writer.write(request_head)
+                await write_fixed_body(
+                    writer,
+                    request_body,
+                    request_chunk_size,
+                    flush=request_chunk_size is not None,
+                )
+                await writer.drain()
+                await read_http_request_headers(reader)
+                body = await read_fixed_body(
+                    reader,
+                    response_body_size,
+                    response_chunk_size,
+                )
+                if body != response_body:
+                    raise RuntimeError(f"unexpected response body size={len(body)}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    try:
+        if clients == 1:
+            await client(count)
+        else:
+            await asyncio.gather(*(client(iterations) for iterations in per_client_counts))
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def websocket_echo_roundtrip(
+    count: int,
+    *,
+    clients: int = 1,
+    payload_size: int,
+    path: bytes = b"/ws",
+) -> None:
+    payload = b"x" * payload_size
+    per_client_counts = split_evenly(count, clients)
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        label_stream_endpoint(reader, writer, "server")
+        try:
+            headers, request_path = await read_http_request_headers(reader)
+            if request_path != path:
+                raise RuntimeError(f"unexpected websocket path: {request_path!r}")
+            key = http_header_value(headers, b"Sec-WebSocket-Key")
+            writer.write(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "
+                + build_websocket_accept(key)
+                + b"\r\n\r\n"
+            )
+            await writer.drain()
+            while True:
+                frame = await read_websocket_frame(reader)
+                if frame != payload:
+                    raise RuntimeError(f"unexpected websocket payload size={len(frame)}")
+                writer.write(encode_websocket_frame(frame, masked=False))
+                await writer.drain()
+        except asyncio.IncompleteReadError:
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    async def client(iterations: int) -> None:
+        reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
+        request, key = build_websocket_handshake_request(path)
+        try:
+            writer.write(request)
+            await writer.drain()
+            response_headers, _response_path = await read_http_request_headers(reader)
+            accept = http_header_value(response_headers, b"Sec-WebSocket-Accept")
+            if accept != build_websocket_accept(key):
+                raise RuntimeError("unexpected websocket handshake response")
+            for _ in range(iterations):
+                writer.write(encode_websocket_frame(payload, masked=True))
+                await writer.drain()
+                echoed = await read_websocket_frame(reader)
+                if echoed != payload:
+                    raise RuntimeError(f"unexpected websocket payload size={len(echoed)}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    try:
+        await asyncio.gather(*(client(iterations) for iterations in per_client_counts))
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def websocket_broadcast(
+    count: int,
+    *,
+    clients: int,
+    payload_size: int,
+    subscriber_path: bytes = b"/sub",
+    producer_path: bytes = b"/pub",
+) -> None:
+    payload = b"x" * payload_size
+    subscribers: list[asyncio.StreamWriter] = []
+    ready = asyncio.get_running_loop().create_future()
+    done = asyncio.get_running_loop().create_future()
+    connected = 0
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal connected
+        label_stream_endpoint(reader, writer, "server")
+        try:
+            headers, request_path = await read_http_request_headers(reader)
+            key = http_header_value(headers, b"Sec-WebSocket-Key")
+            writer.write(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "
+                + build_websocket_accept(key)
+                + b"\r\n\r\n"
+            )
+            await writer.drain()
+            if request_path == subscriber_path:
+                subscribers.append(writer)
+                connected += 1
+                if connected == clients and not ready.done():
+                    ready.set_result(None)
+                try:
+                    await done
+                finally:
+                    if writer in subscribers:
+                        subscribers.remove(writer)
+            elif request_path == producer_path:
+                await ready
+                for _ in range(count):
+                    frame = await read_websocket_frame(reader)
+                    if frame != payload:
+                        raise RuntimeError(f"unexpected websocket payload size={len(frame)}")
+                    encoded = encode_websocket_frame(frame, masked=False)
+                    for subscriber in subscribers:
+                        subscriber.write(encoded)
+                    for subscriber in subscribers:
+                        await subscriber.drain()
+                if not done.done():
+                    done.set_result(None)
+            else:
+                raise RuntimeError(f"unexpected websocket path: {request_path!r}")
+        except asyncio.IncompleteReadError:
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    async def subscriber() -> None:
+        reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
+        request, key = build_websocket_handshake_request(subscriber_path)
+        try:
+            writer.write(request)
+            await writer.drain()
+            response_headers, _ = await read_http_request_headers(reader)
+            accept = http_header_value(response_headers, b"Sec-WebSocket-Accept")
+            if accept != build_websocket_accept(key):
+                raise RuntimeError("unexpected websocket handshake response")
+            for _ in range(count):
+                frame = await read_websocket_frame(reader)
+                if frame != payload:
+                    raise RuntimeError(f"unexpected websocket payload size={len(frame)}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def producer() -> None:
+        reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
+        request, key = build_websocket_handshake_request(producer_path)
+        try:
+            writer.write(request)
+            await writer.drain()
+            response_headers, _ = await read_http_request_headers(reader)
+            accept = http_header_value(response_headers, b"Sec-WebSocket-Accept")
+            if accept != build_websocket_accept(key):
+                raise RuntimeError("unexpected websocket handshake response")
+            await ready
+            for _ in range(count):
+                writer.write(encode_websocket_frame(payload, masked=True))
+                await writer.drain()
+            await done
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    try:
+        await asyncio.gather(
+            *(subscriber() for _ in range(clients)),
+            producer(),
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def framed_rpc_roundtrip(
+    count: int,
+    *,
+    clients: int = 1,
+    request_size: int,
+    response_size: int,
+) -> None:
+    request = b"r" * request_size
+    response = b"s" * response_size
+    per_client_counts = split_evenly(count, clients)
+
+    def encode_message(body: bytes) -> bytes:
+        return b"\x00" + len(body).to_bytes(4, "big") + body
+
+    async def read_message(reader: asyncio.StreamReader) -> bytes:
+        header = await reader.readexactly(5)
+        size = int.from_bytes(header[1:], "big")
+        body = await reader.readexactly(size)
+        return body
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        label_stream_endpoint(reader, writer, "server")
+        try:
+            while True:
+                body = await read_message(reader)
+                if body != request:
+                    raise RuntimeError(f"unexpected framed body size={len(body)}")
+                writer.write(encode_message(response))
+                await writer.drain()
+        except asyncio.IncompleteReadError:
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    async def client(iterations: int) -> None:
+        reader, writer = await asyncio.open_connection(host, port)
+        label_stream_endpoint(reader, writer, "client")
+        try:
+            for _ in range(iterations):
+                writer.write(encode_message(request))
+                await writer.drain()
+                body = await read_message(reader)
+                if body != response:
+                    raise RuntimeError(f"unexpected framed body size={len(body)}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    try:
+        await asyncio.gather(*(client(iterations) for iterations in per_client_counts))
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def task_create_gather(count: int) -> None:
+    batch_size = 64
+
+    async def worker() -> None:
+        await asyncio.sleep(0)
+
+    remaining = count
+    while remaining:
+        current = min(batch_size, remaining)
+        tasks = [asyncio.create_task(worker()) for _ in range(current)]
+        await asyncio.gather(*tasks)
+        remaining -= current
+
+
+async def task_cancel_storm(count: int) -> None:
+    batch_size = 64
+
+    async def waiter(gate: asyncio.Event) -> None:
+        await gate.wait()
+
+    remaining = count
+    while remaining:
+        current = min(batch_size, remaining)
+        gate = asyncio.Event()
+        tasks = [asyncio.create_task(waiter(gate)) for _ in range(current)]
+        for index, task in enumerate(tasks):
+            if index % 4 != 0:
+                task.cancel()
+        gate.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        remaining -= current
+
+
+async def future_completion_storm(count: int) -> None:
+    batch_size = 128
+    loop = asyncio.get_running_loop()
+    remaining = count
+    while remaining:
+        current = min(batch_size, remaining)
+        futures = [loop.create_future() for _ in range(current)]
+        waiter = asyncio.gather(*futures)
+        for future in futures:
+            future.set_result(None)
+        await waiter
+        remaining -= current
+
+
+async def timer_heap_heavy(count: int) -> None:
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+    remaining = 0
+
+    def tick() -> None:
+        nonlocal remaining
+        remaining -= 1
+        if remaining == 0 and not done.done():
+            done.set_result(None)
+
+    for index in range(count):
+        delay = ((index * 2654435761) % 4096) / 1_000_000
+        handle = loop.call_later(delay, tick)
+        if index % 4 == 0:
+            remaining += 1
+        else:
+            handle.cancel()
+
+    if remaining:
+        await done
+
+
+async def mixed_ready_and_timers(count: int) -> None:
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+    remaining = count
+
+    def tick() -> None:
+        nonlocal remaining
+        remaining -= 1
+        if remaining == 0 and not done.done():
+            done.set_result(None)
+
+    for index in range(count):
+        if index % 2 == 0:
+            loop.call_soon(tick)
+        else:
+            loop.call_later(0, tick)
+        if index % 64 == 0:
+            await asyncio.sleep(0)
+
+    await done
+
+
+async def bench_uds_connect_close(count: int) -> None:
+    with tempfile.TemporaryDirectory(prefix="rsloop-uds-") as tmpdir:
+        path = Path(tmpdir) / "sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(path))
+        listener.listen(max(128, count))
+        listener.setblocking(False)
+        done = asyncio.get_running_loop().create_future()
+        accepted = 0
+
+        async def server() -> None:
+            nonlocal accepted
+            try:
+                while accepted < count:
+                    conn, _ = await asyncio.get_running_loop().sock_accept(listener)
+                    accepted += 1
+                    conn.close()
+                done.set_result(None)
+            finally:
+                listener.close()
+
+        server_task = asyncio.create_task(server())
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.setblocking(False)
+
+        try:
+            for _ in range(count):
+                await asyncio.get_running_loop().sock_connect(client, str(path))
+                client.close()
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.setblocking(False)
+            await done
+        finally:
+            client.close()
+            await server_task
+
+
+async def bench_uds_connect_parallel(count: int) -> None:
+    with tempfile.TemporaryDirectory(prefix="rsloop-uds-") as tmpdir:
+        path = Path(tmpdir) / "sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(path))
+        listener.listen(max(128, count))
+        listener.setblocking(False)
+        accepted = 0
+        done = asyncio.get_running_loop().create_future()
+
+        async def server() -> None:
+            nonlocal accepted
+            try:
+                while accepted < count:
+                    conn, _ = await asyncio.get_running_loop().sock_accept(listener)
+                    accepted += 1
+                    conn.close()
+                if not done.done():
+                    done.set_result(None)
+            finally:
+                listener.close()
+
+        async def client() -> None:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            try:
+                await asyncio.get_running_loop().sock_connect(sock, str(path))
+            finally:
+                sock.close()
+
+        server_task = asyncio.create_task(server())
+        try:
+            await asyncio.gather(*(client() for _ in range(count)))
+            await done
+        finally:
+            await server_task
+
+
+async def bench_uds_rpc_parallel(count: int) -> None:
+    with tempfile.TemporaryDirectory(prefix="rsloop-uds-") as tmpdir:
+        path = Path(tmpdir) / "sock"
+        payload = b"x" * 64
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(path))
+        listener.listen(max(128, count))
+        listener.setblocking(False)
+        per_client_counts = split_evenly(count, 16)
+        server_tasks: list[asyncio.Task[None]] = []
+
+        async def handle(conn: socket.socket, iterations: int) -> None:
+            try:
+                for _ in range(iterations):
+                    data = await recv_exact(asyncio.get_running_loop(), conn, len(payload))
+                    if data != payload:
+                        raise RuntimeError(f"unexpected payload size={len(data)}")
+                    await asyncio.get_running_loop().sock_sendall(conn, data)
+            finally:
+                conn.close()
+
+        async def acceptor() -> None:
+            for iterations in per_client_counts:
+                conn, _ = await asyncio.get_running_loop().sock_accept(listener)
+                conn.setblocking(False)
+                server_tasks.append(asyncio.create_task(handle(conn, iterations)))
+
+        async def client(iterations: int) -> None:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            try:
+                await asyncio.get_running_loop().sock_connect(sock, str(path))
+                for _ in range(iterations):
+                    await asyncio.get_running_loop().sock_sendall(sock, payload)
+                    data = await recv_exact(asyncio.get_running_loop(), sock, len(payload))
+                    if data != payload:
+                        raise RuntimeError(f"unexpected payload size={len(data)}")
+            finally:
+                sock.close()
+
+        accept_task = asyncio.create_task(acceptor())
+        try:
+            await asyncio.gather(*(client(iterations) for iterations in per_client_counts))
+            await accept_task
+            if server_tasks:
+                await asyncio.gather(*server_tasks)
+        finally:
+            listener.close()
+
+
+async def bench_uds_idle_fanout(count: int) -> None:
+    with tempfile.TemporaryDirectory(prefix="rsloop-uds-") as tmpdir:
+        path = Path(tmpdir) / "sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(path))
+        listener.listen(max(128, count))
+        listener.setblocking(False)
+        accepted = 0
+        done = asyncio.get_running_loop().create_future()
+        clients: list[socket.socket] = []
+        peers: list[socket.socket] = []
+
+        async def server() -> None:
+            nonlocal accepted
+            try:
+                while accepted < count:
+                    conn, _ = await asyncio.get_running_loop().sock_accept(listener)
+                    peers.append(conn)
+                    accepted += 1
+                if not done.done():
+                    done.set_result(None)
+            finally:
+                listener.close()
+
+        async def client() -> socket.socket:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            await asyncio.get_running_loop().sock_connect(sock, str(path))
+            return sock
+
+        server_task = asyncio.create_task(server())
+        try:
+            clients = list(await asyncio.gather(*(client() for _ in range(count))))
+            await done
+        finally:
+            for sock in clients:
+                sock.close()
+            for sock in peers:
+                sock.close()
+            await server_task
+
+
+async def bench_http1_connect_per_request(count: int) -> None:
+    await http1_roundtrip(
+        count,
+        request_method=b"GET",
+        request_path=b"/connect",
+        request_body_size=0,
+        response_body_size=64,
+        close_each_request=True,
+    )
+
+
+async def bench_http1_keepalive_small(count: int) -> None:
+    await http1_roundtrip(
+        count,
+        request_method=b"POST",
+        request_path=b"/keepalive",
+        request_body_size=64,
+        response_body_size=64,
+        request_content_type=b"application/json",
+        response_content_type=b"application/json",
+    )
+
+
+async def bench_http1_streaming_response(count: int) -> None:
+    await http1_roundtrip(
+        count,
+        request_method=b"GET",
+        request_path=b"/stream-response",
+        request_body_size=0,
+        response_body_size=16 * 1024,
+        response_chunk_size=1024,
+        close_each_request=False,
+    )
+
+
+async def bench_http1_streaming_upload(count: int) -> None:
+    await http1_roundtrip(
+        count,
+        request_method=b"POST",
+        request_path=b"/stream-upload",
+        request_body_size=16 * 1024,
+        response_body_size=1,
+        request_chunk_size=1024,
+    )
+
+
+async def bench_tls_handshake_parallel(count: int) -> None:
+    server_context, client_context = tls_contexts()
+    accepted = 0
+    done = asyncio.get_running_loop().create_future()
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal accepted
+        label_stream_endpoint(reader, writer, "server")
+        accepted += 1
+        if accepted == count and not done.done():
+            done.set_result(None)
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=server_context)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    async def client() -> None:
+        reader, writer = await asyncio.open_connection(
+            host,
+            port,
+            ssl=client_context,
+            server_hostname="localhost",
+        )
+        label_stream_endpoint(reader, writer, "client")
+        writer.close()
+        await writer.wait_closed()
+
+    try:
+        await asyncio.gather(*(client() for _ in range(count)))
+        await done
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def bench_tls_http1_keepalive(count: int) -> None:
+    server_context, client_context = tls_contexts()
+    await http1_roundtrip(
+        count,
+        clients=8,
+        request_method=b"POST",
+        request_path=b"/tls-json",
+        request_body_size=128,
+        response_body_size=128,
+        request_content_type=b"application/json",
+        response_content_type=b"application/json",
+        server_sslcontext=server_context,
+        client_sslcontext=client_context,
+        server_hostname="localhost",
+    )
+
+
+async def bench_websocket_echo_parallel(count: int) -> None:
+    await websocket_echo_roundtrip(count, clients=32, payload_size=64)
+
+
+async def bench_websocket_broadcast(count: int) -> None:
+    await websocket_broadcast(count, clients=16, payload_size=64)
+
+
+async def bench_asgi_json_echo(count: int) -> None:
+    await http1_roundtrip(
+        count,
+        request_method=b"POST",
+        request_path=b"/asgi-json",
+        request_body_size=256,
+        response_body_size=256,
+        request_content_type=b"application/json",
+        response_content_type=b"application/json",
+    )
+
+
+async def bench_asgi_keepalive(count: int) -> None:
+    await http1_roundtrip(
+        count,
+        clients=16,
+        request_method=b"POST",
+        request_path=b"/asgi-keepalive",
+        request_body_size=256,
+        response_body_size=256,
+        request_content_type=b"application/json",
+        response_content_type=b"application/json",
+    )
+
+
+async def bench_asgi_streaming(count: int) -> None:
+    await http1_roundtrip(
+        count,
+        request_method=b"POST",
+        request_path=b"/asgi-streaming",
+        request_body_size=256,
+        response_body_size=16 * 1024,
+        response_chunk_size=1024,
+        request_content_type=b"application/json",
+        response_content_type=b"application/json",
+    )
+
+
+async def bench_grpc_like_unary(count: int) -> None:
+    await framed_rpc_roundtrip(
+        count,
+        clients=16,
+        request_size=64,
+        response_size=128,
+    )
+
+
 BENCHMARKS: dict[str, BenchmarkSpec] = {
     "call_soon": BenchmarkSpec(
         name="call_soon",
@@ -2080,6 +3097,174 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         unit="connections",
         func=bench_tcp_idle_fanout_large,
     ),
+    "task_create_gather": BenchmarkSpec(
+        name="task_create_gather",
+        description="Create batches of tasks, yield once, and gather them back",
+        category="scheduler",
+        default_iterations=50_000,
+        unit="tasks",
+        func=task_create_gather,
+    ),
+    "task_cancel_storm": BenchmarkSpec(
+        name="task_cancel_storm",
+        description="Spawn tasks, cancel most of them, and drain cancellation cleanup",
+        category="scheduler",
+        default_iterations=50_000,
+        unit="tasks",
+        func=task_cancel_storm,
+    ),
+    "future_completion_storm": BenchmarkSpec(
+        name="future_completion_storm",
+        description="Complete batches of futures and fan out wakeups through gather()",
+        category="scheduler",
+        default_iterations=50_000,
+        unit="futures",
+        func=future_completion_storm,
+    ),
+    "timer_heap_heavy": BenchmarkSpec(
+        name="timer_heap_heavy",
+        description="Schedule many distinct timers and cancel most of them before they fire",
+        category="scheduler",
+        default_iterations=20_000,
+        unit="timers",
+        func=timer_heap_heavy,
+    ),
+    "mixed_ready_and_timers": BenchmarkSpec(
+        name="mixed_ready_and_timers",
+        description="Mixed ready callbacks and zero-delay timers under interleaved yielding",
+        category="scheduler",
+        default_iterations=20_000,
+        unit="events",
+        func=mixed_ready_and_timers,
+    ),
+    "uds_connect": BenchmarkSpec(
+        name="uds_connect",
+        description="Sequential AF_UNIX connect/close churn against a local listener",
+        category="raw-socket",
+        default_iterations=256,
+        unit="connections",
+        func=bench_uds_connect_close,
+    ),
+    "uds_connect_parallel": BenchmarkSpec(
+        name="uds_connect_parallel",
+        description="Many AF_UNIX connections opened and closed concurrently",
+        category="raw-socket",
+        default_iterations=256,
+        unit="connections",
+        func=bench_uds_connect_parallel,
+    ),
+    "uds_rpc_parallel": BenchmarkSpec(
+        name="uds_rpc_parallel",
+        description="AF_UNIX echo clients with 64-byte payloads through loop.sock_* helpers",
+        category="raw-socket",
+        default_iterations=8_192,
+        unit="messages",
+        func=bench_uds_rpc_parallel,
+    ),
+    "uds_idle_fanout": BenchmarkSpec(
+        name="uds_idle_fanout",
+        description="Open many idle AF_UNIX connections and tear them down",
+        category="raw-socket",
+        default_iterations=256,
+        unit="connections",
+        func=bench_uds_idle_fanout,
+    ),
+    "http1_connect_per_request": BenchmarkSpec(
+        name="http1_connect_per_request",
+        description="HTTP/1.1 request-per-connection churn with small responses",
+        category="stream",
+        default_iterations=2_048,
+        unit="requests",
+        func=bench_http1_connect_per_request,
+    ),
+    "http1_keepalive_small": BenchmarkSpec(
+        name="http1_keepalive_small",
+        description="Small HTTP/1.1 request/response exchanges over one keep-alive connection",
+        category="stream",
+        default_iterations=8_192,
+        unit="requests",
+        func=bench_http1_keepalive_small,
+    ),
+    "http1_streaming_response": BenchmarkSpec(
+        name="http1_streaming_response",
+        description="HTTP/1.1 response streaming with chunked writes on the server side",
+        category="stream",
+        default_iterations=2_048,
+        unit="requests",
+        func=bench_http1_streaming_response,
+    ),
+    "http1_streaming_upload": BenchmarkSpec(
+        name="http1_streaming_upload",
+        description="HTTP/1.1 upload streaming with chunked client writes",
+        category="stream",
+        default_iterations=2_048,
+        unit="requests",
+        func=bench_http1_streaming_upload,
+    ),
+    "tls_handshake_parallel": BenchmarkSpec(
+        name="tls_handshake_parallel",
+        description="Concurrent TLS handshakes and closes against a local server",
+        category="stream",
+        default_iterations=256,
+        unit="connections",
+        func=bench_tls_handshake_parallel,
+    ),
+    "tls_http1_keepalive": BenchmarkSpec(
+        name="tls_http1_keepalive",
+        description="Small HTTP/1.1 keep-alive exchanges over TLS",
+        category="stream",
+        default_iterations=2_048,
+        unit="requests",
+        func=bench_tls_http1_keepalive,
+    ),
+    "websocket_echo_parallel": BenchmarkSpec(
+        name="websocket_echo_parallel",
+        description="Many websocket clients echoing 64-byte messages in parallel",
+        category="application",
+        default_iterations=4_096,
+        unit="messages",
+        func=bench_websocket_echo_parallel,
+    ),
+    "websocket_broadcast": BenchmarkSpec(
+        name="websocket_broadcast",
+        description="One websocket producer broadcasting to many subscribers",
+        category="application",
+        default_iterations=256,
+        unit="messages",
+        func=bench_websocket_broadcast,
+    ),
+    "asgi_json_echo": BenchmarkSpec(
+        name="asgi_json_echo",
+        description="JSON request/response traffic shaped like a small ASGI endpoint",
+        category="application",
+        default_iterations=4_096,
+        unit="requests",
+        func=bench_asgi_json_echo,
+    ),
+    "asgi_keepalive": BenchmarkSpec(
+        name="asgi_keepalive",
+        description="Keep-alive JSON request/response traffic shaped like an ASGI app",
+        category="application",
+        default_iterations=8_192,
+        unit="requests",
+        func=bench_asgi_keepalive,
+    ),
+    "asgi_streaming": BenchmarkSpec(
+        name="asgi_streaming",
+        description="Streaming JSON response traffic shaped like an ASGI app",
+        category="application",
+        default_iterations=2_048,
+        unit="requests",
+        func=bench_asgi_streaming,
+    ),
+    "grpc_like_unary": BenchmarkSpec(
+        name="grpc_like_unary",
+        description="Length-prefixed unary RPC traffic shaped like a small gRPC call",
+        category="application",
+        default_iterations=8_192,
+        unit="messages",
+        func=bench_grpc_like_unary,
+    ),
 }
 
 
@@ -2188,6 +3373,8 @@ def run_once_isolated(
             ) from exc
         payload = json.loads(completed.stdout)
         result = bench_result_from_payload(payload["results"][0])
+        if spec.category == "connection":
+            time.sleep(ISOLATED_CONNECTION_COOLDOWN)
         return result.samples[0], parse_runtime_profile(completed.stderr), attempts - 1
     assert last_error is not None
     raise RuntimeError("benchmark child retry loop exited unexpectedly") from last_error
@@ -2561,6 +3748,8 @@ def main() -> None:
         if not args.json:
             for result in group_results:
                 print(format_result(result), flush=True)
+        if isolate_process and spec.category == "connection":
+            time.sleep(CONNECTION_BENCHMARK_COOLDOWN)
 
     payload = result_payload(
         results,
