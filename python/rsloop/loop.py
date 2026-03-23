@@ -1310,14 +1310,6 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
                 reader,
                 reader._limit if reader is not None else 65536,
             )
-            if reader is not None:
-                bind_readexactly = getattr(transport, "bind_readexactly", None)
-                if bind_readexactly is not None:
-                    reader.readexactly = bind_readexactly()
-                bind_readuntil = getattr(transport, "bind_readuntil", None)
-                if bind_readuntil is not None:
-                    reader.readuntil = bind_readuntil()
-            protocol.connection_made(transport)
             stream_writer = getattr(protocol, "_stream_writer", None)
             if stream_writer is not None and not isinstance(
                 stream_writer, RsloopStreamWriter
@@ -1466,7 +1458,6 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
                 None,
                 65536,
             )
-            ssl_protocol.connection_made(low_level_transport)
             activate = getattr(low_level_transport, "activate", None)
             if activate is not None:
                 activate()

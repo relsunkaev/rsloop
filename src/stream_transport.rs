@@ -534,10 +534,33 @@ impl StreamTransport {
 
     fn activate(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
         let core = slf.borrow(py).core.clone();
-        let fd = core.borrow().fd;
-        let transports = core.borrow().transports.clone_ref(py);
-        let registry = core.borrow().registry.clone_ref(py);
-        transports.bind(py).set_item(fd, slf.bind(py))?;
+        let (fd, transports, registry, reader, protocol) = {
+            let core = core.borrow();
+            (
+                core.fd,
+                core.transports.clone_ref(py),
+                core.registry.clone_ref(py),
+                core.reader.as_ref().map(|reader| reader.clone_ref(py)),
+                core.protocol.clone_ref(py),
+            )
+        };
+        let transport = slf.bind(py);
+        let transport_any = transport.clone().into_any().unbind();
+
+        if let Some(reader) = reader {
+            reader
+                .bind(py)
+                .setattr("readexactly", create_bound_readexactly(py, &transport_any)?)?;
+            reader
+                .bind(py)
+                .setattr("readuntil", create_bound_readuntil(py, &transport_any)?)?;
+        }
+
+        protocol
+            .bind(py)
+            .call_method1("connection_made", (transport.clone().into_any(),))?;
+
+        transports.bind(py).set_item(fd, transport)?;
         registry
             .bind(py)
             .borrow_mut()
