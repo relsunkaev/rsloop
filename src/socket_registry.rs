@@ -43,7 +43,10 @@ impl SocketStateRegistry {
     pub(crate) fn dispatch_one(&self, py: Python<'_>, fd: i32, mask: u8) -> PyResult<bool> {
         let index = fd as usize;
         let segments = self.segments.borrow();
-        let Some(segment) = segments.get(index >> SEGMENT_BITS).and_then(|segment| segment.as_ref()) else {
+        let Some(segment) = segments
+            .get(index >> SEGMENT_BITS)
+            .and_then(|segment| segment.as_ref())
+        else {
             return Ok(false);
         };
         let Some(state) = segment[index & SEGMENT_MASK].as_ref() else {

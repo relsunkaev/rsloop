@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
-use std::cell::RefCell;
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::RawFd;
@@ -113,7 +113,9 @@ impl SocketState {
     }
 
     fn enqueue_recv(&mut self, py: Python<'_>, future: Py<PyAny>, size: usize) -> PyResult<()> {
-        self.core.borrow_mut().reads
+        self.core
+            .borrow_mut()
+            .reads
             .push_back(PendingRead::Recv(PendingRecv { future, size }));
         self.core.borrow().sync_interest(py)
     }
@@ -125,13 +127,17 @@ impl SocketState {
         buffer: Py<PyAny>,
     ) -> PyResult<()> {
         let buffer = writable_buffer(&buffer.bind(py))?;
-        self.core.borrow_mut().reads
+        self.core
+            .borrow_mut()
+            .reads
             .push_back(PendingRead::RecvInto(PendingRecvInto { future, buffer }));
         self.core.borrow().sync_interest(py)
     }
 
     fn enqueue_accept(&mut self, py: Python<'_>, future: Py<PyAny>) -> PyResult<()> {
-        self.core.borrow_mut().reads
+        self.core
+            .borrow_mut()
+            .reads
             .push_back(PendingRead::Accept(PendingAccept { future }));
         self.core.borrow().sync_interest(py)
     }
@@ -167,7 +173,10 @@ impl SocketState {
         future: Py<PyAny>,
         _address: Py<PyAny>,
     ) -> PyResult<()> {
-        self.core.borrow_mut().connects.push_back(PendingConnect { future });
+        self.core
+            .borrow_mut()
+            .connects
+            .push_back(PendingConnect { future });
         self.core.borrow().sync_interest(py)
     }
 }

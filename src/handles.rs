@@ -1056,23 +1056,32 @@ pub(crate) fn mark_native_unscheduled(py: Python<'_>, handle: &Py<PyAny>) -> boo
 }
 
 pub(crate) fn run_native_handle(py: Python<'_>, handle: &Py<PyAny>) -> Option<PyResult<()>> {
-    match native_handle_kind(py, handle)? {
-        NativeHandleKind::ZeroArg => Some(ZeroArgHandle::run_bound(
+    let kind = native_handle_kind(py, handle)?;
+    Some(run_native_handle_kind(py, handle, kind))
+}
+
+pub(crate) fn run_native_handle_kind(
+    py: Python<'_>,
+    handle: &Py<PyAny>,
+    kind: NativeHandleKind,
+) -> PyResult<()> {
+    match kind {
+        NativeHandleKind::ZeroArg => ZeroArgHandle::run_bound(
             unsafe { handle.cast_bound_unchecked::<ZeroArgHandle>(py) },
             py,
-        )),
-        NativeHandleKind::OneArg => Some(OneArgHandle::run_bound(
+        ),
+        NativeHandleKind::OneArg => OneArgHandle::run_bound(
             unsafe { handle.cast_bound_unchecked::<OneArgHandle>(py) },
             py,
-        )),
-        NativeHandleKind::Handle => Some(Handle::run_bound(
+        ),
+        NativeHandleKind::Handle => Handle::run_bound(
             unsafe { handle.cast_bound_unchecked::<Handle>(py) },
             py,
-        )),
-        NativeHandleKind::Future => Some(FutureHandle::run_bound(
+        ),
+        NativeHandleKind::Future => FutureHandle::run_bound(
             unsafe { handle.cast_bound_unchecked::<FutureHandle>(py) },
             py,
-        )),
+        ),
     }
 }
 
@@ -1108,10 +1117,12 @@ fn native_type_ptr<T: PyTypeInfo + 'static>(py: Python<'_>) -> usize {
     static FUTURE_HANDLE_TYPE: PyOnceLock<usize> = PyOnceLock::new();
 
     if std::any::TypeId::of::<T>() == std::any::TypeId::of::<ZeroArgHandle>() {
-        return *ZERO_ARG_HANDLE_TYPE.get_or_init(py, || PyType::new::<ZeroArgHandle>(py).as_ptr() as usize);
+        return *ZERO_ARG_HANDLE_TYPE
+            .get_or_init(py, || PyType::new::<ZeroArgHandle>(py).as_ptr() as usize);
     }
     if std::any::TypeId::of::<T>() == std::any::TypeId::of::<OneArgHandle>() {
-        return *ONE_ARG_HANDLE_TYPE.get_or_init(py, || PyType::new::<OneArgHandle>(py).as_ptr() as usize);
+        return *ONE_ARG_HANDLE_TYPE
+            .get_or_init(py, || PyType::new::<OneArgHandle>(py).as_ptr() as usize);
     }
     if std::any::TypeId::of::<T>() == std::any::TypeId::of::<Handle>() {
         return *HANDLE_TYPE.get_or_init(py, || PyType::new::<Handle>(py).as_ptr() as usize);
@@ -1179,15 +1190,7 @@ pub(crate) unsafe fn make_handle_fastcall(
     }
     if arg_count == 1 {
         let arg = Bound::from_borrowed_ptr(py, *args.add(0)).unbind();
-        return OneArgHandle::create_with_debug(
-            py,
-            callback,
-            arg,
-            loop_obj,
-            context,
-            when,
-            debug,
-        );
+        return OneArgHandle::create_with_debug(py, callback, arg, loop_obj, context, when, debug);
     }
     let args = HandleArgs::from_fastcall(py, args, arg_count)?;
     Handle::create_with_debug_from_args(py, callback, args, loop_obj, context, when, debug)
@@ -1388,12 +1391,30 @@ fn run_handle(
     args: &HandleArgs,
 ) -> PyResult<()> {
     let callback = callback.bind(py);
-    with_context(py, context, || {
-        unsafe {
-            match args {
-                HandleArgs::Two([arg0, arg1]) => {
-                    let arg0 = arg0.bind(py);
-                    let arg1 = arg1.bind(py);
+    with_context(py, context, || unsafe {
+        match args {
+            HandleArgs::Two([arg0, arg1]) => {
+                let arg0 = arg0.bind(py);
+                let arg1 = arg1.bind(py);
+                let mut argv = [arg0.as_ptr(), arg1.as_ptr()];
+                Ok(ffi::PyObject_Vectorcall(
+                    callback.as_ptr(),
+                    argv.as_mut_ptr(),
+                    argv.len(),
+                    std::ptr::null_mut(),
+                ))
+            }
+            HandleArgs::Tuple(args) => match args.bind(py).len() {
+                0 => Ok(ffi::PyObject_CallNoArgs(callback.as_ptr())),
+                1 => {
+                    let args = args.bind(py);
+                    let arg0 = args.get_item(0)?;
+                    Ok(ffi::PyObject_CallOneArg(callback.as_ptr(), arg0.as_ptr()))
+                }
+                2 => {
+                    let args = args.bind(py);
+                    let arg0 = args.get_item(0)?;
+                    let arg1 = args.get_item(1)?;
                     let mut argv = [arg0.as_ptr(), arg1.as_ptr()];
                     Ok(ffi::PyObject_Vectorcall(
                         callback.as_ptr(),
@@ -1402,47 +1423,29 @@ fn run_handle(
                         std::ptr::null_mut(),
                     ))
                 }
-                HandleArgs::Tuple(args) => match args.bind(py).len() {
-                    0 => Ok(ffi::PyObject_CallNoArgs(callback.as_ptr())),
-                    1 => {
-                        let args = args.bind(py);
-                        let arg0 = args.get_item(0)?;
-                        Ok(ffi::PyObject_CallOneArg(callback.as_ptr(), arg0.as_ptr()))
+                _ => {
+                    let args = args.bind(py);
+                    let mut argv: Vec<*mut ffi::PyObject> = Vec::with_capacity(args.len());
+                    for item in args.iter() {
+                        argv.push(item.as_ptr());
                     }
-                    2 => {
-                        let args = args.bind(py);
-                        let arg0 = args.get_item(0)?;
-                        let arg1 = args.get_item(1)?;
-                        let mut argv = [arg0.as_ptr(), arg1.as_ptr()];
-                        Ok(ffi::PyObject_Vectorcall(
-                            callback.as_ptr(),
-                            argv.as_mut_ptr(),
-                            argv.len(),
-                            std::ptr::null_mut(),
-                        ))
-                    }
-                    _ => {
-                        let args = args.bind(py);
-                        let mut argv: Vec<*mut ffi::PyObject> = Vec::with_capacity(args.len());
-                        for item in args.iter() {
-                            argv.push(item.as_ptr());
-                        }
-                        Ok(ffi::PyObject_Vectorcall(
-                            callback.as_ptr(),
-                            argv.as_mut_ptr(),
-                            argv.len(),
-                            std::ptr::null_mut(),
-                        ))
-                    }
-                },
-            }
+                    Ok(ffi::PyObject_Vectorcall(
+                        callback.as_ptr(),
+                        argv.as_mut_ptr(),
+                        argv.len(),
+                        std::ptr::null_mut(),
+                    ))
+                }
+            },
         }
     })
 }
 
 fn run_zero_arg_handle(py: Python<'_>, context: &Py<PyAny>, callback: &Py<PyAny>) -> PyResult<()> {
     let callback = callback.bind(py);
-    with_context(py, context, || unsafe { Ok(ffi::PyObject_CallNoArgs(callback.as_ptr())) })
+    with_context(py, context, || unsafe {
+        Ok(ffi::PyObject_CallNoArgs(callback.as_ptr()))
+    })
 }
 
 pub(crate) fn run_one_arg_handle(

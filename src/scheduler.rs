@@ -16,8 +16,8 @@ use pyo3::sync::PyOnceLock;
 use crate::completion::{Completion, CompletionPort};
 use crate::fd_callbacks::FdCallbackRegistry;
 use crate::handles::{
-    NativeHandleKind, is_native_cancelled, mark_native_unscheduled, native_handle_kind,
-    run_native_handle, take_one_arg_profile_json,
+    is_native_cancelled, mark_native_unscheduled, native_handle_kind, run_native_handle,
+    take_one_arg_profile_json, NativeHandleKind,
 };
 use crate::loop_api::LoopApi;
 use crate::poller::TokioPoller;
@@ -156,8 +156,12 @@ impl PhaseStats {
         self.tick_stats.socket_fd_hits.push(tick.socket_fd_hits);
         self.tick_stats.generic_fd_hits.push(tick.generic_fd_hits);
         self.tick_stats.ready_handles.push(tick.ready_handles);
-        self.tick_stats.ready_local_items.push(tick.ready_local_items);
-        self.tick_stats.ready_remote_items.push(tick.ready_remote_items);
+        self.tick_stats
+            .ready_local_items
+            .push(tick.ready_local_items);
+        self.tick_stats
+            .ready_remote_items
+            .push(tick.ready_remote_items);
         self.tick_stats.ready_zero_arg.push(tick.ready_zero_arg);
         self.tick_stats.ready_one_arg.push(tick.ready_one_arg);
         self.tick_stats
@@ -402,7 +406,10 @@ impl Scheduler {
             );
         }
         if profiling_json {
-            eprintln!("RSLOOP_PROFILE_SCHED_JSON {}", scheduler_profile_json(&stats));
+            eprintln!(
+                "RSLOOP_PROFILE_SCHED_JSON {}",
+                scheduler_profile_json(&stats)
+            );
             if let Some(trace_json) = take_profile_stream_json() {
                 eprintln!("RSLOOP_PROFILE_STREAM_JSON {trace_json}");
             }
@@ -638,7 +645,9 @@ impl Scheduler {
             &mut tick,
         )?;
         if let Some(stats) = stats.as_deref_mut() {
-            stats.ready += ready_started.map(|started| started.elapsed()).unwrap_or_default();
+            stats.ready += ready_started
+                .map(|started| started.elapsed())
+                .unwrap_or_default();
         }
 
         if let Some(registry) = stream_registry {
@@ -664,7 +673,9 @@ impl Scheduler {
                     &mut tick,
                 )?;
                 if let Some(stats) = stats.as_deref_mut() {
-                    stats.ready += ready_started.map(|started| started.elapsed()).unwrap_or_default();
+                    stats.ready += ready_started
+                        .map(|started| started.elapsed())
+                        .unwrap_or_default();
                 }
             }
         }
@@ -824,13 +835,25 @@ fn scheduler_profile_json(stats: &PhaseStats) -> String {
     out.push(',');
     append_distribution_json(&mut out, "socket_fd_hits", &stats.tick_stats.socket_fd_hits);
     out.push(',');
-    append_distribution_json(&mut out, "generic_fd_hits", &stats.tick_stats.generic_fd_hits);
+    append_distribution_json(
+        &mut out,
+        "generic_fd_hits",
+        &stats.tick_stats.generic_fd_hits,
+    );
     out.push(',');
     append_distribution_json(&mut out, "ready_handles", &stats.tick_stats.ready_handles);
     out.push(',');
-    append_distribution_json(&mut out, "ready_local_items", &stats.tick_stats.ready_local_items);
+    append_distribution_json(
+        &mut out,
+        "ready_local_items",
+        &stats.tick_stats.ready_local_items,
+    );
     out.push(',');
-    append_distribution_json(&mut out, "ready_remote_items", &stats.tick_stats.ready_remote_items);
+    append_distribution_json(
+        &mut out,
+        "ready_remote_items",
+        &stats.tick_stats.ready_remote_items,
+    );
     out.push(',');
     append_distribution_json(&mut out, "ready_zero_arg", &stats.tick_stats.ready_zero_arg);
     out.push(',');
@@ -850,7 +873,11 @@ fn scheduler_profile_json(stats: &PhaseStats) -> String {
     out.push(',');
     append_distribution_json(&mut out, "ready_python", &stats.tick_stats.ready_python);
     out.push(',');
-    append_distribution_json(&mut out, "completion_items", &stats.tick_stats.completion_items);
+    append_distribution_json(
+        &mut out,
+        "completion_items",
+        &stats.tick_stats.completion_items,
+    );
     out.push(',');
     append_distribution_json(&mut out, "writes_flushed", &stats.tick_stats.writes_flushed);
     out.push_str("}}");

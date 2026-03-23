@@ -67,7 +67,11 @@ impl FdCallbackRegistry {
         let mut cleared = Vec::new();
         for segment in states.iter_mut().flatten() {
             for state in segment.iter_mut() {
-                cleared.extend([state.reader.take(), state.writer.take()].into_iter().flatten());
+                cleared.extend(
+                    [state.reader.take(), state.writer.take()]
+                        .into_iter()
+                        .flatten(),
+                );
             }
         }
         states.clear();
@@ -103,7 +107,12 @@ impl FdCallbackRegistry {
         self.dispatch_with(py, events, |handle| scheduler.push_ready_inner(handle))
     }
 
-    fn add(&self, fd: RawFd, handle: Py<PyAny>, kind: EventKind) -> (Option<Py<PyAny>>, bool, bool) {
+    fn add(
+        &self,
+        fd: RawFd,
+        handle: Py<PyAny>,
+        kind: EventKind,
+    ) -> (Option<Py<PyAny>>, bool, bool) {
         let index = fd as usize;
         let mut states = self.states.borrow_mut();
         let segment = Self::segment_mut(&mut states, index);
