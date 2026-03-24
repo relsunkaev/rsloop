@@ -29,6 +29,7 @@ use crate::stream_registry::StreamTransportRegistry;
 
 const DEFAULT_STREAM_READ_SIZE: usize = 64 * 1024;
 const NATIVE_READEXACTLY_LIMIT: usize = 16 * 1024;
+const READ_BUFFER_COMPACT_THRESHOLD: usize = DEFAULT_STREAM_READ_SIZE;
 const DIRECT_WRITE_LIMIT: usize = 0;
 const WRITEV_BATCH_LIMIT: usize = 8;
 const SMALL_WRITE_CHUNK_LIMIT: usize = 256;
@@ -137,6 +138,7 @@ pub(crate) struct StreamCore {
     pending_drains: Vec<Py<PyAny>>,
     pending_close_waiters: Vec<Py<PyAny>>,
     read_buffer: Vec<u8>,
+    read_buffer_offset: usize,
     write_queue: VecDeque<PendingWrite>,
     pub(crate) pending_write_bytes: usize,
     closing: bool,
@@ -511,6 +513,7 @@ impl StreamTransport {
             pending_drains: Vec::new(),
             pending_close_waiters: Vec::new(),
             read_buffer: vec![0_u8; read_size.max(1)],
+            read_buffer_offset: 0,
             write_queue: VecDeque::new(),
             pending_write_bytes: 0,
             closing: false,
@@ -1620,6 +1623,103 @@ impl StreamCore {
         Ok(())
     }
 
+    fn read_buffer_len(&self, buffer: *mut ffi::PyObject) -> PyResult<usize> {
+        let total = bytearray_len(buffer)?;
+        Ok(total.saturating_sub(self.read_buffer_offset))
+    }
+
+    fn maybe_compact_read_buffer(
+        &mut self,
+        py: Python<'_>,
+        buffer: *mut ffi::PyObject,
+    ) -> PyResult<()> {
+        let offset = self.read_buffer_offset;
+        if offset == 0 {
+            return Ok(());
+        }
+
+        let total = bytearray_len(buffer)?;
+        if offset >= total {
+            if unsafe { ffi::PyByteArray_Resize(buffer, 0) } != 0 {
+                return Err(PyErr::fetch(py));
+            }
+            self.read_buffer_offset = 0;
+            return Ok(());
+        }
+
+        if offset < READ_BUFFER_COMPACT_THRESHOLD && offset * 2 < total {
+            return Ok(());
+        }
+
+        let unread = total - offset;
+        let src = unsafe { ffi::PyByteArray_AsString(buffer) };
+        if src.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        unsafe {
+            ptr::copy(src.cast::<u8>().add(offset), src.cast::<u8>(), unread);
+            if ffi::PyByteArray_Resize(buffer, unread as isize) != 0 {
+                return Err(PyErr::fetch(py));
+            }
+        }
+        self.read_buffer_offset = 0;
+        Ok(())
+    }
+
+    fn consume_read_buffer_exact(
+        &mut self,
+        py: Python<'_>,
+        buffer: *mut ffi::PyObject,
+        size: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let total = bytearray_len(buffer)?;
+        let offset = self.read_buffer_offset;
+        let unread = total
+            .checked_sub(offset)
+            .ok_or_else(|| PyRuntimeError::new_err("invalid read buffer offset"))?;
+        if unread < size {
+            return Err(PyRuntimeError::new_err("insufficient buffered data"));
+        }
+        let src = unsafe { ffi::PyByteArray_AsString(buffer) };
+        if src.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let data = PyBytes::new(
+            py,
+            unsafe { std::slice::from_raw_parts(src.cast::<u8>().add(offset), size) },
+        )
+        .into_any()
+        .unbind();
+        self.read_buffer_offset = offset + size;
+        self.maybe_compact_read_buffer(py, buffer)?;
+        Ok(data)
+    }
+
+    fn consume_read_buffer_all(
+        &mut self,
+        py: Python<'_>,
+        buffer: *mut ffi::PyObject,
+    ) -> PyResult<Py<PyAny>> {
+        let total = bytearray_len(buffer)?;
+        let offset = self.read_buffer_offset;
+        let unread = total
+            .checked_sub(offset)
+            .ok_or_else(|| PyRuntimeError::new_err("invalid read buffer offset"))?;
+        let src = unsafe { ffi::PyByteArray_AsString(buffer) };
+        if src.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let data = PyBytes::new(
+            py,
+            unsafe { std::slice::from_raw_parts(src.cast::<u8>().add(offset), unread) },
+        )
+        .into_any()
+        .unbind();
+        self.read_buffer_offset = total;
+        self.maybe_compact_read_buffer(py, buffer)?;
+        Ok(data)
+    }
+
     fn feed_read_buffer_inner(&mut self, py: Python<'_>, size: usize) -> PyResult<()> {
         let Some(reader_obj) = self.reader.as_ref().map(|reader| reader.clone_ref(py)) else {
             return Ok(());
@@ -1633,13 +1733,12 @@ impl StreamCore {
         if self.try_finish_pending_read_from_chunk(py, &reader, size)? {
             return Ok(());
         }
-        let buffer_obj = self
+        let buffer = self
             .buffer
             .as_ref()
             .expect("stream transport buffer")
-            .clone_ref(py);
-        let buffer = buffer_obj.bind(py);
-        append_to_bytearray(buffer.as_ptr(), &self.read_buffer[..size])?;
+            .as_ptr();
+        append_to_bytearray(buffer, &self.read_buffer[..size])?;
         if !self.try_finish_pending_read(py, &reader)? && !had_pending_read {
             wake_waiter(py, &reader)?;
         }
@@ -1649,8 +1748,8 @@ impl StreamCore {
             return Ok(());
         }
 
-        let buffered = unsafe { ffi::PyByteArray_Size(buffer.as_ptr()) };
-        if buffered <= (2 * self.limit) as isize {
+        let buffered = self.read_buffer_len(buffer)?;
+        if buffered <= 2 * self.limit {
             return Ok(());
         }
 
@@ -1683,8 +1782,8 @@ impl StreamCore {
             .buffer
             .as_ref()
             .expect("stream transport buffer")
-            .bind(py);
-        let buffered = bytearray_len(buffer.as_ptr())?;
+            .as_ptr();
+        let buffered = self.read_buffer_len(buffer)?;
         if buffered + chunk_size < *size {
             return Ok(false);
         }
@@ -1707,7 +1806,8 @@ impl StreamCore {
         } else {
             join_buffered_prefix_and_chunk(
                 py,
-                buffer.as_ptr(),
+                buffer,
+                self.read_buffer_offset,
                 buffered,
                 &self.read_buffer[..needed_from_chunk],
                 size,
@@ -1725,12 +1825,11 @@ impl StreamCore {
         )?;
         record_stream_profile_event("read_wait_done", self.fd, size, buffered);
 
-        if needed_from_chunk != chunk_size || buffered != 0 {
-            replace_bytearray(
-                buffer.as_ptr(),
-                &self.read_buffer[needed_from_chunk..chunk_size],
-            )?;
+        self.read_buffer_offset += buffered;
+        if needed_from_chunk != chunk_size {
+            append_to_bytearray(buffer, &self.read_buffer[needed_from_chunk..chunk_size])?;
         }
+        self.maybe_compact_read_buffer(py, buffer)?;
         self.maybe_resume_transport(py, reader)?;
         Ok(true)
     }
@@ -1752,12 +1851,11 @@ impl StreamCore {
             ));
         };
         let reader = reader_obj.bind(py);
-        let buffer_obj = self
+        let buffer = self
             .buffer
             .as_ref()
             .expect("stream transport buffer")
-            .clone_ref(py);
-        let buffer = buffer_obj.bind(py);
+            .as_ptr();
         if let Some(exc) = current_exception(&reader)? {
             return ready_awaitable_exception(py, exc);
         }
@@ -1772,14 +1870,14 @@ impl StreamCore {
             }
         }
 
-        if try_consume_exact(buffer.as_ptr(), size)? {
-            let data = consume_exact(py, buffer.as_ptr(), size)?;
+        if self.read_buffer_len(buffer)? >= size {
+            let data = self.consume_read_buffer_exact(py, buffer, size)?;
             self.maybe_resume_transport(py, &reader)?;
             return ready_awaitable_result(py, data);
         }
 
         if reader.getattr("_eof")?.is_truthy()? {
-            let partial = consume_all(py, buffer.as_ptr())?;
+            let partial = self.consume_read_buffer_all(py, buffer)?;
             return ready_awaitable_exception(py, incomplete_read_error(py, partial, Some(size))?);
         }
 
@@ -1843,24 +1941,29 @@ impl StreamCore {
             .buffer
             .as_ref()
             .expect("stream transport buffer")
-            .bind(py);
-        if let Some(index) = find_subsequence_in_bytearray(buffer.as_ptr(), separator, 0)? {
-            if index > self.limit {
-                return ready_awaitable_exception(py, limit_overrun_error(py, index, true)?);
+            .as_ptr();
+        if let Some(index) =
+            find_subsequence_in_bytearray(buffer, separator, self.read_buffer_offset)?
+        {
+            let consumed = index
+                .checked_sub(self.read_buffer_offset)
+                .ok_or_else(|| PyRuntimeError::new_err("invalid read buffer offset"))?;
+            if consumed > self.limit {
+                return ready_awaitable_exception(py, limit_overrun_error(py, consumed, true)?);
             }
-            let size = index + separator.len();
-            let data = consume_exact(py, buffer.as_ptr(), size)?;
+            let size = consumed + separator.len();
+            let data = self.consume_read_buffer_exact(py, buffer, size)?;
             self.maybe_resume_transport(py, &reader)?;
             return ready_awaitable_result(py, data);
         }
 
-        let offset = next_readuntil_offset(bytearray_len(buffer.as_ptr())?, separator.len());
+        let offset = next_readuntil_offset(self.read_buffer_len(buffer)?, separator.len());
         if offset > self.limit {
             return ready_awaitable_exception(py, limit_overrun_error(py, offset, false)?);
         }
 
         if reader.getattr("_eof")?.is_truthy()? {
-            let partial = consume_all(py, buffer.as_ptr())?;
+            let partial = self.consume_read_buffer_all(py, buffer)?;
             return ready_awaitable_exception(py, incomplete_read_error(py, partial, None)?);
         }
 
@@ -1929,8 +2032,8 @@ impl StreamCore {
             .buffer
             .as_ref()
             .expect("stream transport buffer")
-            .bind(py);
-        let buffered = bytearray_len(buffer.as_ptr())?;
+            .as_ptr();
+        let buffered = self.read_buffer_len(buffer)?;
         enum PendingReadState {
             Exact(usize),
             Until {
@@ -1942,7 +2045,11 @@ impl StreamCore {
         let state = match &pending.kind {
             PendingReadKind::Exact(size) => PendingReadState::Exact(*size),
             PendingReadKind::Until { separator, offset } => PendingReadState::Until {
-                found_index: find_subsequence_in_bytearray(buffer.as_ptr(), separator, *offset)?,
+                found_index: find_subsequence_in_bytearray(
+                    buffer,
+                    separator,
+                    self.read_buffer_offset + *offset,
+                )?,
                 separator_len: separator.len(),
                 next_offset: next_readuntil_offset(buffered, separator.len()),
             },
@@ -1957,7 +2064,7 @@ impl StreamCore {
                 if trace_stream_enabled() {
                     eprintln!("stream-transport finish exact fd={} size={}", self.fd, size);
                 }
-                let data = consume_exact(py, buffer.as_ptr(), size)?;
+                let data = self.consume_read_buffer_exact(py, buffer, size)?;
                 reader.setattr("_waiter", py.None())?;
                 self.queue_completion(
                     py,
@@ -1978,8 +2085,11 @@ impl StreamCore {
             } => {
                 if let Some(index) = found_index {
                     let pending = self.pending_read.take().expect("pending read present");
-                    if index > self.limit {
-                        let exc = limit_overrun_error(py, index, true)?;
+                    let consumed = index
+                        .checked_sub(self.read_buffer_offset)
+                        .ok_or_else(|| PyRuntimeError::new_err("invalid read buffer offset"))?;
+                    if consumed > self.limit {
+                        let exc = limit_overrun_error(py, consumed, true)?;
                         reader.setattr("_waiter", py.None())?;
                         self.queue_completion(
                             py,
@@ -1991,8 +2101,8 @@ impl StreamCore {
                         )?;
                         return Ok(true);
                     }
-                    let size = index + separator_len;
-                    let data = consume_exact(py, buffer.as_ptr(), size)?;
+                    let size = consumed + separator_len;
+                    let data = self.consume_read_buffer_exact(py, buffer, size)?;
                     reader.setattr("_waiter", py.None())?;
                     self.queue_completion(
                         py,
@@ -2038,14 +2148,12 @@ impl StreamCore {
         let Some(pending) = self.pending_read.take() else {
             return Ok(());
         };
-        let partial = consume_all(
-            py,
-            self.buffer
-                .as_ref()
-                .expect("stream transport buffer")
-                .bind(py)
-                .as_ptr(),
-        )?;
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("stream transport buffer")
+            .as_ptr();
+        let partial = self.consume_read_buffer_all(py, buffer)?;
         let exc = match pending.kind {
             PendingReadKind::Exact(size) => incomplete_read_error(py, partial, Some(size))?,
             PendingReadKind::Until { .. } => incomplete_read_error(py, partial, None)?,
@@ -2548,34 +2656,12 @@ fn append_to_bytearray(bytearray: *mut ffi::PyObject, data: &[u8]) -> PyResult<(
     Ok(())
 }
 
-fn replace_bytearray(bytearray: *mut ffi::PyObject, data: &[u8]) -> PyResult<()> {
-    unsafe {
-        if ffi::PyByteArray_Resize(bytearray, data.len() as isize) != 0 {
-            return Err(PyErr::fetch(Python::assume_attached()));
-        }
-        if data.is_empty() {
-            return Ok(());
-        }
-        let dest = ffi::PyByteArray_AsString(bytearray) as *mut u8;
-        if dest.is_null() {
-            return Err(PyErr::fetch(Python::assume_attached()));
-        }
-        ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
-    }
-    Ok(())
-}
-
 fn bytearray_len(bytearray: *mut ffi::PyObject) -> PyResult<usize> {
     let len = unsafe { ffi::PyByteArray_Size(bytearray) };
     if len < 0 {
         return Err(PyErr::fetch(unsafe { Python::assume_attached() }));
     }
     Ok(len as usize)
-}
-
-fn try_consume_exact(bytearray: *mut ffi::PyObject, size: usize) -> PyResult<bool> {
-    let len = unsafe { ffi::PyByteArray_Size(bytearray) };
-    Ok(len >= size as isize)
 }
 
 fn find_subsequence_in_bytearray(
@@ -2605,63 +2691,10 @@ fn find_subsequence_in_bytearray(
     }
 }
 
-fn consume_exact(
-    py: Python<'_>,
-    bytearray: *mut ffi::PyObject,
-    size: usize,
-) -> PyResult<Py<PyAny>> {
-    unsafe {
-        let len = ffi::PyByteArray_Size(bytearray);
-        if len < size as isize {
-            return Err(PyRuntimeError::new_err("insufficient buffered data"));
-        }
-        let src = ffi::PyByteArray_AsString(bytearray) as *mut u8;
-        if src.is_null() {
-            return Err(PyErr::fetch(py));
-        }
-        let data = PyBytes::new(py, std::slice::from_raw_parts(src.cast_const(), size))
-            .into_any()
-            .unbind();
-        if len == size as isize {
-            if ffi::PyByteArray_Resize(bytearray, 0) != 0 {
-                return Err(PyErr::fetch(py));
-            }
-        } else {
-            ptr::copy(src.add(size), src, (len as usize) - size);
-            if ffi::PyByteArray_Resize(bytearray, len - size as isize) != 0 {
-                return Err(PyErr::fetch(py));
-            }
-        }
-        Ok(data)
-    }
-}
-
-fn consume_all(py: Python<'_>, bytearray: *mut ffi::PyObject) -> PyResult<Py<PyAny>> {
-    unsafe {
-        let len = ffi::PyByteArray_Size(bytearray);
-        if len < 0 {
-            return Err(PyErr::fetch(py));
-        }
-        let src = ffi::PyByteArray_AsString(bytearray) as *mut u8;
-        if src.is_null() {
-            return Err(PyErr::fetch(py));
-        }
-        let data = PyBytes::new(
-            py,
-            std::slice::from_raw_parts(src.cast_const(), len as usize),
-        )
-        .into_any()
-        .unbind();
-        if ffi::PyByteArray_Resize(bytearray, 0) != 0 {
-            return Err(PyErr::fetch(py));
-        }
-        Ok(data)
-    }
-}
-
 fn join_buffered_prefix_and_chunk(
     py: Python<'_>,
     bytearray: *mut ffi::PyObject,
+    offset: usize,
     buffered: usize,
     chunk: &[u8],
     total: usize,
@@ -2679,7 +2712,7 @@ fn join_buffered_prefix_and_chunk(
             if src.is_null() {
                 return Err(PyErr::fetch(py));
             }
-            ptr::copy_nonoverlapping(src, dest, buffered);
+            ptr::copy_nonoverlapping(src.add(offset), dest, buffered);
         }
         if !chunk.is_empty() {
             ptr::copy_nonoverlapping(chunk.as_ptr(), dest.add(buffered), chunk.len());
