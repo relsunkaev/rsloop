@@ -69,6 +69,41 @@ performance pass, including changes that were reverted.
 - Decision: kept
 - Commit: `3b2ff71` `perf(stream): move connection setup into native activate`
 
+### 21. Reuse cached buffered protocol state during readable dispatch
+
+- Area: [`src/stream_transport.rs`](../src/stream_transport.rs)
+- Change:
+  - use the transport's cached `buffered_protocol` flag in
+    `StreamCore::on_readable()` instead of re-running Python
+    `hasattr("get_buffer")` / `hasattr("buffer_updated")` checks on every
+    readable event
+  - refresh the cached flag inside `set_protocol()` so `start_tls()` and other
+    protocol swaps keep working
+- Result from interleaved A/B against clean `HEAD`:
+  - `tls_http1_keepalive` `0.157336s -> 0.156412s` (`-0.59%`)
+  - `http1_keepalive_small` `0.205492s -> 0.211748s` (`+3.04%`)
+  - `asgi_json_echo` `0.114812s -> 0.111509s` (`-2.88%`)
+  - `asgi_keepalive` `0.127271s -> 0.112124s` (`-11.90%`)
+  - `grpc_like_unary` `0.115801s -> 0.111559s` (`-3.66%`)
+  - `start_tls_upgrade` `0.044751s -> 0.034159s` (`-23.67%`)
+- Result vs `uvloop` after the patch:
+  - `http1_keepalive_small` `1.058x`
+  - `asgi_json_echo` `1.079x`
+  - `asgi_keepalive` `1.056x`
+  - `grpc_like_unary` `0.998x` raw median, `1.040x` paired
+  - `tls_http1_keepalive` `1.668x`
+  - `start_tls_upgrade` `0.900x` raw median, `1.264x` paired
+- Notes:
+  - the first draft of this change broke `test_native_start_tls` because
+    `set_protocol()` did not refresh the cached flag; that fix is part of the
+    final kept version
+  - `start_tls_upgrade` remains noisy, so the interleaved A/B result is more
+    trustworthy than the cross-loop paired ratio there
+- Decision: kept; broad app-shaped wins outweighed the one small regression on
+  `http1_keepalive_small`
+- Artifact:
+  [`benchmarks/out/ab-interleaved-buffered-flag-fixed/summary.json`](out/ab-interleaved-buffered-flag-fixed/summary.json)
+
 ## Reverted Experiments
 
 ### 4. Immediate small direct writes up to 256 bytes
