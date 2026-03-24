@@ -369,16 +369,38 @@ performance pass, including changes that were reverted.
   - `tls_http1_keepalive` `1.545x`
 - Decision: reverted
 
+### 25. Cache buffered TLS callbacks and skip the scheduled `_on_readable` hop
+
+- Area: [`src/stream_transport.rs`](../src/stream_transport.rs)
+- Change: cache `get_buffer` / `buffer_updated` bound methods for buffered
+  protocols, and drive buffered readable handling directly from the native fd
+  callback instead of scheduling a separate `_on_readable` handle.
+- Result:
+  - `http1_keepalive_small` `1.047x` paired vs `uvloop` on the guard run
+  - `tls_http1_keepalive` `1.544x` paired vs `uvloop`, down from `1.670x` in
+    the prior stored run
+  - `start_tls_upgrade` `0.975x` paired vs `uvloop`
+  - `tls_handshake_parallel` `1.063x` paired vs `uvloop`
+  - runtime profile `ready` dropped from about `0.0607s` to `0.0500s` on the
+    256-request sample
+- Decision: kept
+- Artifacts:
+  - [`benchmarks/out/ab-current-tls-cached-hooks-tls.json`](out/ab-current-tls-cached-hooks-tls.json)
+  - [`benchmarks/out/ab-current-tls-cached-hooks-starttls.json`](out/ab-current-tls-cached-hooks-starttls.json)
+  - [`benchmarks/out/ab-current-tls-cached-hooks-handshake.json`](out/ab-current-tls-cached-hooks-handshake.json)
+  - [`benchmarks/out/tls-http1-keepalive-runtime-tls-cached-hooks.json`](out/tls-http1-keepalive-runtime-tls-cached-hooks.json)
+
 ## Open Direction
 
 The main conclusion so far is that callback-level micro-optimizations are not
-reliably translating into user-visible wins. The remaining credible directions
-are:
+reliably translating into user-visible wins unless they remove a real callback
+hop or a repeated protocol lookup. The remaining credible directions are:
 
 - deeper connection/setup lifecycle changes
 - buffered-read / stream lifecycle work
 - TLS path work that improves real app traffic instead of just handshake or
   microbenchmarks
-- TLS keepalive profiling still points at scheduler `ready` time, not socket or
-  dispatch time: `ready` was about `0.143s`, `fd_dispatch` about `0.0012s`,
-  and `ready_handle_native` stayed at zero in the runtime profile
+- TLS keepalive profiling still shows scheduler `ready` time as the big bucket,
+  but the latest TLS callback pass moved it from about `0.0607s` to `0.0500s`
+  on the 256-request runtime sample; the next credible step is a deeper native
+  SSLProtocol-style path or more callback specialization on top of it
