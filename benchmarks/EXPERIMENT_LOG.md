@@ -104,6 +104,30 @@ performance pass, including changes that were reverted.
 - Artifact:
   [`benchmarks/out/ab-interleaved-buffered-flag-fixed/summary.json`](out/ab-interleaved-buffered-flag-fixed/summary.json)
 
+### 22. Logical read cursor with raw-pointer access
+
+- Area: [`src/stream_transport.rs`](../src/stream_transport.rs)
+- Change:
+  - keep unread bytes in the Python `bytearray` behind a logical cursor instead
+    of front-shifting on every partial consume
+  - switch the hot read helpers to raw bytearray pointers so the cursor does
+    not pay extra `clone_ref()` / `bind()` churn
+  - compact lazily only when the consumed prefix grows large
+- Result:
+  - `asgi_streaming` `0.109066s` vs `0.134885s` (`0.809x` vs `uvloop`)
+  - `start_tls_upgrade` `0.043223s` vs `0.073634s` (`0.587x` vs `uvloop`)
+  - `http1_keepalive_small` `0.223702s` vs `0.214296s` (`1.044x` vs `uvloop`)
+  - `asgi_keepalive` landed around parity in the cleaner targeted runs
+  - remaining gaps stayed in the TLS / JSON / gRPC-style paths:
+    `tls_http1_keepalive`, `asgi_json_echo`, `grpc_like_unary`,
+    `http1_streaming_response`, `tcp_accept_burst`
+- Decision: kept
+- Notes:
+  - this is the first buffer experiment that clearly helped `start_tls_upgrade`
+    and the streaming keepalive-style paths at the same time
+  - the TLS keepalive regression is not explained by the stream-buffer profile
+    alone; see Open Direction
+
 ## Reverted Experiments
 
 ### 4. Immediate small direct writes up to 256 bytes
@@ -324,6 +348,27 @@ performance pass, including changes that were reverted.
   task-heavy regressions were not worth the app-side wins
 - Artifact: [`benchmarks/out/perf-full-taskwakeup.json`](out/perf-full-taskwakeup.json)
 
+### 23. Tighten read-buffer compaction to 8 KiB
+
+- Area: [`src/stream_transport.rs`](../src/stream_transport.rs)
+- Change: compact the logical read cursor sooner.
+- Result:
+  - `asgi_keepalive` `1.100x`
+  - `tls_http1_keepalive` `1.355x`
+  - `asgi_json_echo` `1.642x`
+  - `grpc_like_unary` `1.066x`
+  - `start_tls_upgrade` `1.130x`
+- Decision: reverted
+
+### 24. Tighten read-buffer compaction to 32 KiB
+
+- Area: [`src/stream_transport.rs`](../src/stream_transport.rs)
+- Change: try a middle-ground compaction threshold between 8 KiB and 64 KiB.
+- Result:
+  - `asgi_keepalive` `1.014x`
+  - `tls_http1_keepalive` `1.545x`
+- Decision: reverted
+
 ## Open Direction
 
 The main conclusion so far is that callback-level micro-optimizations are not
@@ -334,3 +379,6 @@ are:
 - buffered-read / stream lifecycle work
 - TLS path work that improves real app traffic instead of just handshake or
   microbenchmarks
+- TLS keepalive profiling still points at scheduler `ready` time, not socket or
+  dispatch time: `ready` was about `0.143s`, `fd_dispatch` about `0.0012s`,
+  and `ready_handle_native` stayed at zero in the runtime profile
