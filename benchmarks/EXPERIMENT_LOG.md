@@ -302,6 +302,28 @@ performance pass, including changes that were reverted.
   regressions
 - Artifact: [`benchmarks/out/ab-interleaved-taskwakeup/summary.json`](out/ab-interleaved-taskwakeup/summary.json)
 
+### 21. Task wakeup fast path with smaller handle state
+
+- Area: [`src/handles.rs`](../src/handles.rs)
+- Change: cache a direct C callback target for `Task.task_wakeup` inside
+  `OneArgHandle`, then shrink the stored direct-call state to reduce handle
+  footprint.
+- Full-profile result:
+  - `asgi_json_echo` `1.062x`
+  - `asgi_keepalive` `1.060x`
+  - `asgi_streaming` `1.121x`
+  - `grpc_like_unary` `0.955x`
+  - `http1_keepalive_small` `0.997x`
+  - `http1_streaming_response` `1.149x`
+  - `tcp_rpc_parallel` `1.072x`
+  - `future_completion_storm` `1.329x`
+  - `task_create_gather` `1.196x`
+  - `tls_http1_keepalive` `1.623x`
+  - `start_tls_upgrade` `0.884x`
+- Decision: reverted; the broader full profile still showed the TLS and
+  task-heavy regressions were not worth the app-side wins
+- Artifact: [`benchmarks/out/perf-full-taskwakeup.json`](out/perf-full-taskwakeup.json)
+
 ## Open Direction
 
 The main conclusion so far is that callback-level micro-optimizations are not
