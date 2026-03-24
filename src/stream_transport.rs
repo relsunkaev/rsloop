@@ -596,6 +596,10 @@ impl StreamTransport {
 
     fn set_protocol(slf: Py<Self>, py: Python<'_>, protocol: Py<PyAny>) -> PyResult<()> {
         let core = slf.borrow(py).core.clone();
+        let buffered_protocol = {
+            let protocol_ref = protocol.bind(py);
+            protocol_ref.hasattr("get_buffer")? && protocol_ref.hasattr("buffer_updated")?
+        };
         if trace_stream_enabled() {
             eprintln!(
                 "stream-transport set_protocol fd={} type={}",
@@ -603,7 +607,9 @@ impl StreamTransport {
                 protocol.bind(py).get_type().name()?
             );
         }
-        core.borrow_mut().protocol = protocol;
+        let mut core = core.borrow_mut();
+        core.protocol = protocol;
+        core.buffered_protocol = buffered_protocol;
         Ok(())
     }
 
@@ -1125,7 +1131,7 @@ impl StreamCore {
         }
         let protocol = self.protocol.clone_ref(py);
         let protocol = protocol.bind(py);
-        if protocol.hasattr("get_buffer")? && protocol.hasattr("buffer_updated")? {
+        if self.buffered_protocol {
             if trace_stream_enabled() {
                 eprintln!("stream-transport ssl-on_readable fd={}", self.fd);
             }
