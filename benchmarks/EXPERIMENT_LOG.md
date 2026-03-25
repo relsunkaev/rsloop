@@ -1,6 +1,6 @@
 # Performance Experiment Log
 
-Last updated: 2026-03-24
+Last updated: 2026-03-25
 
 This file tracks the optimization experiments tried during the current rsloop
 performance pass, including changes that were reverted.
@@ -389,6 +389,24 @@ performance pass, including changes that were reverted.
   - [`benchmarks/out/ab-current-tls-cached-hooks-starttls.json`](out/ab-current-tls-cached-hooks-starttls.json)
   - [`benchmarks/out/ab-current-tls-cached-hooks-handshake.json`](out/ab-current-tls-cached-hooks-handshake.json)
   - [`benchmarks/out/tls-http1-keepalive-runtime-tls-cached-hooks.json`](out/tls-http1-keepalive-runtime-tls-cached-hooks.json)
+
+### 26. Native TLS app-data / callback handling pass
+
+- Area: [`python/rsloop/loop.py`](../python/rsloop/loop.py),
+  [`src/stream_transport.rs`](../src/stream_transport.rs),
+  [`src/stream_registry.rs`](../src/stream_registry.rs)
+- Change: attempt a deeper native TLS path to shift wrapped read/write handling
+  and callback ordering out of stdlib `SSLProtocol`.
+- Result:
+  - direct TLS HTTP repro failed with
+    `ssl.SSLError: [SSL: RECORD_LAYER_FAILURE] record layer failure`
+  - the server-side plaintext read path broke before benchmark validation
+- Decision: reverted
+- Notes:
+  - the experiment did not produce stable measurements, so it should not be
+    treated as a benchmark result
+  - the failure points at remaining correctness work around TLS record-layer
+    handling and read ordering
 
 ## Open Direction
 
