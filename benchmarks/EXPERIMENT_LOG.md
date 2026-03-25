@@ -516,6 +516,56 @@ performance pass, including changes that were reverted.
   waiter resume path regressed too many non-TLS workloads even though the
   mechanism itself worked for plain stream waiters
 
+### 31. TLS buffered-read batching for stdlib `SSLProtocol`
+
+- Area: [`src/stream_transport.rs`](../src/stream_transport.rs)
+- Change:
+  - for buffered/TLS protocols, try to fill more of the writable buffer before
+    calling `buffer_updated()`
+  - batch multiple raw `recv_into()` reads into one dispatch and carry EOF
+    through the same buffered callback path
+- Rationale:
+  - runtime traces showed TLS steady-state traffic still dominated by
+    scheduler `ready` time and stdlib `SSLProtocol` callbacks
+  - the working hypothesis was that rsloop was delivering overly fragmented
+    encrypted reads, leading to too many `buffer_updated()` /
+    `_do_read__buffered()` / `feed_data()` hops
+- Functional result:
+  - the first implementation had a compile break in `on_readable()` because the
+    new EOF-after-buffered path referenced a missing `protocol` binding; fixed
+    during the experiment
+  - focused smokes passed after the fix:
+    `test_native_start_tls` and `test_tcp_socket_helpers_repeated_roundtrip`
+- Initial interleaved A/B versus clean `HEAD` (3 repeats):
+  - `tls_http1_keepalive` `0.240535459s -> 0.191891250s` (`-20.22%`)
+  - `start_tls_upgrade` `0.046506250s -> 0.047563000s` (`+2.27%`)
+  - `http1_keepalive_small` `0.320607125s -> 0.315441917s` (`-1.61%`)
+  - `asgi_keepalive` `0.169853167s -> 0.165371792s` (`-2.64%`)
+  - `grpc_like_unary` (3 repeats) initially looked worse at `+4.40%`
+- Follow-up checks:
+  - `grpc_like_unary` did **not** hold the regression on a tighter 5-repeat A/B:
+    `0.141363s -> 0.139675s` (`-1.19%`)
+  - direct current-vs-`uvloop` spot checks only showed a small absolute change:
+    - `tls_http1_keepalive` `1.528x`
+    - `http1_keepalive_small` `1.053x`
+    - `grpc_like_unary` `1.029x`
+  - a tighter 5-repeat interleaved A/B on the main target collapsed the win to
+    noise:
+    - `tls_http1_keepalive` `0.181930s -> 0.180706s` (`-0.67%`)
+  - `asgi_json_echo` produced wildly inconsistent A/B rounds during this pass
+    (`0.166s`, `1.216s`, `1.296s` baseline samples), so it was discarded as a
+    decision signal for this experiment
+- Decision: reverted; the promising 3-repeat TLS keepalive result was a false
+  positive and did not survive a tighter 5-repeat A/B
+- Artifacts:
+  - [`benchmarks/out/ab-tls-http1-keepalive-batch.json`](out/ab-tls-http1-keepalive-batch.json)
+  - [`benchmarks/out/ab-tls-http1-keepalive-batch-r5.json`](out/ab-tls-http1-keepalive-batch-r5.json)
+  - [`benchmarks/out/ab-start-tls-upgrade-batch.json`](out/ab-start-tls-upgrade-batch.json)
+  - [`benchmarks/out/ab-http1-keepalive-small-batch.json`](out/ab-http1-keepalive-small-batch.json)
+  - [`benchmarks/out/ab-asgi-keepalive-batch.json`](out/ab-asgi-keepalive-batch.json)
+  - [`benchmarks/out/ab-grpc-like-unary-batch-r5.json`](out/ab-grpc-like-unary-batch-r5.json)
+  - [`benchmarks/out/ab-asgi-json-echo-batch.json`](out/ab-asgi-json-echo-batch.json)
+
 ## Open Direction
 
 The main conclusion so far is that callback-level micro-optimizations are not
