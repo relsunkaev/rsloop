@@ -909,3 +909,49 @@ hop or a repeated protocol lookup. The remaining credible directions are:
   - [`benchmarks/out/start-tls-upgrade-all-candidate.json`](out/start-tls-upgrade-all-candidate.json)
   - [`benchmarks/out/http1-keepalive-small-all-candidate.json`](out/http1-keepalive-small-all-candidate.json)
   - [`benchmarks/out/asgi-json-echo-all-candidate.json`](out/asgi-json-echo-all-candidate.json)
+
+### 40. TLS multi-chunk native StreamReader append
+
+- Area:
+  - [`python/rsloop/sslproto.py`](../python/rsloop/sslproto.py)
+  - [`src/stream_transport.rs`](../src/stream_transport.rs)
+  - [`src/lib.rs`](../src/lib.rs)
+- Change:
+  - add `_rsloop.feed_stream_reader_data()` and `_rsloop.feed_stream_reader_eof()`
+    so TLS can reuse native `StreamReader` buffer/waiter/backpressure updates
+  - first tried routing every TLS `feed_data()` call through the new helper
+  - narrowed that to a hybrid policy:
+    - single-chunk copied reads keep using cached Python `reader.feed_data()`
+    - two-chunk reads keep using Python `b''.join(...)` plus `feed_data()`
+    - only 3+ chunk copied reads use the native append helper
+- Rationale:
+  - the tuned TLS protocol still paid Python allocation and `StreamReader`
+    method overhead when a copied-mode TLS read produced multiple decrypted
+    fragments
+- Functional result:
+  - full unittest suite passed after wiring the helper into the extension and
+    rebuilding with `maturin develop --release`
+- Revision A/B against the previous kept TLS revision (`HEAD`):
+  - first fully-native handoff draft regressed `tls_http1_keepalive` by
+    `+17.72%`
+  - hybrid single-chunk path regressed by `+2.98%`
+  - final 3+-chunk-only helper:
+    - `tls_http1_keepalive`: `0.192875s -> 0.181689s` (`-5.80%`)
+    - `start_tls_upgrade`: `0.039380s -> 0.036604s` (`-7.05%`)
+- Guard checks:
+  - `http1_keepalive_small`: `+0.45%` on a stricter 7-repeat / 2-warmup A/B
+  - `asgi_json_echo`: `-2.79%`
+- Cross-loop spot checks were noisy on macOS and not used as the keep/revert
+  gate for this slice; the interleaved revision A/Bs were materially more
+  stable for this change
+- Conclusion:
+  - native `StreamReader` mutation can help TLS steady-state traffic, but only
+    when it replaces a meaningfully expensive multi-fragment path
+  - applying the helper to every decrypted chunk was a regression; the final
+    win came from using it only when TLS produced 3+ copied chunks
+- Decision: kept
+- Artifacts:
+  - [`benchmarks/out/revision-ab-tls-reader-helper-v3.json`](out/revision-ab-tls-reader-helper-v3.json)
+  - [`benchmarks/out/revision-ab-start-tls-reader-helper-v3.json`](out/revision-ab-start-tls-reader-helper-v3.json)
+  - [`benchmarks/out/revision-ab-http1-reader-helper-v3-strict.json`](out/revision-ab-http1-reader-helper-v3-strict.json)
+  - [`benchmarks/out/revision-ab-asgi-reader-helper-v3.json`](out/revision-ab-asgi-reader-helper-v3.json)
