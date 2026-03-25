@@ -449,6 +449,36 @@ performance pass, including changes that were reverted.
     in the SSL transport call site
 - Decision: reverted; too many regressions and a TLS correctness break
 
+### 29. Stream waiter context-copy C-API fast path
+
+- Area: [`src/stream_transport.rs`](../src/stream_transport.rs)
+- Change:
+  - replace Python-level `contextvars.copy_context()` in
+    `StreamWaiter.add_done_callback()` with the C-API
+    `PyContext_CopyCurrent()`
+- Initial targeted `rsloop`-only A/B versus clean `HEAD`:
+  - `http1_keepalive_small` `0.228305542s -> 0.219377458s` (`-3.91%`)
+  - `http1_streaming_response` `0.106581542s -> 0.105338125s` (`-1.17%`)
+  - `asgi_json_echo` `0.118730375s -> 0.114386000s` (`-3.66%`)
+  - `asgi_keepalive` `0.117113292s -> 0.122719792s` (`+4.79%`)
+  - `asgi_streaming` `0.107081042s -> 0.105759334s` (`-1.23%`)
+  - `grpc_like_unary` `0.107249625s -> 0.108508166s` (`+1.17%`)
+  - `tls_http1_keepalive` `0.154162250s -> 0.151561750s` (`-1.69%`)
+  - `start_tls_upgrade` `0.049731292s -> 0.040155833s` (`-19.25%`)
+- Tightened interleaved A/B:
+  - `http1_keepalive_small` `+1.90%`
+  - `asgi_json_echo` `+3.01%`
+  - `asgi_keepalive` `+5.62%`
+  - `asgi_streaming` `-2.11%`
+  - `grpc_like_unary` `+5.36%`
+  - `tls_http1_keepalive` `-4.17%`
+- Decision: reverted; the tighter run showed broader real-workload regressions
+  than wins
+- Artifacts:
+  - [`benchmarks/out/ab-contextcopy-baseline-summary.json`](out/ab-contextcopy-baseline-summary.json)
+  - [`benchmarks/out/ab-contextcopy-current-summary.json`](out/ab-contextcopy-current-summary.json)
+  - [`benchmarks/out/ab-contextcopy-interleaved-summary.json`](out/ab-contextcopy-interleaved-summary.json)
+
 ## Open Direction
 
 The main conclusion so far is that callback-level micro-optimizations are not
