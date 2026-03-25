@@ -1196,3 +1196,62 @@ hop or a repeated protocol lookup. The remaining credible directions are:
   - [`benchmarks/out/revision-ab-http1-wakeup-cache-strict.json`](out/revision-ab-http1-wakeup-cache-strict.json)
   - [`benchmarks/out/revision-ab-http1-wakeup-cache-confirm.json`](out/revision-ab-http1-wakeup-cache-confirm.json)
   - [`benchmarks/out/tls-http1-all-wakeup-cache.json`](out/tls-http1-all-wakeup-cache.json)
+
+### 47. Native Unix write-pipe transport
+
+- Area:
+  - [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+  - `src/pipe_transport.rs` (reverted)
+- Change:
+  - replace stdlib `_UnixWritePipeTransport` with an rsloop-owned Rust
+    transport for `connect_write_pipe()` and subprocess stdin
+  - native hot path used direct `libc::write`, a Rust-side pending buffer, and
+    native `_on_writable` callbacks
+  - a second tuning pass added `bytes` / `bytearray` fast paths to avoid the
+    generic Python buffer-protocol overhead on every `write()`
+- Rationale:
+  - focused CPU profiling showed stdlib
+    `asyncio.unix_events._UnixWritePipeTransport.write()` dominating
+    `pipe_write`, with `os.write` itself only about half the cost
+- Functional result:
+  - targeted pipe/subprocess tests passed on both drafts
+- Revision A/B against `HEAD`:
+  - first strict sequential run:
+    - `pipe_write`: `0.006082s -> 0.006402s` (`+5.26%`)
+  - tuned `bytes` fast path:
+    - `pipe_write`: `0.005662s -> 0.005714s` (`+0.93%`)
+- Notes:
+  - an earlier parallel A/B run falsely showed `-3.24%`; that result was
+    discarded after rerunning sequentially
+  - the transport likely removed some Python overhead, but the remaining
+    Python-to-Rust crossing plus buffer coercion kept it below the keep bar
+- Conclusion:
+  - a real native write-pipe transport is plausible, but this version was not
+    a win and did not justify more surface area
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/revision-ab-pipe-write-native-transport-seq.json`](out/revision-ab-pipe-write-native-transport-seq.json)
+  - [`benchmarks/out/revision-ab-pipe-write-native-transport-bytesfast.json`](out/revision-ab-pipe-write-native-transport-bytesfast.json)
+
+### 48. Cached subprocess exit callback
+
+- Area:
+  - [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+- Change:
+  - cache `transport._process_exited` once during subprocess transport creation
+  - use the cached bound method from `_child_watcher_callback()` instead of
+    rebuilding the bound method for every child exit
+- Rationale:
+  - `subprocess_exec` is already close to parity, so the cheapest remaining
+    hypothesis was to remove a small Python-bound-method allocation on the
+    child-watcher thread
+- Functional result:
+  - subprocess tests passed
+- Revision A/B against `HEAD`:
+  - `subprocess_exec`: `0.936902s -> 1.016443s` (`+8.49%`)
+- Conclusion:
+  - this callback-level tweak is the wrong layer; the subprocess gap is not the
+    bound-method lookup in `_child_watcher_callback()`
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/revision-ab-subprocess-exit-cache-seq.json`](out/revision-ab-subprocess-exit-cache-seq.json)
