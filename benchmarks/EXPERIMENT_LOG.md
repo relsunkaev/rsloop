@@ -566,6 +566,79 @@ performance pass, including changes that were reverted.
   - [`benchmarks/out/ab-grpc-like-unary-batch-r5.json`](out/ab-grpc-like-unary-batch-r5.json)
   - [`benchmarks/out/ab-asgi-json-echo-batch.json`](out/ab-asgi-json-echo-batch.json)
 
+### 32. TLS app-protocol coalescing above stdlib `SSLProtocol`
+
+- Area: [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+- Change:
+  - wrap TLS `StreamReaderProtocol` instances in a small protocol proxy that
+    buffers multiple `data_received()` calls and flushes them once with
+    `loop.call_soon()`
+- Rationale:
+  - fresh TLS traces showed rsloop still delivering roughly `8070`
+    `feed_data()` calls for `968704` bytes where `uvloop` delivered `4096`
+  - the goal was to cut `reader.feed_data()` wakeups without rewriting
+    `SSLProtocol`
+- Functional result:
+  - focused smokes passed:
+    `test_native_start_tls` and `test_tcp_socket_helpers_repeated_roundtrip`
+- Runtime trace result on `tls_http1_keepalive`:
+  - `feed_data_calls` dropped `8070 -> 6479`
+  - but the benchmark got slower `0.178044125s -> 0.239805041s`
+  - scheduler `ready` time rose `0.099186s -> 0.163925s`
+  - `Task.task_wakeup` total rose `62.392ms -> 71.437ms`
+  - header/body phases moved the wrong way overall:
+    - `http.client.read_response_head` `972.888ms -> 1069.220ms`
+    - `http.server.read_headers` `969.741ms -> 1060.850ms`
+- Conclusion:
+  - delaying the first decrypted chunk to coalesce later chunks hurt latency
+    more than it helped wakeup count
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/tls_http1_keepalive-rsloop-runtime-coalesced.json`](out/tls_http1_keepalive-rsloop-runtime-coalesced.json)
+
+### 33. Native TLS decrypted-buffer reader bridge
+
+- Area: [`src/stream_transport.rs`](../src/stream_transport.rs),
+  [`src/lib.rs`](../src/lib.rs),
+  [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+- Change:
+  - prototype a native `StreamReaderBridge` for TLS streams
+  - keep stdlib `SSLProtocol`, but patch TLS `StreamReader` instances so
+    `readexactly()` / `readuntil()` use rsloop-native waiters and scans on top
+    of the decrypted `reader._buffer`
+  - wrap the TLS app protocol so the bridge gets immediate
+    `after_data_received()` / `after_eof()` notifications with no deferred
+    coalescing
+- Rationale:
+  - the coalescing pass proved that reducing `feed_data()` count by delaying
+    delivery was the wrong trade
+  - the next idea was to leave delivery immediate but cut the Python work in
+    stdlib `readuntil()` / `readexactly()` after each TLS chunk
+- Functional result:
+  - compile issues around Rust borrowing were fixed during the experiment
+  - focused smokes passed:
+    `test_native_start_tls` and `test_tcp_socket_helpers_repeated_roundtrip`
+- Runtime trace result on `tls_http1_keepalive`:
+  - headers improved slightly:
+    - `http.client.read_response_head` `972.888ms -> 965.646ms`
+    - `http.server.read_headers` `969.741ms -> 966.728ms`
+  - but the overall path still regressed:
+    - sample `0.178044125s -> 0.193317375s`
+    - scheduler `ready` time `0.099186s -> 0.115499s`
+    - `Task.task_wakeup` total `62.392ms -> 66.483ms`
+- Interleaved A/B versus clean `HEAD`:
+  - `tls_http1_keepalive` `0.160595s -> 0.177139s` (`+10.30%`)
+  - `http1_keepalive_small` `0.304442s -> 0.326810s` (`+7.35%`)
+- Conclusion:
+  - moving TLS `readuntil()` / `readexactly()` onto native waiters without a
+    deeper TLS protocol change still added enough extra machinery around the
+    existing stdlib path to lose overall
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/tls_http1_keepalive-rsloop-runtime-reader-bridge.json`](out/tls_http1_keepalive-rsloop-runtime-reader-bridge.json)
+  - [`benchmarks/out/ab-tls-http1-keepalive-reader-bridge.json`](out/ab-tls-http1-keepalive-reader-bridge.json)
+  - [`benchmarks/out/ab-http1-keepalive-small-reader-bridge.json`](out/ab-http1-keepalive-small-reader-bridge.json)
+
 ## Open Direction
 
 The main conclusion so far is that callback-level micro-optimizations are not
