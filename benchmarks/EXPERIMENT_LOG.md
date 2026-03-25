@@ -479,6 +479,43 @@ performance pass, including changes that were reverted.
   - [`benchmarks/out/ab-contextcopy-current-summary.json`](out/ab-contextcopy-current-summary.json)
   - [`benchmarks/out/ab-contextcopy-interleaved-summary.json`](out/ab-contextcopy-interleaved-summary.json)
 
+### 30. Env-gated Python task with direct `StreamWaiter` resume
+
+- Area: [`python/rsloop/loop.py`](../python/rsloop/loop.py),
+  [`python/rsloop/task.py`](../python/rsloop/task.py),
+  [`src/stream_transport.rs`](../src/stream_transport.rs)
+- Change:
+  - prototype an env-gated custom task factory based on `asyncio.tasks._PyTask`
+  - when a task awaited a native `StreamWaiter`, register the task directly on
+    the waiter and resume it through a zero-arg handle instead of scheduling
+    the usual one-arg `Task.task_wakeup` callback
+- Functional result:
+  - the first prototype needed extra compatibility shims for
+    `asyncio.current_task()` / `asyncio.all_tasks()` in Python 3.14 because the
+    default C builtins do not see `_PyTask`
+  - after those shims, targeted loop tests passed under the env flag
+- Targeted `rsloop`-only A/B with the env flag off vs on:
+  - `http1_keepalive_small` `0.298071458s -> 0.328320958s` (`+10.15%`)
+  - `http1_streaming_response` `0.117935292s -> 0.118046542s` (`+0.09%`)
+  - `asgi_json_echo` `0.148487083s -> 0.152993709s` (`+3.04%`)
+  - `asgi_keepalive` `0.170888833s -> 0.178208625s` (`+4.28%`)
+  - `asgi_streaming` `0.117828708s -> 0.124516708s` (`+5.68%`)
+  - `grpc_like_unary` `0.136319208s -> 0.143473292s` (`+5.25%`)
+  - `tls_http1_keepalive` `0.196055500s -> 0.173776875s` (`-11.36%`)
+- Runtime-profile result:
+  - on `http1_keepalive_small`, the direct waiter path worked mechanically:
+    `ready_zero_arg` rose to `16389` and `ready_one_arg` fell to `4`
+  - on `tls_http1_keepalive`, the direct waiter path did **not** apply because
+    the hot TLS waits still go through stdlib SSL/Future machinery; the trace
+    still showed `RsloopTask.__wakeup` dominating one-arg callbacks
+- Additional conclusion:
+  - subclassing the C `_asyncio.Task` does not expose an overrideable
+    `task_wakeup` hook, so a C-task version of this prototype is not reachable
+    from Python alone
+- Decision: reverted; the pure-Python task needed to prototype the direct
+  waiter resume path regressed too many non-TLS workloads even though the
+  mechanism itself worked for plain stream waiters
+
 ## Open Direction
 
 The main conclusion so far is that callback-level micro-optimizations are not
