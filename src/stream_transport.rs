@@ -65,6 +65,37 @@ struct PendingRead {
     waiter: Py<StreamWaiter>,
 }
 
+struct NativeSslCache {
+    ssl_buffer_view: Py<PyAny>,
+    incoming_write: Py<PyAny>,
+    sslobj_read: Py<PyAny>,
+    outgoing_read: Py<PyAny>,
+    transport_write: Option<Py<PyAny>>,
+    stream_reader: Option<Py<PyAny>>,
+    stream_reader_buffer: Option<Py<PyByteArray>>,
+    stream_reader_limit: usize,
+    max_size: usize,
+}
+
+impl NativeSslCache {
+    fn clone_ref(&self, py: Python<'_>) -> Self {
+        Self {
+            ssl_buffer_view: self.ssl_buffer_view.clone_ref(py),
+            incoming_write: self.incoming_write.clone_ref(py),
+            sslobj_read: self.sslobj_read.clone_ref(py),
+            outgoing_read: self.outgoing_read.clone_ref(py),
+            transport_write: self.transport_write.as_ref().map(|value| value.clone_ref(py)),
+            stream_reader: self.stream_reader.as_ref().map(|value| value.clone_ref(py)),
+            stream_reader_buffer: self
+                .stream_reader_buffer
+                .as_ref()
+                .map(|value| value.clone_ref(py)),
+            stream_reader_limit: self.stream_reader_limit,
+            max_size: self.max_size,
+        }
+    }
+}
+
 enum PendingReadKind {
     Exact(usize),
     Until { separator: Vec<u8>, offset: usize },
@@ -165,6 +196,7 @@ pub(crate) struct StreamCore {
     fd: RawFd,
     protocol: Py<PyAny>,
     native_ssl_protocol: bool,
+    native_ssl_cache: Option<NativeSslCache>,
     buffered_protocol: bool,
     buffered_get_buffer: Option<Py<PyAny>>,
     buffered_buffer_updated: Option<Py<PyAny>>,
@@ -513,6 +545,11 @@ impl StreamTransport {
         };
         let protocol_ref = protocol.bind(py);
         let native_ssl_protocol = is_rsloop_ssl_protocol(&protocol_ref)?;
+        let native_ssl_cache = if native_ssl_protocol {
+            Some(build_native_ssl_cache(py, &protocol_ref)?)
+        } else {
+            None
+        };
         let (buffered_protocol, buffered_get_buffer, buffered_buffer_updated) =
             buffered_protocol_methods(&protocol_ref)?;
         let fd = sock.bind(py).call_method0("fileno")?.extract::<i32>()? as RawFd;
@@ -543,6 +580,7 @@ impl StreamTransport {
             fd,
             protocol,
             native_ssl_protocol,
+            native_ssl_cache,
             buffered_protocol,
             buffered_get_buffer,
             buffered_buffer_updated,
@@ -612,6 +650,11 @@ impl StreamTransport {
         protocol
             .bind(py)
             .call_method1("connection_made", (transport.clone().into_any(),))?;
+        if core.borrow().native_ssl_protocol {
+            let protocol = core.borrow().protocol.clone_ref(py);
+            core.borrow_mut().native_ssl_cache =
+                Some(build_native_ssl_cache(py, &protocol.bind(py))?);
+        }
 
         transports.bind(py).set_item(fd, transport)?;
         registry
@@ -651,6 +694,11 @@ impl StreamTransport {
         let core = slf.borrow(py).core.clone();
         let protocol_ref = protocol.bind(py);
         let native_ssl_protocol = is_rsloop_ssl_protocol(&protocol_ref)?;
+        let native_ssl_cache = if native_ssl_protocol {
+            Some(build_native_ssl_cache(py, &protocol_ref)?)
+        } else {
+            None
+        };
         let (buffered_protocol, buffered_get_buffer, buffered_buffer_updated) =
             buffered_protocol_methods(&protocol_ref)?;
         if trace_stream_enabled() {
@@ -663,6 +711,7 @@ impl StreamTransport {
         let mut core = core.borrow_mut();
         core.protocol = protocol;
         core.native_ssl_protocol = native_ssl_protocol;
+        core.native_ssl_cache = native_ssl_cache;
         core.buffered_protocol = buffered_protocol;
         core.buffered_get_buffer = buffered_get_buffer;
         core.buffered_buffer_updated = buffered_buffer_updated;
@@ -1269,9 +1318,13 @@ impl StreamCore {
 
     fn on_readable_native_ssl(&mut self, py: Python<'_>) -> PyResult<()> {
         let protocol = self.protocol.clone_ref(py);
-        let ssl_view = protocol.bind(py).getattr("_ssl_buffer_view")?.unbind();
+        let ssl_cache = self
+            .native_ssl_cache
+            .as_ref()
+            .map(|cache| cache.clone_ref(py))
+            .ok_or_else(|| PyRuntimeError::new_err("missing native TLS cache"))?;
         loop {
-            let buffer = PyBuffer::<u8>::get(&ssl_view.bind(py))?;
+            let buffer = PyBuffer::<u8>::get(&ssl_cache.ssl_buffer_view.bind(py))?;
             let Some(cells) = buffer.as_mut_slice(py) else {
                 return self.finish_close(
                     py,
@@ -1294,7 +1347,7 @@ impl StreamCore {
                 Ok(n) => {
                     self.record_profile_event("ssl_native_read", n, self.pending_write_bytes);
                     if let Err(err) =
-                        rsloop_sslproto_buffer_updated(py, &protocol.bind(py), &ssl_view.bind(py), n)
+                        rsloop_sslproto_buffer_updated_cached(py, &protocol.bind(py), &ssl_cache, n)
                     {
                         return self.finish_close(py, Some(err.into_value(py).into_any()));
                     }
@@ -3123,15 +3176,51 @@ fn ssl_again_errors(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
         .bind(py))
 }
 
-fn rsloop_sslproto_buffer_updated(
+fn build_native_ssl_cache(
+    _py: Python<'_>,
+    protocol: &Bound<'_, PyAny>,
+) -> PyResult<NativeSslCache> {
+    let stream_reader = match protocol.getattr("_rsloop_stream_reader") {
+        Ok(reader) if !reader.is_none() => Some(reader.unbind()),
+        _ => None,
+    };
+    let stream_reader_buffer = match protocol.getattr("_rsloop_stream_reader_buffer") {
+        Ok(buffer) if !buffer.is_none() => {
+            Some(buffer.cast_into::<PyByteArray>()?.unbind())
+        }
+        _ => None,
+    };
+    let stream_reader_limit = protocol
+        .getattr("_rsloop_stream_reader_limit")
+        .ok()
+        .and_then(|limit| limit.extract::<usize>().ok())
+        .unwrap_or(0);
+    let transport_write = match protocol.getattr("_rsloop_transport_write") {
+        Ok(write) if !write.is_none() => Some(write.unbind()),
+        _ => None,
+    };
+    Ok(NativeSslCache {
+        ssl_buffer_view: protocol.getattr("_ssl_buffer_view")?.unbind(),
+        incoming_write: protocol.getattr("_rsloop_incoming_write")?.unbind(),
+        sslobj_read: protocol.getattr("_rsloop_sslobj_read")?.unbind(),
+        outgoing_read: protocol.getattr("_rsloop_outgoing_read")?.unbind(),
+        transport_write,
+        stream_reader,
+        stream_reader_buffer,
+        stream_reader_limit,
+        max_size: protocol.getattr("max_size")?.extract::<usize>()?,
+    })
+}
+
+fn rsloop_sslproto_buffer_updated_cached(
     py: Python<'_>,
     protocol: &Bound<'_, PyAny>,
-    ssl_view: &Bound<'_, PyAny>,
+    cache: &NativeSslCache,
     nbytes: usize,
 ) -> PyResult<()> {
     let slice = PySlice::new(py, 0, nbytes as isize, 1);
-    let payload = ssl_view.get_item(slice)?;
-    protocol.getattr("_rsloop_incoming_write")?.call1((payload,))?;
+    let payload = cache.ssl_buffer_view.bind(py).get_item(slice)?;
+    cache.incoming_write.bind(py).call1((payload,))?;
 
     let state = protocol.getattr("_state")?;
     if state.as_ptr() == sslproto_state_do_handshake(py)?.as_ptr() {
@@ -3145,12 +3234,12 @@ fn rsloop_sslproto_buffer_updated(
             if protocol.getattr("_app_protocol_is_buffer")?.is_truthy()? {
                 protocol.call_method0("_do_read__buffered")?;
             } else {
-                rsloop_sslproto_do_read_copied(py, protocol)?;
+                rsloop_sslproto_do_read_copied_cached(py, protocol, cache)?;
             }
             if protocol.getattr("_write_backlog")?.is_truthy()? {
                 protocol.call_method0("_do_write")?;
             } else {
-                rsloop_sslproto_process_outgoing(py, protocol)?;
+                rsloop_sslproto_process_outgoing_cached(py, protocol, cache)?;
             }
         }
         protocol.call_method0("_control_ssl_reading")?;
@@ -3162,20 +3251,21 @@ fn rsloop_sslproto_buffer_updated(
     Ok(())
 }
 
-fn rsloop_sslproto_do_read_copied(py: Python<'_>, protocol: &Bound<'_, PyAny>) -> PyResult<()> {
-    let reader = protocol.getattr("_rsloop_stream_reader")?;
-    if reader.is_none() {
+fn rsloop_sslproto_do_read_copied_cached(
+    py: Python<'_>,
+    protocol: &Bound<'_, PyAny>,
+    cache: &NativeSslCache,
+) -> PyResult<()> {
+    let Some(reader) = cache.stream_reader.as_ref() else {
         protocol.call_method0("_do_read__copied")?;
         return Ok(());
-    }
+    };
 
-    let sslobj_read = protocol.getattr("_rsloop_sslobj_read")?;
-    let max_size = protocol.getattr("max_size")?.extract::<usize>()?;
     let mut chunks: Vec<Py<PyBytes>> = Vec::new();
     let mut total = 0usize;
     let mut saw_eof = false;
     loop {
-        match sslobj_read.call1((max_size,)) {
+        match cache.sslobj_read.bind(py).call1((cache.max_size,)) {
             Ok(chunk) => {
                 let chunk = chunk.cast_into::<PyBytes>()?;
                 if chunk.as_bytes().is_empty() {
@@ -3191,12 +3281,10 @@ fn rsloop_sslproto_do_read_copied(py: Python<'_>, protocol: &Bound<'_, PyAny>) -
     }
 
     if !chunks.is_empty() {
-        let buffer = protocol
-            .getattr("_rsloop_stream_reader_buffer")?
-            .cast_into::<PyByteArray>()?;
-        let limit = protocol
-            .getattr("_rsloop_stream_reader_limit")?
-            .extract::<usize>()?;
+        let Some(buffer) = cache.stream_reader_buffer.as_ref() else {
+            protocol.call_method0("_do_read__copied")?;
+            return Ok(());
+        };
         match chunks.len() {
             1 => {
                 append_to_bytearray(buffer.as_ptr(), chunks[0].bind(py).as_bytes())?;
@@ -3209,44 +3297,50 @@ fn rsloop_sslproto_do_read_copied(py: Python<'_>, protocol: &Bound<'_, PyAny>) -
                 append_to_bytearray(buffer.as_ptr(), &joined)?;
             }
         }
+        let reader = reader.bind(py);
         wake_waiter(py, &reader)?;
-        pause_reader_if_needed_limit(py, &reader, buffer.as_ptr(), limit)?;
+        pause_reader_if_needed_limit(py, &reader, buffer.as_ptr(), cache.stream_reader_limit)?;
     }
 
     if saw_eof {
-        rsloop_sslproto_call_eof_received(py, protocol)?;
+        rsloop_sslproto_call_eof_received_cached(py, protocol, cache)?;
         protocol.call_method0("_start_shutdown")?;
     }
     Ok(())
 }
 
-fn rsloop_sslproto_process_outgoing(_py: Python<'_>, protocol: &Bound<'_, PyAny>) -> PyResult<()> {
+fn rsloop_sslproto_process_outgoing_cached(
+    py: Python<'_>,
+    protocol: &Bound<'_, PyAny>,
+    cache: &NativeSslCache,
+) -> PyResult<()> {
     if protocol.getattr("_ssl_writing_paused")?.is_truthy()? {
         return Ok(());
     }
-    let data = protocol.getattr("_rsloop_outgoing_read")?.call0()?;
+    let data = cache.outgoing_read.bind(py).call0()?;
     if data.is_truthy()? {
-        let transport_write = protocol.getattr("_rsloop_transport_write")?;
-        if transport_write.is_none() {
-            protocol.getattr("_transport")?.call_method1("write", (data,))?;
+        if let Some(transport_write) = cache.transport_write.as_ref() {
+            transport_write.bind(py).call1((data,))?;
         } else {
-            transport_write.call1((data,))?;
+            protocol.getattr("_transport")?.call_method1("write", (data,))?;
         }
     }
     protocol.call_method0("_control_app_writing")?;
     Ok(())
 }
 
-fn rsloop_sslproto_call_eof_received(
+fn rsloop_sslproto_call_eof_received_cached(
     py: Python<'_>,
     protocol: &Bound<'_, PyAny>,
+    cache: &NativeSslCache,
 ) -> PyResult<()> {
-    let reader = protocol.getattr("_rsloop_stream_reader")?;
     let app_state = protocol.getattr("_app_state")?;
-    if !reader.is_none() && app_state.as_ptr() == app_protocol_state_con_made(py)?.as_ptr() {
-        protocol.setattr("_app_state", app_protocol_state_eof(py)?)?;
-        feed_stream_reader_eof(py, reader.unbind())?;
-        return Ok(());
+    if let Some(reader) = cache.stream_reader.as_ref() {
+        if app_state.as_ptr() == app_protocol_state_con_made(py)?.as_ptr() {
+            protocol.setattr("_app_state", app_protocol_state_eof(py)?)?;
+            feed_stream_reader_eof(py, reader.clone_ref(py))?;
+            return Ok(());
+        }
     }
     protocol.call_method0("_call_eof_received")?;
     Ok(())
