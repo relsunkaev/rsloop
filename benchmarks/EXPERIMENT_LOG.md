@@ -639,43 +639,6 @@ performance pass, including changes that were reverted.
   - [`benchmarks/out/ab-tls-http1-keepalive-reader-bridge.json`](out/ab-tls-http1-keepalive-reader-bridge.json)
   - [`benchmarks/out/ab-http1-keepalive-small-reader-bridge.json`](out/ab-http1-keepalive-small-reader-bridge.json)
 
-### 34. TLS raw-read batching into one `buffer_updated()` call
-
-- Area: [`src/stream_transport.rs`](../src/stream_transport.rs)
-- Change:
-  - batch up to 8 raw `recv_into()` calls in the buffered TLS readable path
-  - hand the combined byte count to stdlib `SSLProtocol.buffer_updated()`
-    once per dispatch instead of once per socket read
-  - preserve EOF/error ordering by deferring them until after the buffered
-    callback
-- Rationale:
-  - the new SSLProtocol profiler showed rsloop spending most of its extra TLS
-    time in `buffer_updated`, `_do_read`, and `_do_read__copied`
-  - this path was trying to reduce those call counts without replacing
-    stdlib `SSLProtocol`
-- Runtime trace result on `tls_http1_keepalive`:
-  - `feed_data_calls` only dropped `8080 -> 7902`
-  - `buffer_updated` calls only dropped `8080 -> 7902`
-  - the heavier traced run got much worse overall, which made the variant
-    immediately suspicious
-- Interleaved A/B versus clean `HEAD`:
-  - `tls_http1_keepalive` `0.193978s -> 0.186193s` (`-4.01%`)
-  - `http1_keepalive_small` `0.328961s -> 0.332684s` (`+1.13%`)
-  - `asgi_json_echo` `0.161691s -> 0.169808s` (`+5.02%`)
-- Conclusion:
-  - batching raw socket reads at this boundary trimmed only a small fraction of
-    TLS fragment churn, and that benefit did not survive broader app-shaped
-    traffic
-  - this is more evidence that the remaining TLS loss sits inside the stdlib
-    `SSLProtocol` steady-state path rather than at the raw transport/readable
-    boundary
-- Decision: reverted
-- Artifacts:
-  - [`benchmarks/out/tls-http1-batch-deep-profile.json`](out/tls-http1-batch-deep-profile.json)
-  - [`benchmarks/out/revision-ab-tls-batch.json`](out/revision-ab-tls-batch.json)
-  - [`benchmarks/out/revision-ab-http1-keepalive-batch.json`](out/revision-ab-http1-keepalive-batch.json)
-  - [`benchmarks/out/revision-ab-asgi-json-batch.json`](out/revision-ab-asgi-json-batch.json)
-
 ## Open Direction
 
 The main conclusion so far is that callback-level micro-optimizations are not
