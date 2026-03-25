@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+from asyncio import sslproto as _sslproto
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -157,6 +158,7 @@ class PythonStreamProfiler:
 
 
 PYTHON_STREAM_PROFILER: PythonStreamProfiler | None = None
+SSLPROTO_PROFILER: SslProtoProfiler | None = None
 PYTHON_CPU_PROFILER: PythonCpuProfiler | None = None
 APP_PHASE_PROFILER: AppPhaseProfiler | None = None
 STREAM_WRITER_ROLES: dict[int, str] = {}
@@ -172,6 +174,114 @@ def install_python_stream_profiler() -> None:
 def emit_python_stream_profiler() -> None:
     if PYTHON_STREAM_PROFILER is not None:
         PYTHON_STREAM_PROFILER.emit()
+
+
+class SslProtoProfiler:
+    _METHODS = (
+        "buffer_updated",
+        "_do_read",
+        "_do_read__copied",
+        "_do_read__buffered",
+        "_process_outgoing",
+        "_write_appdata",
+        "_control_ssl_reading",
+        "_on_handshake_complete",
+    )
+
+    def __init__(self) -> None:
+        self._installed = False
+        self._originals: dict[str, Any] = {}
+        self._methods: dict[str, dict[str, Any]] = {}
+
+    def _bucket(self, method: str, state: str, mode: str) -> dict[str, Any]:
+        key = f"{method}|{state}|{mode}"
+        bucket = self._methods.get(key)
+        if bucket is None:
+            bucket = {
+                "method": method,
+                "state": state,
+                "mode": mode,
+                "count": 0,
+                "total_seconds": 0.0,
+                "max_seconds": 0.0,
+                "exceptions": 0,
+                "payload_bytes": 0,
+            }
+            self._methods[key] = bucket
+        return bucket
+
+    def install(self) -> None:
+        if self._installed:
+            return
+        profiler = self
+        ssl_protocol = _sslproto.SSLProtocol
+
+        def wrap_method(name: str) -> None:
+            original = getattr(ssl_protocol, name)
+            profiler._originals[name] = original
+
+            def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+                state_obj = getattr(self, "_state", None)
+                state = getattr(state_obj, "name", str(state_obj))
+                mode = (
+                    "buffered"
+                    if getattr(self, "_app_protocol_is_buffer", False)
+                    else "copied"
+                )
+                payload_bytes = 0
+                if name == "buffer_updated" and args:
+                    payload_bytes = int(args[0])
+                elif name == "_write_appdata" and args:
+                    payload_bytes = sum(len(chunk) for chunk in args[0])
+                bucket = profiler._bucket(name, state, mode)
+                started = time.perf_counter()
+                try:
+                    return original(self, *args, **kwargs)
+                except Exception:
+                    bucket["exceptions"] += 1
+                    raise
+                finally:
+                    elapsed = time.perf_counter() - started
+                    bucket["count"] += 1
+                    bucket["total_seconds"] += elapsed
+                    bucket["max_seconds"] = max(bucket["max_seconds"], elapsed)
+                    bucket["payload_bytes"] += payload_bytes
+
+            setattr(ssl_protocol, name, wrapped)
+
+        for name in self._METHODS:
+            wrap_method(name)
+        self._installed = True
+
+    def emit(self) -> None:
+        if not self._installed:
+            return
+        methods = sorted(
+            self._methods.values(),
+            key=lambda bucket: (
+                bucket["total_seconds"],
+                bucket["count"],
+                bucket["method"],
+            ),
+            reverse=True,
+        )
+        print(
+            "BENCH_PROFILE_SSLPROTO_JSON "
+            + json.dumps({"methods": methods}, sort_keys=True),
+            file=sys.stderr,
+        )
+
+
+def install_sslproto_profiler() -> None:
+    global SSLPROTO_PROFILER
+    if SSLPROTO_PROFILER is None:
+        SSLPROTO_PROFILER = SslProtoProfiler()
+        SSLPROTO_PROFILER.install()
+
+
+def emit_sslproto_profiler() -> None:
+    if SSLPROTO_PROFILER is not None:
+        SSLPROTO_PROFILER.emit()
 
 
 class PythonCpuProfiler:
@@ -468,6 +578,7 @@ def parse_runtime_profile(stderr: str) -> dict[str, Any] | None:
     stream_runs: list[dict[str, Any]] = []
     onearg_runs: list[dict[str, Any]] = []
     python_stream_runs: list[dict[str, Any]] = []
+    sslproto_runs: list[dict[str, Any]] = []
     cpu_runs: list[dict[str, Any]] = []
     app_phase_runs: list[dict[str, Any]] = []
     for line in stderr.splitlines():
@@ -487,6 +598,10 @@ def parse_runtime_profile(stderr: str) -> dict[str, Any] | None:
             python_stream_runs.append(
                 json.loads(line.removeprefix("BENCH_PROFILE_PY_STREAM_JSON "))
             )
+        elif line.startswith("BENCH_PROFILE_SSLPROTO_JSON "):
+            sslproto_runs.append(
+                json.loads(line.removeprefix("BENCH_PROFILE_SSLPROTO_JSON "))
+            )
         elif line.startswith("BENCH_PROFILE_CPU_JSON "):
             cpu_runs.append(json.loads(line.removeprefix("BENCH_PROFILE_CPU_JSON ")))
         elif line.startswith("BENCH_PROFILE_APP_PHASE_JSON "):
@@ -498,6 +613,7 @@ def parse_runtime_profile(stderr: str) -> dict[str, Any] | None:
         and not stream_runs
         and not onearg_runs
         and not python_stream_runs
+        and not sslproto_runs
         and not cpu_runs
         and not app_phase_runs
     ):
@@ -511,6 +627,8 @@ def parse_runtime_profile(stderr: str) -> dict[str, Any] | None:
         profile["onearg_runs"] = onearg_runs
     if python_stream_runs:
         profile["python_stream_runs"] = python_stream_runs
+    if sslproto_runs:
+        profile["sslproto_runs"] = sslproto_runs
     if cpu_runs:
         profile["cpu_runs"] = cpu_runs
     if app_phase_runs:
@@ -3992,6 +4110,7 @@ def run_once(
     profile_runtime: bool,
     profile_stream: bool,
     profile_python_streams: bool,
+    profile_sslproto: bool,
     profile_python_cpu: bool,
     profile_app_phases: bool,
     isolate_process: bool,
@@ -4018,6 +4137,7 @@ def run_once(
         profile_runtime,
         profile_stream,
         profile_python_streams,
+        profile_sslproto,
         profile_python_cpu,
         profile_app_phases,
         child_retries,
@@ -4031,6 +4151,7 @@ def run_once_isolated(
     profile_runtime: bool,
     profile_stream: bool,
     profile_python_streams: bool,
+    profile_sslproto: bool,
     profile_python_cpu: bool,
     profile_app_phases: bool,
     child_retries: int,
@@ -4067,6 +4188,8 @@ def run_once_isolated(
             env["RSLOOP_PROFILE_ONEARG_JSON"] = "1"
         if profile_python_streams:
             env["BENCH_PROFILE_PY_STREAM_JSON"] = "1"
+        if profile_sslproto:
+            env["BENCH_PROFILE_SSLPROTO_JSON"] = "1"
         if profile_python_cpu:
             env["BENCH_PROFILE_CPU_JSON"] = "1"
         if profile_app_phases:
@@ -4120,6 +4243,7 @@ def run_benchmark_group(
     profile_runtime: bool,
     profile_stream: bool,
     profile_python_streams: bool,
+    profile_sslproto: bool,
     profile_python_cpu: bool,
     profile_app_phases: bool,
     interleave_loops: bool,
@@ -4141,6 +4265,7 @@ def run_benchmark_group(
                         profile_runtime,
                         profile_stream,
                         profile_python_streams,
+                        profile_sslproto,
                         profile_python_cpu,
                         profile_app_phases,
                         isolate_process,
@@ -4166,6 +4291,7 @@ def run_benchmark_group(
                         profile_runtime,
                         profile_stream,
                         profile_python_streams,
+                        profile_sslproto,
                         profile_python_cpu,
                         profile_app_phases,
                         isolate_process,
@@ -4202,6 +4328,7 @@ def run_benchmark_group(
                         profile_runtime,
                         profile_stream,
                         profile_python_streams,
+                        profile_sslproto,
                         profile_python_cpu,
                         profile_app_phases,
                         isolate_process,
@@ -4218,6 +4345,7 @@ def run_benchmark_group(
                         profile_runtime,
                         profile_stream,
                         profile_python_streams,
+                        profile_sslproto,
                         profile_python_cpu,
                         profile_app_phases,
                         isolate_process,
@@ -4453,6 +4581,11 @@ def main() -> None:
         help="Capture Python CPU samples for isolated child runs with pyinstrument.",
     )
     parser.add_argument(
+        "--profile-sslproto",
+        action="store_true",
+        help="Capture stdlib asyncio.sslproto.SSLProtocol method timings for isolated child runs.",
+    )
+    parser.add_argument(
         "--profile-app-phases",
         action="store_true",
         help="Capture benchmark-level HTTP/ASGI/TLS phase markers for isolated child runs.",
@@ -4477,6 +4610,9 @@ def main() -> None:
     args = parser.parse_args()
     profile_python_streams = args.profile_python_streams or (
         os.environ.get("BENCH_PROFILE_PY_STREAM_JSON") == "1"
+    )
+    profile_sslproto = args.profile_sslproto or (
+        os.environ.get("BENCH_PROFILE_SSLPROTO_JSON") == "1"
     )
     profile_python_cpu = args.profile_python_cpu or (
         os.environ.get("BENCH_PROFILE_CPU_JSON") == "1"
@@ -4504,6 +4640,7 @@ def main() -> None:
         args.profile_runtime
         or args.profile_stream
         or profile_python_streams
+        or profile_sslproto
         or profile_python_cpu
         or profile_app_phases
     ) and not isolate_process and not args.child_run:
@@ -4511,6 +4648,8 @@ def main() -> None:
     enable_local_profilers = args.child_run or not isolate_process
     if profile_python_streams and enable_local_profilers:
         install_python_stream_profiler()
+    if profile_sslproto and enable_local_profilers:
+        install_sslproto_profiler()
     if profile_app_phases and enable_local_profilers:
         install_app_phase_profiler()
     for spec in specs:
@@ -4526,6 +4665,7 @@ def main() -> None:
             args.profile_runtime,
             args.profile_stream,
             profile_python_streams,
+            profile_sslproto,
             profile_python_cpu,
             profile_app_phases,
             interleave_loops,
@@ -4553,6 +4693,7 @@ def main() -> None:
             "profile_runtime": args.profile_runtime,
             "profile_stream": args.profile_stream,
             "profile_python_streams": profile_python_streams,
+            "profile_sslproto": profile_sslproto,
             "profile_python_cpu": profile_python_cpu,
             "profile_app_phases": profile_app_phases,
         },
@@ -4565,6 +4706,8 @@ def main() -> None:
         emit_summary(results, args.baseline, rounds_by_benchmark)
     if profile_python_streams and enable_local_profilers:
         emit_python_stream_profiler()
+    if profile_sslproto and enable_local_profilers:
+        emit_sslproto_profiler()
     if profile_app_phases and enable_local_profilers:
         emit_app_phase_profiler()
 

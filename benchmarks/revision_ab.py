@@ -40,6 +40,7 @@ def benchmark_once(
     profile_runtime: bool,
     profile_stream: bool,
     profile_python_streams: bool,
+    profile_sslproto: bool,
     profile_python_cpu: bool,
     profile_app_phases: bool,
     child_retries: int,
@@ -69,6 +70,8 @@ def benchmark_once(
         cmd.append("--profile-stream")
     if profile_python_streams:
         cmd.append("--profile-python-streams")
+    if profile_sslproto:
+        cmd.append("--profile-sslproto")
     if profile_python_cpu:
         cmd.append("--profile-python-cpu")
     if profile_app_phases:
@@ -130,6 +133,7 @@ def main() -> None:
     parser.add_argument("--profile-runtime", action="store_true")
     parser.add_argument("--profile-stream", action="store_true")
     parser.add_argument("--profile-python-streams", action="store_true")
+    parser.add_argument("--profile-sslproto", action="store_true")
     parser.add_argument("--profile-python-cpu", action="store_true")
     parser.add_argument("--profile-app-phases", action="store_true")
     parser.add_argument("--child-retries", type=int, default=1)
@@ -171,6 +175,7 @@ def main() -> None:
                         profile_runtime=args.profile_runtime,
                         profile_stream=args.profile_stream,
                         profile_python_streams=args.profile_python_streams,
+                        profile_sslproto=args.profile_sslproto,
                         profile_python_cpu=args.profile_python_cpu,
                         profile_app_phases=args.profile_app_phases,
                         child_retries=max(0, args.child_retries),
@@ -196,6 +201,7 @@ def main() -> None:
                         profile_runtime=args.profile_runtime,
                         profile_stream=args.profile_stream,
                         profile_python_streams=args.profile_python_streams,
+                        profile_sslproto=args.profile_sslproto,
                         profile_python_cpu=args.profile_python_cpu,
                         profile_app_phases=args.profile_app_phases,
                         child_retries=max(0, args.child_retries),
@@ -243,6 +249,7 @@ def main() -> None:
                 "profile_runtime": args.profile_runtime,
                 "profile_stream": args.profile_stream,
                 "profile_python_streams": args.profile_python_streams,
+                "profile_sslproto": args.profile_sslproto,
                 "profile_python_cpu": args.profile_python_cpu,
                 "profile_app_phases": args.profile_app_phases,
             },
