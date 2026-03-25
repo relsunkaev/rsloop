@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::time::Instant;
 use std::{collections::BTreeMap, env};
 
 use parking_lot::Mutex;
@@ -106,9 +107,17 @@ pub struct FutureHandle {
 }
 
 struct OneArgProfileState {
-    seen: usize,
     limit: usize,
-    counts: BTreeMap<String, u64>,
+    total_calls: u64,
+    total_ns: u64,
+    callbacks: BTreeMap<String, OneArgProfileEntry>,
+}
+
+#[derive(Default)]
+struct OneArgProfileEntry {
+    count: u64,
+    total_ns: u64,
+    exceptions: u64,
 }
 
 static ONE_ARG_PROFILE: OnceLock<Option<Mutex<OneArgProfileState>>> = OnceLock::new();
@@ -124,37 +133,94 @@ fn one_arg_profile_state() -> Option<&'static Mutex<OneArgProfileState>> {
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(16);
             Some(Mutex::new(OneArgProfileState {
-                seen: 0,
                 limit,
-                counts: BTreeMap::new(),
+                total_calls: 0,
+                total_ns: 0,
+                callbacks: BTreeMap::new(),
             }))
         })
         .as_ref()
 }
 
-pub(crate) fn profile_one_arg_callback(py: Python<'_>, callback: &Py<PyAny>) {
+fn one_arg_callback_label(py: Python<'_>, callback: &Py<PyAny>) -> String {
+    let callback = callback.bind(py);
+    if let Ok(bound_self) = callback.getattr("__self__") {
+        if !bound_self.is_none() {
+            let class_name = bound_self
+                .getattr("__class__")
+                .and_then(|cls| cls.getattr("__name__"))
+                .and_then(|name| name.extract::<String>())
+                .ok();
+            let method_name = callback
+                .getattr("__name__")
+                .and_then(|name| name.extract::<String>())
+                .ok();
+            if let (Some(class_name), Some(method_name)) = (class_name, method_name) {
+                return format!("{class_name}.{method_name}");
+            }
+        }
+    }
+    let qualname = callback
+        .getattr("__qualname__")
+        .and_then(|name| name.extract::<String>())
+        .ok();
+    let module = callback
+        .getattr("__module__")
+        .and_then(|name| name.extract::<String>())
+        .ok();
+    match (module, qualname) {
+        (Some(module), Some(qualname)) => format!("{module}.{qualname}"),
+        (None, Some(qualname)) => qualname,
+        _ => callback
+            .repr()
+            .ok()
+            .and_then(|value| value.extract::<String>().ok())
+            .unwrap_or_else(|| "<repr failed>".to_string()),
+    }
+}
+
+pub(crate) fn profile_one_arg_callback(
+    py: Python<'_>,
+    callback: &Py<PyAny>,
+    elapsed_ns: u64,
+    is_err: bool,
+) {
     let Some(state) = one_arg_profile_state() else {
         return;
     };
     let mut state = state.lock();
-    if state.seen >= state.limit {
-        return;
+    state.total_calls += 1;
+    state.total_ns += elapsed_ns;
+    let label = one_arg_callback_label(py, callback);
+    let entry_key = if state.callbacks.len() < state.limit || state.callbacks.contains_key(&label) {
+        label
+    } else {
+        "<other>".to_string()
+    };
+    let entry = state.callbacks.entry(entry_key).or_default();
+    entry.count += 1;
+    entry.total_ns += elapsed_ns;
+    if is_err {
+        entry.exceptions += 1;
     }
-    let label = callback
-        .bind(py)
-        .repr()
-        .ok()
-        .and_then(|value| value.extract::<String>().ok())
-        .unwrap_or_else(|| "<repr failed>".to_string());
-    *state.counts.entry(label).or_insert(0) += 1;
-    state.seen += 1;
 }
 
 pub(crate) fn take_one_arg_profile_json() -> Option<String> {
     let state = one_arg_profile_state()?;
     let mut state = state.lock();
-    let mut out = String::from("{\"counts\":[");
-    for (index, (label, count)) in state.counts.iter().enumerate() {
+    let mut entries = state.callbacks.iter().collect::<Vec<_>>();
+    entries.sort_by(|(label_a, entry_a), (label_b, entry_b)| {
+        entry_b
+            .total_ns
+            .cmp(&entry_a.total_ns)
+            .then(entry_b.count.cmp(&entry_a.count))
+            .then(label_a.cmp(label_b))
+    });
+    let mut out = format!(
+        "{{\"total_calls\":{},\"total_ns\":{},\"callbacks\":[",
+        state.total_calls, state.total_ns
+    );
+    for (index, (label, entry)) in entries.iter().enumerate() {
         if index != 0 {
             out.push(',');
         }
@@ -164,12 +230,26 @@ pub(crate) fn take_one_arg_profile_json() -> Option<String> {
         out.push_str(&encoded);
         out.push('"');
         out.push_str(",\"count\":");
-        out.push_str(&count.to_string());
+        out.push_str(&entry.count.to_string());
+        out.push_str(",\"total_ns\":");
+        out.push_str(&entry.total_ns.to_string());
+        out.push_str(",\"mean_ns\":");
+        out.push_str(&format!(
+            "{:.3}",
+            if entry.count == 0 {
+                0.0
+            } else {
+                entry.total_ns as f64 / entry.count as f64
+            }
+        ));
+        out.push_str(",\"exceptions\":");
+        out.push_str(&entry.exceptions.to_string());
         out.push('}');
     }
     out.push_str("]}");
-    state.seen = 0;
-    state.counts.clear();
+    state.total_calls = 0;
+    state.total_ns = 0;
+    state.callbacks.clear();
     Some(out)
 }
 
@@ -951,7 +1031,6 @@ impl OneArgHandle {
         when: Option<f64>,
         debug: bool,
     ) -> PyResult<Py<PyAny>> {
-        profile_one_arg_callback(py, &callback);
         let context = match context {
             Some(context) => context,
             None => copy_context(py)?,
@@ -992,7 +1071,18 @@ impl OneArgHandle {
             .map(|tb| tb.clone_ref(py));
         drop(borrowed);
 
-        if let Err(err) = run_one_arg_handle(py, &context, &callback, &arg) {
+        let started = one_arg_profile_state().map(|_| Instant::now());
+        let result = run_one_arg_handle(py, &context, &callback, &arg);
+        if let Some(started) = started {
+            profile_one_arg_callback(
+                py,
+                &callback,
+                started.elapsed().as_nanos() as u64,
+                result.is_err(),
+            );
+        }
+
+        if let Err(err) = result {
             if err.is_instance_of::<PySystemExit>(py)
                 || err.is_instance_of::<PyKeyboardInterrupt>(py)
             {
@@ -1074,10 +1164,9 @@ pub(crate) fn run_native_handle_kind(
             unsafe { handle.cast_bound_unchecked::<OneArgHandle>(py) },
             py,
         ),
-        NativeHandleKind::Handle => Handle::run_bound(
-            unsafe { handle.cast_bound_unchecked::<Handle>(py) },
-            py,
-        ),
+        NativeHandleKind::Handle => {
+            Handle::run_bound(unsafe { handle.cast_bound_unchecked::<Handle>(py) }, py)
+        }
         NativeHandleKind::Future => FutureHandle::run_bound(
             unsafe { handle.cast_bound_unchecked::<FutureHandle>(py) },
             py,

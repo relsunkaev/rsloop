@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -156,6 +157,8 @@ class PythonStreamProfiler:
 
 
 PYTHON_STREAM_PROFILER: PythonStreamProfiler | None = None
+PYTHON_CPU_PROFILER: PythonCpuProfiler | None = None
+APP_PHASE_PROFILER: AppPhaseProfiler | None = None
 STREAM_WRITER_ROLES: dict[int, str] = {}
 
 
@@ -169,6 +172,113 @@ def install_python_stream_profiler() -> None:
 def emit_python_stream_profiler() -> None:
     if PYTHON_STREAM_PROFILER is not None:
         PYTHON_STREAM_PROFILER.emit()
+
+
+class PythonCpuProfiler:
+    def __init__(self, interval: float = 0.001) -> None:
+        from pyinstrument import Profiler
+        from pyinstrument.renderers import JSONRenderer
+
+        self._profiler = Profiler(interval=interval)
+        self._renderer = JSONRenderer()
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._profiler.start()
+        self._started = True
+
+    def emit(self) -> None:
+        if not self._started:
+            return
+        self._profiler.stop()
+        payload = json.loads(self._profiler.output(self._renderer))
+        print(
+            "BENCH_PROFILE_CPU_JSON " + json.dumps(payload, sort_keys=True),
+            file=sys.stderr,
+        )
+        self._started = False
+
+
+@dataclass
+class AppPhaseBucket:
+    count: int = 0
+    total_seconds: float = 0.0
+    max_seconds: float = 0.0
+    total_bytes: int = 0
+
+
+class AppPhaseProfiler:
+    def __init__(self) -> None:
+        self._buckets: dict[str, AppPhaseBucket] = {}
+
+    def record(self, phase: str, elapsed: float, *, payload_bytes: int = 0) -> None:
+        bucket = self._buckets.get(phase)
+        if bucket is None:
+            bucket = AppPhaseBucket()
+            self._buckets[phase] = bucket
+        bucket.count += 1
+        bucket.total_seconds += elapsed
+        bucket.max_seconds = max(bucket.max_seconds, elapsed)
+        bucket.total_bytes += payload_bytes
+
+    def emit(self) -> None:
+        phases: dict[str, Any] = {}
+        for phase, bucket in sorted(self._buckets.items()):
+            phases[phase] = {
+                "count": bucket.count,
+                "total_seconds": bucket.total_seconds,
+                "mean_seconds": (
+                    bucket.total_seconds / bucket.count if bucket.count else 0.0
+                ),
+                "max_seconds": bucket.max_seconds,
+                "total_bytes": bucket.total_bytes,
+            }
+        print(
+            "BENCH_PROFILE_APP_PHASE_JSON "
+            + json.dumps({"phases": phases}, sort_keys=True),
+            file=sys.stderr,
+        )
+
+
+def install_python_cpu_profiler() -> None:
+    global PYTHON_CPU_PROFILER
+    if PYTHON_CPU_PROFILER is None:
+        interval = float(os.environ.get("BENCH_PROFILE_CPU_INTERVAL", "0.001"))
+        PYTHON_CPU_PROFILER = PythonCpuProfiler(interval)
+
+
+def emit_python_cpu_profiler() -> None:
+    if PYTHON_CPU_PROFILER is not None:
+        PYTHON_CPU_PROFILER.emit()
+
+
+def install_app_phase_profiler() -> None:
+    global APP_PHASE_PROFILER
+    if APP_PHASE_PROFILER is None:
+        APP_PHASE_PROFILER = AppPhaseProfiler()
+
+
+def emit_app_phase_profiler() -> None:
+    if APP_PHASE_PROFILER is not None:
+        APP_PHASE_PROFILER.emit()
+
+
+@contextmanager
+def app_phase_scope(phase: str, *, payload_bytes: int = 0) -> Any:
+    if APP_PHASE_PROFILER is None:
+        yield
+        return
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        APP_PHASE_PROFILER.record(
+            phase,
+            time.perf_counter() - started,
+            payload_bytes=payload_bytes,
+        )
 
 
 def label_stream_endpoint(
@@ -356,7 +466,10 @@ def bench_result_from_payload(payload: dict[str, Any]) -> BenchResult:
 def parse_runtime_profile(stderr: str) -> dict[str, Any] | None:
     scheduler_runs: list[dict[str, Any]] = []
     stream_runs: list[dict[str, Any]] = []
+    onearg_runs: list[dict[str, Any]] = []
     python_stream_runs: list[dict[str, Any]] = []
+    cpu_runs: list[dict[str, Any]] = []
+    app_phase_runs: list[dict[str, Any]] = []
     for line in stderr.splitlines():
         if line.startswith("RSLOOP_PROFILE_SCHED_JSON "):
             scheduler_runs.append(
@@ -366,38 +479,42 @@ def parse_runtime_profile(stderr: str) -> dict[str, Any] | None:
             stream_runs.append(
                 json.loads(line.removeprefix("RSLOOP_PROFILE_STREAM_JSON "))
             )
+        elif line.startswith("RSLOOP_PROFILE_ONEARG_JSON "):
+            onearg_runs.append(
+                json.loads(line.removeprefix("RSLOOP_PROFILE_ONEARG_JSON "))
+            )
         elif line.startswith("BENCH_PROFILE_PY_STREAM_JSON "):
             python_stream_runs.append(
                 json.loads(line.removeprefix("BENCH_PROFILE_PY_STREAM_JSON "))
             )
-    if not scheduler_runs and not stream_runs and not python_stream_runs:
+        elif line.startswith("BENCH_PROFILE_CPU_JSON "):
+            cpu_runs.append(json.loads(line.removeprefix("BENCH_PROFILE_CPU_JSON ")))
+        elif line.startswith("BENCH_PROFILE_APP_PHASE_JSON "):
+            app_phase_runs.append(
+                json.loads(line.removeprefix("BENCH_PROFILE_APP_PHASE_JSON "))
+            )
+    if (
+        not scheduler_runs
+        and not stream_runs
+        and not onearg_runs
+        and not python_stream_runs
+        and not cpu_runs
+        and not app_phase_runs
+    ):
         return None
     profile: dict[str, Any] = {}
     if scheduler_runs:
         profile["scheduler_runs"] = scheduler_runs
-        profile["scheduler"] = max(
-            scheduler_runs,
-            key=lambda item: (
-                item.get("iterations", 0),
-                item.get("fd_events", 0),
-                item.get("ready_handles", 0),
-            ),
-        )
     if stream_runs:
         profile["stream_runs"] = stream_runs
-        profile["stream"] = max(
-            stream_runs,
-            key=lambda item: (
-                len(item.get("events", [])),
-                item.get("dropped", 0),
-            ),
-        )
+    if onearg_runs:
+        profile["onearg_runs"] = onearg_runs
     if python_stream_runs:
         profile["python_stream_runs"] = python_stream_runs
-        profile["python_stream"] = max(
-            python_stream_runs,
-            key=lambda item: item.get("totals", {}).get("feed_data_calls", 0),
-        )
+    if cpu_runs:
+        profile["cpu_runs"] = cpu_runs
+    if app_phase_runs:
+        profile["app_phase_runs"] = app_phase_runs
     return profile
 
 
@@ -2020,40 +2137,76 @@ async def http1_roundtrip(
         label_stream_endpoint(reader, writer, "server")
         try:
             if close_each_request:
-                await read_http_request_headers(reader)
+                with app_phase_scope("http.server.read_headers"):
+                    await read_http_request_headers(reader)
                 if request_body_size:
-                    body = await read_fixed_body(reader, request_body_size, request_chunk_size)
+                    with app_phase_scope(
+                        "http.server.read_body", payload_bytes=request_body_size
+                    ):
+                        body = await read_fixed_body(
+                            reader, request_body_size, request_chunk_size
+                        )
                     if body != request_body:
                         raise RuntimeError(f"unexpected request body size={len(body)}")
-                writer.write(response_head)
+                with app_phase_scope(
+                    "http.server.write_response_head",
+                    payload_bytes=len(response_head),
+                ):
+                    writer.write(response_head)
                 if response_chunk_size is None:
-                    writer.write(response_body)
-                    await writer.drain()
+                    with app_phase_scope(
+                        "http.server.write_response_body",
+                        payload_bytes=response_body_size,
+                    ):
+                        writer.write(response_body)
+                        await writer.drain()
                 else:
-                    await write_fixed_body(
-                        writer,
-                        response_body,
-                        response_chunk_size,
-                        flush=True,
-                    )
+                    with app_phase_scope(
+                        "http.server.write_response_body",
+                        payload_bytes=response_body_size,
+                    ):
+                        await write_fixed_body(
+                            writer,
+                            response_body,
+                            response_chunk_size,
+                            flush=True,
+                        )
                 return
             while True:
-                await read_http_request_headers(reader)
+                with app_phase_scope("http.server.read_headers"):
+                    await read_http_request_headers(reader)
                 if request_body_size:
-                    body = await read_fixed_body(reader, request_body_size, request_chunk_size)
+                    with app_phase_scope(
+                        "http.server.read_body", payload_bytes=request_body_size
+                    ):
+                        body = await read_fixed_body(
+                            reader, request_body_size, request_chunk_size
+                        )
                     if body != request_body:
                         raise RuntimeError(f"unexpected request body size={len(body)}")
-                writer.write(response_head)
+                with app_phase_scope(
+                    "http.server.write_response_head",
+                    payload_bytes=len(response_head),
+                ):
+                    writer.write(response_head)
                 if response_chunk_size is None:
-                    writer.write(response_body)
-                    await writer.drain()
+                    with app_phase_scope(
+                        "http.server.write_response_body",
+                        payload_bytes=response_body_size,
+                    ):
+                        writer.write(response_body)
+                        await writer.drain()
                 else:
-                    await write_fixed_body(
-                        writer,
-                        response_body,
-                        response_chunk_size,
-                        flush=True,
-                    )
+                    with app_phase_scope(
+                        "http.server.write_response_body",
+                        payload_bytes=response_body_size,
+                    ):
+                        await write_fixed_body(
+                            writer,
+                            response_body,
+                            response_chunk_size,
+                            flush=True,
+                        )
         except asyncio.IncompleteReadError:
             pass
         finally:
@@ -2072,12 +2225,13 @@ async def http1_roundtrip(
     async def open_client_connection() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         while True:
             try:
-                return await asyncio.open_connection(
-                    host,
-                    port,
-                    ssl=client_sslcontext,
-                    server_hostname=server_hostname,
-                )
+                with app_phase_scope("http.client.connect"):
+                    return await asyncio.open_connection(
+                        host,
+                        port,
+                        ssl=client_sslcontext,
+                        server_hostname=server_hostname,
+                    )
             except TimeoutError:
                 await asyncio.sleep(0)
                 continue
@@ -2093,20 +2247,34 @@ async def http1_roundtrip(
                 reader, writer = await open_client_connection()
                 label_stream_endpoint(reader, writer, "client")
                 try:
-                    writer.write(request_head)
-                    await write_fixed_body(
-                        writer,
-                        request_body,
-                        request_chunk_size,
-                        flush=request_chunk_size is not None,
-                    )
-                    await writer.drain()
-                    await read_http_request_headers(reader)
-                    body = await read_fixed_body(
-                        reader,
-                        response_body_size,
-                        response_chunk_size,
-                    )
+                    with app_phase_scope(
+                        "http.client.write_request_head",
+                        payload_bytes=len(request_head),
+                    ):
+                        writer.write(request_head)
+                    with app_phase_scope(
+                        "http.client.write_request_body",
+                        payload_bytes=request_body_size,
+                    ):
+                        await write_fixed_body(
+                            writer,
+                            request_body,
+                            request_chunk_size,
+                            flush=request_chunk_size is not None,
+                        )
+                    with app_phase_scope("http.client.drain"):
+                        await writer.drain()
+                    with app_phase_scope("http.client.read_response_head"):
+                        await read_http_request_headers(reader)
+                    with app_phase_scope(
+                        "http.client.read_response_body",
+                        payload_bytes=response_body_size,
+                    ):
+                        body = await read_fixed_body(
+                            reader,
+                            response_body_size,
+                            response_chunk_size,
+                        )
                     if body != response_body:
                         raise RuntimeError(f"unexpected response body size={len(body)}")
                 finally:
@@ -2120,20 +2288,34 @@ async def http1_roundtrip(
         label_stream_endpoint(reader, writer, "client")
         try:
             for _ in range(iterations):
-                writer.write(request_head)
-                await write_fixed_body(
-                    writer,
-                    request_body,
-                    request_chunk_size,
-                    flush=request_chunk_size is not None,
-                )
-                await writer.drain()
-                await read_http_request_headers(reader)
-                body = await read_fixed_body(
-                    reader,
-                    response_body_size,
-                    response_chunk_size,
-                )
+                with app_phase_scope(
+                    "http.client.write_request_head",
+                    payload_bytes=len(request_head),
+                ):
+                    writer.write(request_head)
+                with app_phase_scope(
+                    "http.client.write_request_body",
+                    payload_bytes=request_body_size,
+                ):
+                    await write_fixed_body(
+                        writer,
+                        request_body,
+                        request_chunk_size,
+                        flush=request_chunk_size is not None,
+                    )
+                with app_phase_scope("http.client.drain"):
+                    await writer.drain()
+                with app_phase_scope("http.client.read_response_head"):
+                    await read_http_request_headers(reader)
+                with app_phase_scope(
+                    "http.client.read_response_body",
+                    payload_bytes=response_body_size,
+                ):
+                    body = await read_fixed_body(
+                        reader,
+                        response_body_size,
+                        response_chunk_size,
+                    )
                 if body != response_body:
                     raise RuntimeError(f"unexpected response body size={len(body)}")
         finally:
@@ -2349,11 +2531,15 @@ async def framed_rpc_roundtrip(
         label_stream_endpoint(reader, writer, "server")
         try:
             while True:
-                body = await read_message(reader)
+                with app_phase_scope("grpc.server.read_message", payload_bytes=request_size):
+                    body = await read_message(reader)
                 if body != request:
                     raise RuntimeError(f"unexpected framed body size={len(body)}")
-                writer.write(encode_message(response))
-                await writer.drain()
+                with app_phase_scope(
+                    "grpc.server.write_message", payload_bytes=5 + response_size
+                ):
+                    writer.write(encode_message(response))
+                    await writer.drain()
         except asyncio.IncompleteReadError:
             pass
         finally:
@@ -2364,13 +2550,18 @@ async def framed_rpc_roundtrip(
     host, port = server.sockets[0].getsockname()[:2]
 
     async def client(iterations: int) -> None:
-        reader, writer = await asyncio.open_connection(host, port)
+        with app_phase_scope("grpc.client.connect"):
+            reader, writer = await asyncio.open_connection(host, port)
         label_stream_endpoint(reader, writer, "client")
         try:
             for _ in range(iterations):
-                writer.write(encode_message(request))
-                await writer.drain()
-                body = await read_message(reader)
+                with app_phase_scope(
+                    "grpc.client.write_message", payload_bytes=5 + request_size
+                ):
+                    writer.write(encode_message(request))
+                    await writer.drain()
+                with app_phase_scope("grpc.client.read_message", payload_bytes=response_size):
+                    body = await read_message(reader)
                 if body != response:
                     raise RuntimeError(f"unexpected framed body size={len(body)}")
         finally:
@@ -3071,13 +3262,18 @@ async def bench_start_tls_upgrade(count: int) -> None:
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         try:
-            await reader.readexactly(9)
-            writer.write(b"READY\n")
-            await writer.drain()
-            await writer.start_tls(server_context)
-            await reader.readexactly(4)
-            writer.write(b"pong")
-            await writer.drain()
+            with app_phase_scope("start_tls.server.read_banner", payload_bytes=9):
+                await reader.readexactly(9)
+            with app_phase_scope("start_tls.server.write_ready", payload_bytes=6):
+                writer.write(b"READY\n")
+                await writer.drain()
+            with app_phase_scope("start_tls.server.handshake"):
+                await writer.start_tls(server_context)
+            with app_phase_scope("start_tls.server.read_payload", payload_bytes=4):
+                await reader.readexactly(4)
+            with app_phase_scope("start_tls.server.write_payload", payload_bytes=4):
+                writer.write(b"pong")
+                await writer.drain()
         finally:
             writer.close()
             await writer.wait_closed()
@@ -3087,16 +3283,24 @@ async def bench_start_tls_upgrade(count: int) -> None:
 
     try:
         for _ in range(count):
-            reader, writer = await asyncio.open_connection(host, port)
+            with app_phase_scope("start_tls.client.connect"):
+                reader, writer = await asyncio.open_connection(host, port)
             try:
-                writer.write(b"STARTTLS\n")
-                await writer.drain()
-                if await reader.readexactly(6) != b"READY\n":
+                with app_phase_scope("start_tls.client.write_banner", payload_bytes=9):
+                    writer.write(b"STARTTLS\n")
+                    await writer.drain()
+                with app_phase_scope("start_tls.client.read_ready", payload_bytes=6):
+                    ready = await reader.readexactly(6)
+                if ready != b"READY\n":
                     raise RuntimeError("unexpected start_tls readiness banner")
-                await writer.start_tls(client_context, server_hostname="localhost")
-                writer.write(b"ping")
-                await writer.drain()
-                if await reader.readexactly(4) != b"pong":
+                with app_phase_scope("start_tls.client.handshake"):
+                    await writer.start_tls(client_context, server_hostname="localhost")
+                with app_phase_scope("start_tls.client.write_payload", payload_bytes=4):
+                    writer.write(b"ping")
+                    await writer.drain()
+                with app_phase_scope("start_tls.client.read_payload", payload_bytes=4):
+                    response = await reader.readexactly(4)
+                if response != b"pong":
                     raise RuntimeError("unexpected start_tls response")
             finally:
                 writer.close()
@@ -3788,15 +3992,24 @@ def run_once(
     profile_runtime: bool,
     profile_stream: bool,
     profile_python_streams: bool,
+    profile_python_cpu: bool,
+    profile_app_phases: bool,
     isolate_process: bool,
     child_retries: int,
 ) -> tuple[float, dict[str, Any] | None, int]:
     if not isolate_process:
+        if profile_python_cpu:
+            install_python_cpu_profiler()
+            assert PYTHON_CPU_PROFILER is not None
+            PYTHON_CPU_PROFILER.start()
         started = time.perf_counter()
         try:
             run_on_loop(loop_name, spec.func(iterations))
         except BenchmarkSkipped:
             raise
+        finally:
+            if profile_python_cpu:
+                emit_python_cpu_profiler()
         return time.perf_counter() - started, None, 0
     return run_once_isolated(
         loop_name,
@@ -3805,6 +4018,8 @@ def run_once(
         profile_runtime,
         profile_stream,
         profile_python_streams,
+        profile_python_cpu,
+        profile_app_phases,
         child_retries,
     )
 
@@ -3816,6 +4031,8 @@ def run_once_isolated(
     profile_runtime: bool,
     profile_stream: bool,
     profile_python_streams: bool,
+    profile_python_cpu: bool,
+    profile_app_phases: bool,
     child_retries: int,
 ) -> tuple[float, dict[str, Any] | None, int]:
     attempts = 0
@@ -3848,6 +4065,10 @@ def run_once_isolated(
             env["RSLOOP_PROFILE_STREAM_JSON"] = "1"
         if profile_python_streams:
             env["BENCH_PROFILE_PY_STREAM_JSON"] = "1"
+        if profile_python_cpu:
+            env["BENCH_PROFILE_CPU_JSON"] = "1"
+        if profile_app_phases:
+            env["BENCH_PROFILE_APP_PHASE_JSON"] = "1"
         try:
             completed = subprocess.run(
                 cmd,
@@ -3897,6 +4118,8 @@ def run_benchmark_group(
     profile_runtime: bool,
     profile_stream: bool,
     profile_python_streams: bool,
+    profile_python_cpu: bool,
+    profile_app_phases: bool,
     interleave_loops: bool,
     child_retries: int,
 ) -> tuple[list[BenchResult], list[dict[str, Any]] | None]:
@@ -3916,6 +4139,8 @@ def run_benchmark_group(
                         profile_runtime,
                         profile_stream,
                         profile_python_streams,
+                        profile_python_cpu,
+                        profile_app_phases,
                         isolate_process,
                         child_retries,
                     )
@@ -3939,6 +4164,8 @@ def run_benchmark_group(
                         profile_runtime,
                         profile_stream,
                         profile_python_streams,
+                        profile_python_cpu,
+                        profile_app_phases,
                         isolate_process,
                         child_retries,
                     )
@@ -3946,12 +4173,19 @@ def run_benchmark_group(
                     round_record["samples"][loop_name] = None
                     retries_used[loop_name] = -1
                     continue
+                sample_index = len(sample_map[loop_name])
                 sample_map[loop_name].append(sample)
                 round_record["samples"][loop_name] = sample
                 if retries_used_count:
                     retries_used[loop_name] = retries_used_count
                 if profile is not None:
-                    profile_map[loop_name].append(profile)
+                    profile_map[loop_name].append(
+                        {
+                            "sample_index": sample_index,
+                            "round_index": repeat_index,
+                            "profile": profile,
+                        }
+                    )
             if retries_used:
                 round_record["retries"] = retries_used
             round_records.append(round_record)
@@ -3966,6 +4200,8 @@ def run_benchmark_group(
                         profile_runtime,
                         profile_stream,
                         profile_python_streams,
+                        profile_python_cpu,
+                        profile_app_phases,
                         isolate_process,
                         child_retries,
                     )
@@ -3980,14 +4216,23 @@ def run_benchmark_group(
                         profile_runtime,
                         profile_stream,
                         profile_python_streams,
+                        profile_python_cpu,
+                        profile_app_phases,
                         isolate_process,
                         child_retries,
                     )
                 except BenchmarkSkipped:
                     continue
+                sample_index = len(sample_map[loop_name])
                 sample_map[loop_name].append(sample)
                 if profile is not None:
-                    profile_map[loop_name].append(profile)
+                    profile_map[loop_name].append(
+                        {
+                            "sample_index": sample_index,
+                            "round_index": repeat_index,
+                            "profile": profile,
+                        }
+                    )
                 round_record = {
                     "index": repeat_index,
                     "order": [loop_name],
@@ -4200,6 +4445,16 @@ def main() -> None:
         action="store_true",
         help="Capture cross-loop Python stream delivery/write/drain counters for isolated child runs.",
     )
+    parser.add_argument(
+        "--profile-python-cpu",
+        action="store_true",
+        help="Capture Python CPU samples for isolated child runs with pyinstrument.",
+    )
+    parser.add_argument(
+        "--profile-app-phases",
+        action="store_true",
+        help="Capture benchmark-level HTTP/ASGI/TLS phase markers for isolated child runs.",
+    )
     parser.add_argument("--child-run", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--no-isolate-process",
@@ -4221,6 +4476,12 @@ def main() -> None:
     profile_python_streams = args.profile_python_streams or (
         os.environ.get("BENCH_PROFILE_PY_STREAM_JSON") == "1"
     )
+    profile_python_cpu = args.profile_python_cpu or (
+        os.environ.get("BENCH_PROFILE_CPU_JSON") == "1"
+    )
+    profile_app_phases = args.profile_app_phases or (
+        os.environ.get("BENCH_PROFILE_APP_PHASE_JSON") == "1"
+    )
 
     if args.list:
         for name, spec in BENCHMARKS.items():
@@ -4237,10 +4498,19 @@ def main() -> None:
     rounds_by_benchmark: dict[str, list[dict[str, Any]]] = {}
     isolate_process = not args.no_isolate_process and not args.child_run
     interleave_loops = not args.no_interleave_loops and not args.child_run
-    if (args.profile_runtime or args.profile_stream or profile_python_streams) and not isolate_process and not args.child_run:
+    if (
+        args.profile_runtime
+        or args.profile_stream
+        or profile_python_streams
+        or profile_python_cpu
+        or profile_app_phases
+    ) and not isolate_process and not args.child_run:
         raise SystemExit("profiling requires subprocess isolation")
-    if profile_python_streams:
+    enable_local_profilers = args.child_run or not isolate_process
+    if profile_python_streams and enable_local_profilers:
         install_python_stream_profiler()
+    if profile_app_phases and enable_local_profilers:
+        install_app_phase_profiler()
     for spec in specs:
         iterations = args.iterations or spec.default_iterations
         selected_loops = [loop_name for loop_name in loops if loop_name != "uvloop" or uvloop is not None]
@@ -4254,6 +4524,8 @@ def main() -> None:
             args.profile_runtime,
             args.profile_stream,
             profile_python_streams,
+            profile_python_cpu,
+            profile_app_phases,
             interleave_loops,
             max(0, args.child_retries),
         )
@@ -4276,6 +4548,11 @@ def main() -> None:
             "child_retries": max(0, args.child_retries),
             "repeats": args.repeats,
             "warmups": args.warmups,
+            "profile_runtime": args.profile_runtime,
+            "profile_stream": args.profile_stream,
+            "profile_python_streams": profile_python_streams,
+            "profile_python_cpu": profile_python_cpu,
+            "profile_app_phases": profile_app_phases,
         },
     )
     write_output(payload, args.output)
@@ -4284,8 +4561,10 @@ def main() -> None:
         print(json.dumps(payload, indent=2))
     elif len(loops) > 1:
         emit_summary(results, args.baseline, rounds_by_benchmark)
-    if profile_python_streams:
+    if profile_python_streams and enable_local_profilers:
         emit_python_stream_profiler()
+    if profile_app_phases and enable_local_profilers:
+        emit_app_phase_profiler()
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ use crate::handles::{
 use crate::loop_api::LoopApi;
 use crate::poller::TokioPoller;
 use crate::socket_registry::SocketStateRegistry;
-use crate::stream_registry::StreamTransportRegistry;
+use crate::stream_registry::{CompletionDrainStats, StreamTransportRegistry};
 use crate::stream_transport::take_profile_stream_json;
 
 #[derive(Debug)]
@@ -97,6 +97,7 @@ struct PhaseStats {
     timers: Duration,
     ready: Duration,
     writes: Duration,
+    completion_breakdown: CompletionBreakdown,
     tick_stats: TickStats,
 }
 
@@ -116,6 +117,12 @@ struct TickStats {
     ready_python: Vec<u32>,
     completion_items: Vec<u32>,
     writes_flushed: Vec<u32>,
+    select_us: Vec<u64>,
+    fd_dispatch_us: Vec<u64>,
+    completions_us: Vec<u64>,
+    timers_us: Vec<u64>,
+    ready_us: Vec<u64>,
+    writes_us: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -134,6 +141,35 @@ struct TickSample {
     ready_python: u32,
     completion_items: u32,
     writes_flushed: u32,
+    select_us: u64,
+    fd_dispatch_us: u64,
+    completions_us: u64,
+    timers_us: u64,
+    ready_us: u64,
+    writes_us: u64,
+}
+
+#[derive(Default)]
+struct CompletionBreakdown {
+    port_future_result: u64,
+    port_future_exception: u64,
+    port_future_result_us: u64,
+    port_future_exception_us: u64,
+    stream_read_result: u64,
+    stream_read_exception: u64,
+    stream_future_result: u64,
+    stream_future_exception: u64,
+    stream_read_result_us: u64,
+    stream_read_exception_us: u64,
+    stream_future_result_us: u64,
+    stream_future_exception_us: u64,
+}
+
+#[derive(Default)]
+struct CompletionPortDrainStats {
+    total: u32,
+    future_result: u32,
+    future_exception: u32,
 }
 
 impl PhaseStats {
@@ -173,6 +209,34 @@ impl PhaseStats {
         self.tick_stats.ready_python.push(tick.ready_python);
         self.tick_stats.completion_items.push(tick.completion_items);
         self.tick_stats.writes_flushed.push(tick.writes_flushed);
+        self.tick_stats.select_us.push(tick.select_us);
+        self.tick_stats.fd_dispatch_us.push(tick.fd_dispatch_us);
+        self.tick_stats.completions_us.push(tick.completions_us);
+        self.tick_stats.timers_us.push(tick.timers_us);
+        self.tick_stats.ready_us.push(tick.ready_us);
+        self.tick_stats.writes_us.push(tick.writes_us);
+    }
+
+    fn record_stream_completion_stats(&mut self, drained: &CompletionDrainStats) {
+        self.completion_breakdown.stream_read_result += drained.read_result as u64;
+        self.completion_breakdown.stream_read_exception += drained.read_exception as u64;
+        self.completion_breakdown.stream_future_result += drained.future_result as u64;
+        self.completion_breakdown.stream_future_exception += drained.future_exception as u64;
+        self.completion_breakdown.stream_read_result_us += drained.read_result_us;
+        self.completion_breakdown.stream_read_exception_us += drained.read_exception_us;
+        self.completion_breakdown.stream_future_result_us += drained.future_result_us;
+        self.completion_breakdown.stream_future_exception_us += drained.future_exception_us;
+    }
+
+    fn record_port_completion(&mut self, is_err: bool, elapsed: Duration) {
+        let elapsed_us = elapsed.as_micros() as u64;
+        if is_err {
+            self.completion_breakdown.port_future_exception += 1;
+            self.completion_breakdown.port_future_exception_us += elapsed_us;
+        } else {
+            self.completion_breakdown.port_future_result += 1;
+            self.completion_breakdown.port_future_result_us += elapsed_us;
+        }
     }
 }
 
@@ -515,7 +579,9 @@ impl Scheduler {
         }
         if let (Some(stats), Some(started)) = (stats.as_deref_mut(), select_started) {
             stats.iterations += 1;
-            stats.select += started.elapsed();
+            let elapsed = started.elapsed();
+            stats.select += elapsed;
+            tick.select_us += elapsed.as_micros() as u64;
         }
 
         if !fd_events.is_empty() {
@@ -602,25 +668,36 @@ impl Scheduler {
                 }
             }
             if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
-                stats.fd_dispatch += started.elapsed();
+                let elapsed = started.elapsed();
+                stats.fd_dispatch += elapsed;
+                tick.fd_dispatch_us += elapsed.as_micros() as u64;
             }
         }
 
         if let Some(registry) = stream_registry {
             let started = stats.as_ref().map(|_| Instant::now());
-            let drained = registry.bind(py).borrow().drain_completion_queue(py)? as u32;
-            tick.completion_items += drained;
+            let drained = registry
+                .bind(py)
+                .borrow()
+                .drain_completion_queue(py, stats.is_some())?;
+            tick.completion_items += drained.total;
             if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
-                stats.completions += started.elapsed();
+                let elapsed = started.elapsed();
+                stats.record_stream_completion_stats(&drained);
+                stats.completions += elapsed;
+                tick.completions_us += elapsed.as_micros() as u64;
             }
         }
 
         if !completions.is_empty() {
             tick.completion_items += completions.len() as u32;
             let started = stats.as_ref().map(|_| Instant::now());
-            drain_completions(py, completions)?;
+            let drained = drain_completions(py, completions, stats.as_deref_mut())?;
             if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
-                stats.completions += started.elapsed();
+                let elapsed = started.elapsed();
+                debug_assert_eq!(drained.total, completions.len() as u32);
+                stats.completions += elapsed;
+                tick.completions_us += elapsed.as_micros() as u64;
             }
         }
 
@@ -629,7 +706,9 @@ impl Scheduler {
             let end_time = loop_time_cached(py, loop_obj, clock)? + clock_resolution;
             self.promote_due_inner(py, end_time)?;
             if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
-                stats.timers += started.elapsed();
+                let elapsed = started.elapsed();
+                stats.timers += elapsed;
+                tick.timers_us += elapsed.as_micros() as u64;
             }
         }
         for handle in generic_ready_handles.drain(..) {
@@ -645,23 +724,33 @@ impl Scheduler {
             &mut tick,
         )?;
         if let Some(stats) = stats.as_deref_mut() {
-            stats.ready += ready_started
+            let elapsed = ready_started
                 .map(|started| started.elapsed())
                 .unwrap_or_default();
+            stats.ready += elapsed;
+            tick.ready_us += elapsed.as_micros() as u64;
         }
 
         if let Some(registry) = stream_registry {
             let started = stats.as_ref().map(|_| Instant::now());
             tick.writes_flushed = registry.bind(py).borrow().flush_write_queue(py)? as u32;
             if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
-                stats.writes += started.elapsed();
+                let elapsed = started.elapsed();
+                stats.writes += elapsed;
+                tick.writes_us += elapsed.as_micros() as u64;
             }
             if registry.bind(py).borrow().has_completions() {
                 let started = stats.as_ref().map(|_| Instant::now());
-                let drained = registry.bind(py).borrow().drain_completion_queue(py)? as u32;
-                tick.completion_items += drained;
+                let drained = registry
+                    .bind(py)
+                    .borrow()
+                    .drain_completion_queue(py, stats.is_some())?;
+                tick.completion_items += drained.total;
                 if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
-                    stats.completions += started.elapsed();
+                    let elapsed = started.elapsed();
+                    stats.record_stream_completion_stats(&drained);
+                    stats.completions += elapsed;
+                    tick.completions_us += elapsed.as_micros() as u64;
                 }
                 let ready_started = stats.as_ref().map(|_| Instant::now());
                 self.run_ready_inner(
@@ -673,9 +762,11 @@ impl Scheduler {
                     &mut tick,
                 )?;
                 if let Some(stats) = stats.as_deref_mut() {
-                    stats.ready += ready_started
+                    let elapsed = ready_started
                         .map(|started| started.elapsed())
                         .unwrap_or_default();
+                    stats.ready += elapsed;
+                    tick.ready_us += elapsed.as_micros() as u64;
                 }
             }
         }
@@ -805,7 +896,7 @@ fn scheduler_profile_json(stats: &PhaseStats) -> String {
     out.push('{');
     let _ = write!(
         out,
-        "\"iterations\":{},\"direct_waits\":{},\"poll_waits\":{},\"completion_items\":{},\"ready_handles\":{},\"fd_events\":{},\"stream_fd_hits\":{},\"socket_fd_hits\":{},\"generic_fd_hits\":{},\"ready_local_items\":{},\"ready_remote_items\":{},\"ready_zero_arg\":{},\"ready_one_arg\":{},\"ready_handle_native\":{},\"ready_future_native\":{},\"ready_python\":{},\"phase_seconds\":{{\"select\":{:.6},\"fd_dispatch\":{:.6},\"completions\":{:.6},\"timers\":{:.6},\"ready\":{:.6},\"writes\":{:.6}}},\"ticks\":{{",
+        "\"iterations\":{},\"direct_waits\":{},\"poll_waits\":{},\"completion_items\":{},\"ready_handles\":{},\"fd_events\":{},\"stream_fd_hits\":{},\"socket_fd_hits\":{},\"generic_fd_hits\":{},\"ready_local_items\":{},\"ready_remote_items\":{},\"ready_zero_arg\":{},\"ready_one_arg\":{},\"ready_handle_native\":{},\"ready_future_native\":{},\"ready_python\":{},\"phase_seconds\":{{\"select\":{:.6},\"fd_dispatch\":{:.6},\"completions\":{:.6},\"timers\":{:.6},\"ready\":{:.6},\"writes\":{:.6}}},\"completion_breakdown\":{{\"port_future_result\":{},\"port_future_exception\":{},\"port_future_result_us\":{},\"port_future_exception_us\":{},\"stream_read_result\":{},\"stream_read_exception\":{},\"stream_future_result\":{},\"stream_future_exception\":{},\"stream_read_result_us\":{},\"stream_read_exception_us\":{},\"stream_future_result_us\":{},\"stream_future_exception_us\":{}}},\"ticks\":{{",
         stats.iterations,
         stats.direct_waits,
         stats.poll_waits,
@@ -828,6 +919,18 @@ fn scheduler_profile_json(stats: &PhaseStats) -> String {
         stats.timers.as_secs_f64(),
         stats.ready.as_secs_f64(),
         stats.writes.as_secs_f64(),
+        stats.completion_breakdown.port_future_result,
+        stats.completion_breakdown.port_future_exception,
+        stats.completion_breakdown.port_future_result_us,
+        stats.completion_breakdown.port_future_exception_us,
+        stats.completion_breakdown.stream_read_result,
+        stats.completion_breakdown.stream_read_exception,
+        stats.completion_breakdown.stream_future_result,
+        stats.completion_breakdown.stream_future_exception,
+        stats.completion_breakdown.stream_read_result_us,
+        stats.completion_breakdown.stream_read_exception_us,
+        stats.completion_breakdown.stream_future_result_us,
+        stats.completion_breakdown.stream_future_exception_us,
     );
     append_distribution_json(&mut out, "fd_events", &stats.tick_stats.fd_events);
     out.push(',');
@@ -880,6 +983,18 @@ fn scheduler_profile_json(stats: &PhaseStats) -> String {
     );
     out.push(',');
     append_distribution_json(&mut out, "writes_flushed", &stats.tick_stats.writes_flushed);
+    out.push(',');
+    append_duration_distribution_json(&mut out, "select_us", &stats.tick_stats.select_us);
+    out.push(',');
+    append_duration_distribution_json(&mut out, "fd_dispatch_us", &stats.tick_stats.fd_dispatch_us);
+    out.push(',');
+    append_duration_distribution_json(&mut out, "completions_us", &stats.tick_stats.completions_us);
+    out.push(',');
+    append_duration_distribution_json(&mut out, "timers_us", &stats.tick_stats.timers_us);
+    out.push(',');
+    append_duration_distribution_json(&mut out, "ready_us", &stats.tick_stats.ready_us);
+    out.push(',');
+    append_duration_distribution_json(&mut out, "writes_us", &stats.tick_stats.writes_us);
     out.push_str("}}");
     out
 }
@@ -905,7 +1020,39 @@ fn append_distribution_json(out: &mut String, name: &str, values: &[u32]) {
     );
 }
 
+fn append_duration_distribution_json(out: &mut String, name: &str, values: &[u64]) {
+    let _ = write!(out, "\"{name}\":");
+    if values.is_empty() {
+        out.push_str(
+            "{\"count\":0,\"sum\":0,\"mean\":0.0,\"p50\":0,\"p95\":0,\"p99\":0,\"max\":0}",
+        );
+        return;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let count = sorted.len();
+    let sum: u64 = sorted.iter().copied().sum();
+    let mean = sum as f64 / count as f64;
+    let p50 = percentile_u64(&sorted, 0.50);
+    let p95 = percentile_u64(&sorted, 0.95);
+    let p99 = percentile_u64(&sorted, 0.99);
+    let max = *sorted.last().unwrap_or(&0);
+    let _ = write!(
+        out,
+        "{{\"count\":{},\"sum\":{},\"mean\":{:.3},\"p50\":{},\"p95\":{},\"p99\":{},\"max\":{}}}",
+        count, sum, mean, p50, p95, p99, max
+    );
+}
+
 fn percentile(sorted: &[u32], pct: f64) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let index = ((sorted.len() - 1) as f64 * pct).round() as usize;
+    sorted[index.min(sorted.len() - 1)]
+}
+
+fn percentile_u64(sorted: &[u64], pct: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
     }
@@ -954,7 +1101,12 @@ fn mark_unscheduled(py: Python<'_>, handle: &Py<PyAny>) -> PyResult<()> {
         .map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
-fn drain_completions(py: Python<'_>, completions: &[Completion]) -> PyResult<()> {
+fn drain_completions(
+    py: Python<'_>,
+    completions: &[Completion],
+    mut stats: Option<&mut PhaseStats>,
+) -> PyResult<CompletionPortDrainStats> {
+    let mut drained = CompletionPortDrainStats::default();
     for completion in completions {
         match completion {
             Completion::Future {
@@ -962,23 +1114,31 @@ fn drain_completions(py: Python<'_>, completions: &[Completion]) -> PyResult<()>
                 payload,
                 is_err,
             } => {
+                let started = stats.as_ref().map(|_| Instant::now());
                 if future.bind(py).call_method0("cancelled")?.is_truthy()? {
+                    drained.total += 1;
                     continue;
                 }
                 if *is_err {
                     future
                         .bind(py)
                         .call_method1("set_exception", (payload.bind(py),))?;
+                    drained.future_exception += 1;
                 } else {
                     future
                         .bind(py)
                         .call_method1("set_result", (payload.bind(py),))?;
+                    drained.future_result += 1;
                 }
+                if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
+                    stats.record_port_completion(*is_err, started.elapsed());
+                }
+                drained.total += 1;
             }
         }
     }
 
-    Ok(())
+    Ok(drained)
 }
 
 fn loop_time(py: Python<'_>, loop_obj: &Py<PyAny>) -> PyResult<f64> {

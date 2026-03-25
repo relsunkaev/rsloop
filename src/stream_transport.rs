@@ -43,9 +43,14 @@ static STREAM_PROFILE: OnceLock<Option<Mutex<StreamProfileState>>> = OnceLock::n
 struct StreamProfileEvent {
     at_us: u64,
     kind: &'static str,
+    stream_token: u64,
     fd: RawFd,
     size: usize,
     aux: usize,
+    read_buffer_len: usize,
+    read_buffer_offset: usize,
+    pending_write_bytes: usize,
+    state_flags: u32,
 }
 
 struct StreamProfileState {
@@ -103,8 +108,12 @@ enum ReadableDispatch {
         buffer_updated: Py<PyAny>,
         nbytes: usize,
     },
-    Eof { protocol: Py<PyAny> },
-    Error { exc: Py<PyAny> },
+    Eof {
+        protocol: Py<PyAny>,
+    },
+    Error {
+        exc: Py<PyAny>,
+    },
 }
 
 fn buffered_protocol_methods(
@@ -818,6 +827,55 @@ impl StreamTransport {
 }
 
 impl StreamCore {
+    fn profile_state_flags(&self) -> u32 {
+        let mut flags = 0_u32;
+        if self.reader.is_some() {
+            flags |= 1 << 0;
+        }
+        if self.buffered_protocol {
+            flags |= 1 << 1;
+        }
+        if self.closing {
+            flags |= 1 << 2;
+        }
+        if self.closed {
+            flags |= 1 << 3;
+        }
+        if self.read_paused {
+            flags |= 1 << 4;
+        }
+        if self.reader_registered {
+            flags |= 1 << 5;
+        }
+        if self.writer_registered {
+            flags |= 1 << 6;
+        }
+        if self.write_waiting_for_writable {
+            flags |= 1 << 7;
+        }
+        if self.protocol_paused {
+            flags |= 1 << 8;
+        }
+        if self.connection_lost_sent {
+            flags |= 1 << 9;
+        }
+        flags
+    }
+
+    fn record_profile_event(&self, kind: &'static str, size: usize, aux: usize) {
+        record_stream_profile_event_detail(
+            kind,
+            self.fd,
+            size,
+            aux,
+            self.stream_token,
+            self.read_buffer.len(),
+            self.read_buffer_offset,
+            self.pending_write_bytes,
+            self.profile_state_flags(),
+        );
+    }
+
     fn pause_reading(&mut self, py: Python<'_>) -> PyResult<()> {
         if self.read_paused || self.closed {
             return Ok(());
@@ -945,7 +1003,7 @@ impl StreamCore {
         {
             match try_send_bytes(self.fd, bytes) {
                 Ok(sent) if sent == bytes.len() => {
-                    record_stream_profile_event("write_direct", self.fd, sent, 0);
+                    self.record_profile_event("write_direct", sent, 0);
                     return Ok(());
                 }
                 Ok(sent) => {
@@ -953,12 +1011,7 @@ impl StreamCore {
                     self.queue_write_bytes(py, tail, 0)?;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    record_stream_profile_event(
-                        "write_direct_would_block",
-                        self.fd,
-                        bytes.len(),
-                        0,
-                    );
+                    self.record_profile_event("write_direct_would_block", bytes.len(), 0);
                     self.queue_write_bytes(py, data.clone().unbind(), 0)?;
                 }
                 Err(err) => {
@@ -995,7 +1048,7 @@ impl StreamCore {
                     self.queue_write_bytes(py, PyBytes::new(py, &data[sent..]).unbind(), 0)?;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    record_stream_profile_event("write_direct_would_block", self.fd, data.len(), 0);
+                    self.record_profile_event("write_direct_would_block", data.len(), 0);
                     self.queue_write_bytes(py, PyBytes::new(py, data).unbind(), 0)?;
                 }
                 Err(err) => {
@@ -1049,9 +1102,8 @@ impl StreamCore {
                         PendingWriteData::Owned(existing) => {
                             if existing.len() + len <= SMALL_WRITE_BUFFER_LIMIT {
                                 existing.extend_from_slice(bytes);
-                                record_stream_profile_event(
+                                self.record_profile_event(
                                     "write_queue_small_append",
-                                    self.fd,
                                     queued,
                                     self.pending_write_bytes,
                                 );
@@ -1067,9 +1119,8 @@ impl StreamCore {
                                 combined.extend_from_slice(existing_bytes);
                                 combined.extend_from_slice(bytes);
                                 last.data = PendingWriteData::Owned(combined);
-                                record_stream_profile_event(
+                                self.record_profile_event(
                                     "write_queue_small_merge",
-                                    self.fd,
                                     queued,
                                     self.pending_write_bytes,
                                 );
@@ -1084,7 +1135,7 @@ impl StreamCore {
             data: PendingWriteData::PyBytes(data),
             sent,
         });
-        record_stream_profile_event("write_queue", self.fd, queued, self.pending_write_bytes);
+        self.record_profile_event("write_queue", queued, self.pending_write_bytes);
         Ok(())
     }
 
@@ -1156,7 +1207,7 @@ impl StreamCore {
                     return Ok(());
                 }
                 Ok(n) => {
-                    record_stream_profile_event("read", self.fd, n, self.pending_write_bytes);
+                    self.record_profile_event("read", n, self.pending_write_bytes);
                     if trace_stream_enabled() {
                         eprintln!("stream-transport read fd={} bytes={}", self.fd, n);
                     }
@@ -1273,9 +1324,8 @@ impl StreamCore {
     }
 
     pub(crate) fn on_writable(&mut self, py: Python<'_>) -> PyResult<()> {
-        record_stream_profile_event(
+        self.record_profile_event(
             "write_ready",
-            self.fd,
             self.pending_write_bytes,
             self.write_queue.len(),
         );
@@ -1293,12 +1343,7 @@ impl StreamCore {
                 self.fd, self.pending_write_bytes
             );
         }
-        record_stream_profile_event(
-            "write_phase_start",
-            self.fd,
-            queued_before,
-            self.write_queue.len(),
-        );
+        self.record_profile_event("write_phase_start", queued_before, self.write_queue.len());
         while !self.write_queue.is_empty() {
             match self.flush_write_once(py) {
                 Ok(0) => {
@@ -1308,12 +1353,7 @@ impl StreamCore {
                 }
                 Ok(sent) => {
                     phase_sent += sent;
-                    record_stream_profile_event(
-                        "write_flush",
-                        self.fd,
-                        sent,
-                        self.pending_write_bytes,
-                    );
+                    self.record_profile_event("write_flush", sent, self.pending_write_bytes);
                     if trace_stream_enabled() {
                         eprintln!("stream-transport wrote fd={} bytes={}", self.fd, sent);
                     }
@@ -1321,9 +1361,8 @@ impl StreamCore {
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     self.write_waiting_for_writable = true;
                     self.sync_interest(py)?;
-                    record_stream_profile_event(
+                    self.record_profile_event(
                         "write_would_block",
-                        self.fd,
                         self.pending_write_bytes,
                         self.write_queue.len(),
                     );
@@ -1341,12 +1380,7 @@ impl StreamCore {
                 }
             }
         }
-        record_stream_profile_event(
-            "write_phase_end",
-            self.fd,
-            phase_sent,
-            self.pending_write_bytes,
-        );
+        self.record_profile_event("write_phase_end", phase_sent, self.pending_write_bytes);
 
         if self.pending_write_bytes == 0 {
             self.remove_writer(py)?;
@@ -1503,13 +1537,12 @@ impl StreamCore {
             return Ok(());
         }
         if writable != self.writer_registered {
-            record_stream_profile_event(
+            self.record_profile_event(
                 if writable {
                     "write_interest_on"
                 } else {
                     "write_interest_off"
                 },
-                self.fd,
                 self.pending_write_bytes,
                 self.write_queue.len(),
             );
@@ -1545,9 +1578,8 @@ impl StreamCore {
         }
         self.protocol.bind(py).call_method0("pause_writing")?;
         self.protocol_paused = true;
-        record_stream_profile_event(
+        self.record_profile_event(
             "pause_writing",
-            self.fd,
             self.pending_write_bytes,
             self.write_queue.len(),
         );
@@ -1560,9 +1592,8 @@ impl StreamCore {
         }
         self.protocol.bind(py).call_method0("resume_writing")?;
         self.protocol_paused = false;
-        record_stream_profile_event(
+        self.record_profile_event(
             "resume_writing",
-            self.fd,
             self.pending_write_bytes,
             self.write_queue.len(),
         );
@@ -1631,10 +1662,9 @@ impl StreamCore {
         if src.is_null() {
             return Err(PyErr::fetch(py));
         }
-        let data = PyBytes::new(
-            py,
-            unsafe { std::slice::from_raw_parts(src.cast::<u8>().add(offset), size) },
-        )
+        let data = PyBytes::new(py, unsafe {
+            std::slice::from_raw_parts(src.cast::<u8>().add(offset), size)
+        })
         .into_any()
         .unbind();
         self.read_buffer_offset = offset + size;
@@ -1656,10 +1686,9 @@ impl StreamCore {
         if src.is_null() {
             return Err(PyErr::fetch(py));
         }
-        let data = PyBytes::new(
-            py,
-            unsafe { std::slice::from_raw_parts(src.cast::<u8>().add(offset), unread) },
-        )
+        let data = PyBytes::new(py, unsafe {
+            std::slice::from_raw_parts(src.cast::<u8>().add(offset), unread)
+        })
         .into_any()
         .unbind();
         self.read_buffer_offset = total;
@@ -1770,7 +1799,7 @@ impl StreamCore {
                 resume_transport: true,
             },
         )?;
-        record_stream_profile_event("read_wait_done", self.fd, size, buffered);
+        self.record_profile_event("read_wait_done", size, buffered);
 
         self.read_buffer_offset += buffered;
         if needed_from_chunk != chunk_size {
@@ -1958,9 +1987,8 @@ impl StreamCore {
             .call_method0("create_future")?
             .unbind();
         self.pending_drains.push(future.clone_ref(py));
-        record_stream_profile_event(
+        self.record_profile_event(
             "drain_wait",
-            self.fd,
             self.pending_write_bytes,
             self.pending_drains.len(),
         );
@@ -2022,7 +2050,7 @@ impl StreamCore {
                         resume_transport: true,
                     },
                 )?;
-                record_stream_profile_event("read_wait_done", self.fd, size, buffered);
+                self.record_profile_event("read_wait_done", size, buffered);
                 Ok(true)
             }
             PendingReadState::Until {
@@ -2060,7 +2088,7 @@ impl StreamCore {
                             resume_transport: true,
                         },
                     )?;
-                    record_stream_profile_event("read_wait_done", self.fd, size, buffered);
+                    self.record_profile_event("read_wait_done", size, buffered);
                     return Ok(true);
                 }
                 if next_offset <= self.limit {
@@ -2165,13 +2193,12 @@ impl StreamCore {
         if self.pending_drains.is_empty() {
             return Ok(());
         }
-        record_stream_profile_event(
+        self.record_profile_event(
             if exception.is_some() {
                 "drain_fail"
             } else {
                 "drain_ready"
             },
-            self.fd,
             self.pending_write_bytes,
             self.pending_drains.len(),
         );
@@ -2227,8 +2254,17 @@ pub(crate) fn take_profile_stream_json() -> Option<String> {
         }
         let _ = write!(
             out,
-            "{{\"at_us\":{},\"kind\":\"{}\",\"fd\":{},\"size\":{},\"aux\":{}}}",
-            event.at_us, event.kind, event.fd, event.size, event.aux
+            "{{\"at_us\":{},\"kind\":\"{}\",\"stream_token\":{},\"fd\":{},\"size\":{},\"aux\":{},\"read_buffer_len\":{},\"read_buffer_offset\":{},\"pending_write_bytes\":{},\"state_flags\":{}}}",
+            event.at_us,
+            event.kind,
+            event.stream_token,
+            event.fd,
+            event.size,
+            event.aux,
+            event.read_buffer_len,
+            event.read_buffer_offset,
+            event.pending_write_bytes,
+            event.state_flags
         );
     }
     out.push_str("]}");
@@ -2258,6 +2294,20 @@ fn stream_profile_state() -> Option<&'static Mutex<StreamProfileState>> {
 }
 
 fn record_stream_profile_event(kind: &'static str, fd: RawFd, size: usize, aux: usize) {
+    record_stream_profile_event_detail(kind, fd, size, aux, 0, 0, 0, 0, 0);
+}
+
+fn record_stream_profile_event_detail(
+    kind: &'static str,
+    fd: RawFd,
+    size: usize,
+    aux: usize,
+    stream_token: u64,
+    read_buffer_len: usize,
+    read_buffer_offset: usize,
+    pending_write_bytes: usize,
+    state_flags: u32,
+) {
     let Some(state) = stream_profile_state() else {
         return;
     };
@@ -2270,9 +2320,14 @@ fn record_stream_profile_event(kind: &'static str, fd: RawFd, size: usize, aux: 
     state.events.push(StreamProfileEvent {
         at_us,
         kind,
+        stream_token,
         fd,
         size,
         aux,
+        read_buffer_len,
+        read_buffer_offset,
+        pending_write_bytes,
+        state_flags,
     });
 }
 

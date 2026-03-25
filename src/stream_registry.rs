@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::env;
 use std::os::fd::RawFd;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use pyo3::prelude::*;
 
@@ -12,6 +13,19 @@ use crate::stream_transport::{StreamCompletion, StreamCoreRef, StreamTransport, 
 const SEGMENT_BITS: usize = 8;
 const SEGMENT_SIZE: usize = 1 << SEGMENT_BITS;
 const SEGMENT_MASK: usize = SEGMENT_SIZE - 1;
+
+#[derive(Default, Clone, Copy)]
+pub(crate) struct CompletionDrainStats {
+    pub(crate) total: u32,
+    pub(crate) read_result: u32,
+    pub(crate) read_exception: u32,
+    pub(crate) future_result: u32,
+    pub(crate) future_exception: u32,
+    pub(crate) read_result_us: u64,
+    pub(crate) read_exception_us: u64,
+    pub(crate) future_result_us: u64,
+    pub(crate) future_exception_us: u64,
+}
 
 #[pyclass(module = "rsloop._rsloop", unsendable)]
 pub struct StreamTransportRegistry {
@@ -51,7 +65,10 @@ impl StreamTransportRegistry {
     pub(crate) fn dispatch_one(&self, py: Python<'_>, fd: i32, mask: u8) -> PyResult<bool> {
         let index = fd as usize;
         let segments = self.segments.borrow();
-        let Some(segment) = segments.get(index >> SEGMENT_BITS).and_then(|segment| segment.as_ref()) else {
+        let Some(segment) = segments
+            .get(index >> SEGMENT_BITS)
+            .and_then(|segment| segment.as_ref())
+        else {
             return Ok(false);
         };
         let Some(transport) = segment[index & SEGMENT_MASK].as_ref() else {
@@ -76,15 +93,19 @@ impl StreamTransportRegistry {
         !self.completions.borrow().is_empty()
     }
 
-    pub(crate) fn drain_completion_queue(&self, py: Python<'_>) -> PyResult<usize> {
+    pub(crate) fn drain_completion_queue(
+        &self,
+        py: Python<'_>,
+        profile_timing: bool,
+    ) -> PyResult<CompletionDrainStats> {
         let completions = {
             let mut queued = self.completions.borrow_mut();
             if queued.is_empty() {
-                return Ok(0);
+                return Ok(CompletionDrainStats::default());
             }
             std::mem::take(&mut *queued)
         };
-        let mut drained = 0usize;
+        let mut stats = CompletionDrainStats::default();
         for completion in completions {
             match completion {
                 StreamCompletion::ReadResult {
@@ -93,11 +114,16 @@ impl StreamTransportRegistry {
                     payload,
                     resume_transport,
                 } => {
+                    let started = profile_timing.then(Instant::now);
                     let reader = reader.bind(py);
                     clear_waiter(reader, py)?;
                     StreamWaiter::finish_result(&waiter, py, payload)?;
                     if resume_transport {
                         maybe_resume_transport(reader)?;
+                    }
+                    stats.read_result += 1;
+                    if let Some(started) = started {
+                        stats.read_result_us += started.elapsed().as_micros() as u64;
                     }
                 }
                 StreamCompletion::ReadException {
@@ -105,24 +131,41 @@ impl StreamTransportRegistry {
                     waiter,
                     exception,
                 } => {
+                    let started = profile_timing.then(Instant::now);
                     let reader = reader.bind(py);
                     clear_waiter(reader, py)?;
                     StreamWaiter::finish_exception(&waiter, py, exception)?;
+                    stats.read_exception += 1;
+                    if let Some(started) = started {
+                        stats.read_exception_us += started.elapsed().as_micros() as u64;
+                    }
                 }
                 StreamCompletion::FutureResult { future, value } => {
+                    let started = profile_timing.then(Instant::now);
                     if !future_done(py, &future)? {
                         future.bind(py).call_method1("set_result", (value,))?;
                     }
+                    stats.future_result += 1;
+                    if let Some(started) = started {
+                        stats.future_result_us += started.elapsed().as_micros() as u64;
+                    }
                 }
                 StreamCompletion::FutureException { future, exception } => {
+                    let started = profile_timing.then(Instant::now);
                     if !future_done(py, &future)? {
-                        future.bind(py).call_method1("set_exception", (exception,))?;
+                        future
+                            .bind(py)
+                            .call_method1("set_exception", (exception,))?;
+                    }
+                    stats.future_exception += 1;
+                    if let Some(started) = started {
+                        stats.future_exception_us += started.elapsed().as_micros() as u64;
                     }
                 }
             }
-            drained += 1;
+            stats.total += 1;
         }
-        Ok(drained)
+        Ok(stats)
     }
 
     pub(crate) fn flush_write_queue(&self, py: Python<'_>) -> PyResult<usize> {
