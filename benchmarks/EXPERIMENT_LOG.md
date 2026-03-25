@@ -1017,3 +1017,41 @@ hop or a repeated protocol lookup. The remaining credible directions are:
   - [`benchmarks/out/start-tls-upgrade-all-native-hotpath-v3.json`](out/start-tls-upgrade-all-native-hotpath-v3.json)
   - [`benchmarks/out/http1-keepalive-small-all-native-hotpath-v3.json`](out/http1-keepalive-small-all-native-hotpath-v3.json)
   - [`benchmarks/out/asgi-json-echo-all-native-hotpath-v3.json`](out/asgi-json-echo-all-native-hotpath-v3.json)
+
+### 42. Native TLS app-write fast path
+
+- Area:
+  - [`python/rsloop/sslproto.py`](../python/rsloop/sslproto.py)
+  - [`src/stream_transport.rs`](../src/stream_transport.rs)
+  - [`src/lib.rs`](../src/lib.rs)
+- Change:
+  - first tried moving `_write_appdata()` and `_process_outgoing()` wholesale into
+    Rust, including direct `SSLObject.write()` and backlog draining
+  - after that regressed, narrowed it to a fast path only:
+    - native direct single-write attempt in `WRAPPED` state
+    - stdlib fallback for all other write shapes
+- Rationale:
+  - after the copied-read hot path moved native, the next visible TLS cost was
+    `_write_appdata` on small keepalive writes
+- Functional result:
+  - targeted TLS tests still passed through both variants
+- Revision A/B against the kept copied-read baseline:
+  - broad native write pass:
+    - `tls_http1_keepalive`: `0.179620s -> 0.192421s` (`+7.13%`)
+  - narrowed fast-path-only pass:
+    - `tls_http1_keepalive`: `0.197297s -> 0.182058s` (`-7.72%`)
+    - `start_tls_upgrade`: `0.043939s -> 0.043161s` (`-1.77%`)
+- Guard checks on the narrowed pass:
+  - `http1_keepalive_small`: `0.305060s -> 0.322161s` (`+5.61%`)
+  - `asgi_json_echo`: `0.168220s -> 0.173484s` (`+3.13%`)
+- Conclusion:
+  - the TLS write-side fast path can help the isolated TLS keepalive case
+  - but it regressed the plain HTTP and ASGI guards too much, so it is not a
+    keeper in its current shape
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/revision-ab-tls-native-write-v1.json`](out/revision-ab-tls-native-write-v1.json)
+  - [`benchmarks/out/revision-ab-tls-native-write-v2.json`](out/revision-ab-tls-native-write-v2.json)
+  - [`benchmarks/out/revision-ab-start-tls-native-write-v2.json`](out/revision-ab-start-tls-native-write-v2.json)
+  - [`benchmarks/out/revision-ab-http1-native-write-v2-strict.json`](out/revision-ab-http1-native-write-v2-strict.json)
+  - [`benchmarks/out/revision-ab-asgi-native-write-v2.json`](out/revision-ab-asgi-native-write-v2.json)
