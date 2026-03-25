@@ -129,6 +129,15 @@ fn buffered_protocol_methods(
     Ok((false, None, None))
 }
 
+fn defer_transport_method(py: Python<'_>, transport: &Bound<'_, StreamTransport>, method: &str) -> PyResult<()> {
+    let loop_obj = PyModule::import(py, "asyncio")?
+        .getattr("get_running_loop")?
+        .call0()?;
+    let callback = transport.getattr(method)?;
+    loop_obj.call_method1("call_soon", (callback,))?;
+    Ok(())
+}
+
 impl PendingWrite {
     fn len(&self, py: Python<'_>) -> usize {
         match &self.data {
@@ -728,7 +737,9 @@ impl StreamTransport {
 
     fn close(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
         let core = slf.borrow(py).core.clone();
-        let mut transport = core.borrow_mut();
+        let Ok(mut transport) = core.try_borrow_mut() else {
+            return defer_transport_method(py, &slf.bind(py), "close");
+        };
         if transport.closing || transport.closed {
             return Ok(());
         }
@@ -746,7 +757,9 @@ impl StreamTransport {
     fn abort(slf: Py<Self>, py: Python<'_>, message: Option<String>) -> PyResult<()> {
         let exc = message.map(|message| PyRuntimeError::new_err(message).into_value(py).into_any());
         let core = slf.borrow(py).core.clone();
-        let mut transport = core.borrow_mut();
+        let Ok(mut transport) = core.try_borrow_mut() else {
+            return defer_transport_method(py, &slf.bind(py), "close");
+        };
         transport.finish_close(py, exc)
     }
 
@@ -780,8 +793,11 @@ impl StreamTransport {
         }
     }
 
-    fn pause_reading(&mut self, py: Python<'_>) -> PyResult<()> {
-        let mut core = self.core.borrow_mut();
+    fn pause_reading(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
+        let core_ref = slf.borrow(py).core.clone();
+        let Ok(mut core) = core_ref.try_borrow_mut() else {
+            return defer_transport_method(py, &slf.bind(py), "pause_reading");
+        };
         if core.read_paused || core.closed {
             return Ok(());
         }
@@ -791,7 +807,9 @@ impl StreamTransport {
 
     fn resume_reading(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
         let core = slf.borrow(py).core.clone();
-        let mut transport = core.borrow_mut();
+        let Ok(mut transport) = core.try_borrow_mut() else {
+            return defer_transport_method(py, &slf.bind(py), "resume_reading");
+        };
         if !transport.read_paused || transport.closed || transport.closing {
             return Ok(());
         }

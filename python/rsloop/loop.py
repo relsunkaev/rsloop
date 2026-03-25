@@ -1292,12 +1292,11 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         self._ensure_fd_no_transport(sock)
         self._take_fd_for_transport(sock)
         stream_transport_type = getattr(_rsloop, "StreamTransport", None)
-        if (
-            stream_transport_type is not None
-            and isinstance(protocol, _streams.StreamReaderProtocol)
-        ):
+        if stream_transport_type is not None:
             extra = {} if extra is None else dict(extra)
-            reader = protocol._stream_reader
+            reader = None
+            if isinstance(protocol, _streams.StreamReaderProtocol):
+                reader = protocol._stream_reader
             _base_events._set_nodelay(sock)
             transport = stream_transport_type(
                 sock,
@@ -1310,22 +1309,23 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
                 reader,
                 reader._limit if reader is not None else 65536,
             )
-            stream_writer = getattr(protocol, "_stream_writer", None)
-            if stream_writer is not None and not isinstance(
-                stream_writer, RsloopStreamWriter
-            ):
-                bind_write = getattr(transport, "bind_write", None)
-                if bind_write is not None:
-                    stream_writer.write = bind_write()
-                bind_close = getattr(transport, "bind_close", None)
-                if bind_close is not None:
-                    stream_writer.close = bind_close()
-                bind_drain = getattr(transport, "bind_drain", None)
-                if bind_drain is not None:
-                    stream_writer.drain = bind_drain(stream_writer.drain)
-                bind_wait_closed = getattr(transport, "bind_wait_closed", None)
-                if bind_wait_closed is not None:
-                    stream_writer.wait_closed = bind_wait_closed()
+            if reader is not None:
+                stream_writer = getattr(protocol, "_stream_writer", None)
+                if stream_writer is not None and not isinstance(
+                    stream_writer, RsloopStreamWriter
+                ):
+                    bind_write = getattr(transport, "bind_write", None)
+                    if bind_write is not None:
+                        stream_writer.write = bind_write()
+                    bind_close = getattr(transport, "bind_close", None)
+                    if bind_close is not None:
+                        stream_writer.close = bind_close()
+                    bind_drain = getattr(transport, "bind_drain", None)
+                    if bind_drain is not None:
+                        stream_writer.drain = bind_drain(stream_writer.drain)
+                    bind_wait_closed = getattr(transport, "bind_wait_closed", None)
+                    if bind_wait_closed is not None:
+                        stream_writer.wait_closed = bind_wait_closed()
             activate = getattr(transport, "activate", None)
             if activate is not None:
                 activate()
