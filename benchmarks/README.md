@@ -88,6 +88,35 @@ Capture cross-loop Python stream delivery/write shape for an isolated comparison
   --json
 ```
 
+Capture runtime, stream, one-arg callback timing, Python CPU samples, and
+HTTP/ASGI/TLS phase markers for one benchmark:
+
+```bash
+.venv/bin/python benchmarks/loops.py \
+  --loop rsloop \
+  --benchmark asgi_json_echo \
+  --repeats 1 \
+  --warmups 0 \
+  --profile-runtime \
+  --profile-stream \
+  --profile-python-streams \
+  --profile-python-cpu \
+  --profile-app-phases \
+  --output benchmarks/out/asgi-json-profile.json \
+  --json
+```
+
+Run an interleaved current-vs-`HEAD` revision comparison for rsloop itself:
+
+```bash
+.venv/bin/python benchmarks/revision_ab.py \
+  --benchmark asgi_json_echo \
+  --repeats 3 \
+  --warmups 1 \
+  --profile-runtime \
+  --output benchmarks/out/asgi-json-revision-ab.json
+```
+
 ### Profiles
 
 - `smoke`: fast sanity checks
@@ -103,8 +132,13 @@ Capture cross-loop Python stream delivery/write shape for an isolated comparison
 - `--profile-runtime` captures Rsloop scheduler per-tick summaries into the JSON artifact.
 - `--profile-stream` captures a bounded Rsloop stream event trace into the JSON artifact.
 - `--profile-python-streams` captures cross-loop Python stream counters for `feed_data`, `readexactly`, `write`, and `drain`.
+- `--profile-python-cpu` captures a pyinstrument CPU sample for isolated child runs.
+- `--profile-app-phases` captures benchmark-level HTTP/ASGI/TLS phase markers for isolated child runs.
 - `--iterations` overrides the default iteration count for the selected scenarios.
 - `--no-interleave-loops` disables round-robin pairing if you need the old run shape.
 - `--child-retries` retries transient child failures before aborting the suite.
 - Runtime profile capture requires subprocess isolation; leave `--no-isolate-process` off when using it.
 - On Rsloop’s native stream fast path, Python stream counters can legitimately stay near zero. That means the workload stayed below `StreamReader`/`StreamWriter`, not that the profiler failed.
+- Profile artifacts now preserve per-sample profile records. Each `results[*].profiles[*]` entry includes `sample_index`, `round_index`, and the raw profile payload instead of collapsing to one synthetic “max” profile.
+- Scheduler runtime profiles now include one-arg callback timing, completion breakdowns, and per-tick phase latency histograms.
+- Stream traces now include `stream_token`, buffer state, pending write bytes, and transport state flags to disambiguate fd reuse.
