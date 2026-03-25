@@ -1155,3 +1155,44 @@ hop or a repeated protocol lookup. The remaining credible directions are:
   - [`benchmarks/out/tls-http1-all-cache-handoff.json`](out/tls-http1-all-cache-handoff.json)
   - [`benchmarks/out/start-tls-all-cache-handoff.json`](out/start-tls-all-cache-handoff.json)
   - [`benchmarks/out/http1-all-cache-handoff.json`](out/http1-all-cache-handoff.json)
+
+### 46. Cached `StreamReader._wakeup_waiter` on native TLS copied reads
+
+- Area:
+  - [`src/stream_transport.rs`](../src/stream_transport.rs)
+- Change:
+  - cache the exact `StreamReader._wakeup_waiter` bound method alongside the
+    other copied-mode TLS reader state
+  - use that cached method from the native copied-read path instead of
+    reconstructing the wakeup sequence through separate `_waiter` /
+    `cancelled()` / `set_result(None)` attribute lookups
+- Rationale:
+  - after caching the TLS protocol-side handles, the next repeated Python
+    control-plane step in copied-mode wrapped reads was the `StreamReader`
+    waiter wakeup path
+- Functional result:
+  - `cargo test -q` passed
+  - `./.venv/bin/maturin develop --release` passed
+- Revision A/B against `HEAD`:
+  - `tls_http1_keepalive`: `0.171501s -> 0.167197s` (`-2.51%`)
+  - `start_tls_upgrade`: `0.052311s -> 0.037720s` (`-27.89%`)
+- Guard checks:
+  - `asgi_json_echo`: `0.185090s -> 0.185558s` (`+0.25%`)
+  - `http1_keepalive_small` initial strict run:
+    `0.338179s -> 0.341734s` (`+1.05%`)
+  - `http1_keepalive_small` tighter confirmation:
+    `0.313483s -> 0.313122s` (`-0.12%`)
+- Cross-loop spot check vs `uvloop`:
+  - `tls_http1_keepalive`: `1.157x`
+- Conclusion:
+  - caching the exact wakeup method is worth keeping
+  - the target TLS path improved again, and the tighter plain-HTTP confirmation
+    removed the initial guard concern
+- Decision: kept
+- Artifacts:
+  - [`benchmarks/out/revision-ab-tls-wakeup-cache.json`](out/revision-ab-tls-wakeup-cache.json)
+  - [`benchmarks/out/revision-ab-starttls-wakeup-cache.json`](out/revision-ab-starttls-wakeup-cache.json)
+  - [`benchmarks/out/revision-ab-asgi-wakeup-cache.json`](out/revision-ab-asgi-wakeup-cache.json)
+  - [`benchmarks/out/revision-ab-http1-wakeup-cache-strict.json`](out/revision-ab-http1-wakeup-cache-strict.json)
+  - [`benchmarks/out/revision-ab-http1-wakeup-cache-confirm.json`](out/revision-ab-http1-wakeup-cache-confirm.json)
+  - [`benchmarks/out/tls-http1-all-wakeup-cache.json`](out/tls-http1-all-wakeup-cache.json)
