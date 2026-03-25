@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import _rsloop
+from .sslproto import RsloopSSLProtocol
 
 
 logger = _selector_events.logger
@@ -1434,7 +1435,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
     ) -> asyncio.Transport:
         self._ensure_fd_no_transport(rawsock)
         self._take_fd_for_transport(rawsock)
-        ssl_protocol = _sslproto.SSLProtocol(
+        ssl_protocol = RsloopSSLProtocol(
             self,
             protocol,
             sslcontext,
