@@ -100,6 +100,7 @@ HTTP/ASGI/TLS phase markers for one benchmark:
   --profile-runtime \
   --profile-stream \
   --profile-python-streams \
+  --profile-sslproto \
   --profile-python-cpu \
   --profile-app-phases \
   --output benchmarks/out/asgi-json-profile.json \
@@ -114,6 +115,7 @@ Run an interleaved current-vs-`HEAD` revision comparison for rsloop itself:
   --repeats 3 \
   --warmups 1 \
   --profile-runtime \
+  --profile-sslproto \
   --output benchmarks/out/asgi-json-revision-ab.json
 ```
 
@@ -132,6 +134,7 @@ Run an interleaved current-vs-`HEAD` revision comparison for rsloop itself:
 - `--profile-runtime` captures Rsloop scheduler per-tick summaries into the JSON artifact.
 - `--profile-stream` captures a bounded Rsloop stream event trace into the JSON artifact.
 - `--profile-python-streams` captures cross-loop Python stream counters for `feed_data`, `readexactly`, `write`, and `drain`.
+- `--profile-sslproto` captures stdlib `asyncio.sslproto.SSLProtocol` method timings for isolated child runs.
 - `--profile-python-cpu` captures a pyinstrument CPU sample for isolated child runs.
 - `--profile-app-phases` captures benchmark-level HTTP/ASGI/TLS phase markers for isolated child runs.
 - `--iterations` overrides the default iteration count for the selected scenarios.
@@ -142,3 +145,19 @@ Run an interleaved current-vs-`HEAD` revision comparison for rsloop itself:
 - Profile artifacts now preserve per-sample profile records. Each `results[*].profiles[*]` entry includes `sample_index`, `round_index`, and the raw profile payload instead of collapsing to one synthetic “max” profile.
 - Scheduler runtime profiles now include one-arg callback timing, completion breakdowns, and per-tick phase latency histograms.
 - Stream traces now include `stream_token`, buffer state, pending write bytes, and transport state flags to disambiguate fd reuse.
+
+Capture a native macOS `sample` trace around a single isolated benchmark child:
+
+```bash
+.venv/bin/python benchmarks/native_sample.py \
+  --loop rsloop \
+  --benchmark tls_http1_keepalive \
+  --duration 5 \
+  --profile-runtime \
+  --profile-sslproto \
+  --profile-python-streams \
+  --profile-app-phases \
+  --output-prefix benchmarks/out/tls-http1-rsloop-sample
+```
+
+- `native_sample.py` writes `<prefix>.json` with the parsed benchmark result, parsed runtime profile, and top-of-stack summary, plus `<prefix>.sample.txt` with raw `sample` output.
