@@ -854,3 +854,58 @@ hop or a repeated protocol lookup. The remaining credible directions are:
 - Decision: reverted
 - Artifacts:
   - [`benchmarks/out/ab-rsloop-sslproto-replacement.json`](out/ab-rsloop-sslproto-replacement.json)
+
+### 39. Tuned rsloop TLS protocol replacement
+
+- Area:
+  - [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+  - [`python/rsloop/sslproto.py`](../python/rsloop/sslproto.py)
+  - [`benchmarks/loops.py`](../benchmarks/loops.py)
+- Change:
+  - keep an rsloop-owned `RsloopSSLProtocol` as the default TLS protocol
+  - cache exact stdlib `StreamReaderProtocol` reader hooks once in
+    `_set_app_protocol()`
+  - specialize copied-mode wrapped reads for the stream-helper case so TLS data
+    goes straight to the cached reader `feed_data()` / `feed_eof()` hooks
+  - cheapen `_process_outgoing()` by skipping empty BIO reads
+  - extend the benchmark `sslproto` profiler to wrap rsloop-owned TLS methods
+    without double-wrapping inherited stdlib methods
+- Rationale:
+  - the first TLS replacement draft was still paying too much stdlib-shaped
+    overhead in the wrapped read path and the profiler itself became blind once
+    rsloop owned more of the class
+- Functional result:
+  - focused TLS tests and benchmark parser coverage passed
+  - the profiler fix added coverage for rsloop-owned TLS methods and a test for
+    the subclass wrapping behavior
+- Same-codebase interleaved A/B against forced stdlib `SSLProtocol`
+  (no profiler):
+  - `tls_http1_keepalive`: `0.207242s -> 0.182067s` (`-12.15%`), 4/5 wins
+  - `start_tls_upgrade`: `0.057689s -> 0.034670s` (`-39.90%`), 4/5 wins
+- Strict non-TLS guards:
+  - `http1_keepalive_small`: `-1.10%`
+  - `asgi_json_echo`: `+0.33%`
+- Cross-loop spot checks against `uvloop`:
+  - `tls_http1_keepalive`: `1.588x`
+  - `start_tls_upgrade`: `0.962x`
+  - `http1_keepalive_small`: `1.026x`
+  - `asgi_json_echo`: `1.041x`
+- Profiler note:
+  - on the candidate run, wrapped `_process_outgoing` time dropped from about
+    `0.0288s` to `0.0255s` and `_write_appdata` also dropped in the non-outlier
+    samples; the tuned path moved the hot TLS buckets in the right direction
+- Conclusion:
+  - a Python-level rsloop-owned TLS path can improve the wrapped steady-state
+    case if it owns enough of the copied read path and avoids extra profiler and
+    empty-BIO overhead
+  - this is still not a full native TLS state machine, but it is the first TLS
+    replacement pass that held up on the main keepalive target
+- Decision: kept
+- Artifacts:
+  - [`benchmarks/out/ab-rsloop-sslproto-prototype-v3-noprofile.json`](out/ab-rsloop-sslproto-prototype-v3-noprofile.json)
+  - [`benchmarks/out/ab-rsloop-sslproto-guards-strict.json`](out/ab-rsloop-sslproto-guards-strict.json)
+  - [`benchmarks/out/ab-rsloop-sslproto-prototype-v3.json`](out/ab-rsloop-sslproto-prototype-v3.json)
+  - [`benchmarks/out/tls-http1-keepalive-all-candidate.json`](out/tls-http1-keepalive-all-candidate.json)
+  - [`benchmarks/out/start-tls-upgrade-all-candidate.json`](out/start-tls-upgrade-all-candidate.json)
+  - [`benchmarks/out/http1-keepalive-small-all-candidate.json`](out/http1-keepalive-small-all-candidate.json)
+  - [`benchmarks/out/asgi-json-echo-all-candidate.json`](out/asgi-json-echo-all-candidate.json)
