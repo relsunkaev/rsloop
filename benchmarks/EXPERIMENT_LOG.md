@@ -767,6 +767,47 @@ performance pass, including changes that were reverted.
   - [`benchmarks/out/tcp-protocol-echo-selector-runtime.json`](out/tcp-protocol-echo-selector-runtime.json)
   - [`benchmarks/out/tcp-protocol-echo-native-runtime.json`](out/tcp-protocol-echo-native-runtime.json)
 
+### 37. Native `StreamReaderProtocol.connection_made` bind
+
+- Area: [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+- Change:
+  - replace stdlib `StreamReaderProtocol.connection_made()` with an rsloop
+    helper for exact stdlib `StreamReaderProtocol` instances
+  - use `RsloopStreamWriter` directly for server-side `client_connected_cb`
+    callbacks
+  - first try it on both plain streams and TLS, then narrow it to the TLS
+    app-protocol path only
+- Rationale:
+  - this was the smallest shared slice that touched both the stream-helper path
+    and the TLS app-protocol handoff without attempting a full SSLProtocol
+    rewrite
+- Functional result:
+  - focused stream and `start_tls` tests passed
+- Mixed plain-stream + TLS A/B against the old path:
+  - `http1_keepalive_small`: `+7.60%`
+  - `http1_connect_per_request`: `+4.57%`
+  - `tls_http1_keepalive`: `-5.88%`
+- Narrowed TLS-only A/B:
+  - `tls_http1_keepalive`: `+0.80%`
+  - `start_tls_upgrade`: `-36.74%` on the first 5-round run
+  - `http1_keepalive_small`: `-1.22%`
+- Strict confirmation on `start_tls_upgrade` did not hold:
+  - `0.036657s -> 0.044439s` (`+21.23%`)
+- Conclusion:
+  - the combined stream/TLS bind regressed the plain stream workloads we care
+    about
+  - the TLS-only version looked promising at first but collapsed under a
+    stricter confirmation run
+  - the lifecycle handoff is too noisy to keep in its current form
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/ab-native-stream-reader-bind.json`](out/ab-native-stream-reader-bind.json)
+  - [`benchmarks/out/ab-native-stream-reader-bind-tls-only.json`](out/ab-native-stream-reader-bind-tls-only.json)
+  - [`benchmarks/out/ab-start-tls-upgrade-stream-bind-strict.json`](out/ab-start-tls-upgrade-stream-bind-strict.json)
+  - [`benchmarks/out/start-tls-upgrade-stream-bind-final.json`](out/start-tls-upgrade-stream-bind-final.json)
+  - [`benchmarks/out/tls-http1-keepalive-stream-bind-final.json`](out/tls-http1-keepalive-stream-bind-final.json)
+  - [`benchmarks/out/http1-keepalive-small-stream-bind-final.json`](out/http1-keepalive-small-stream-bind-final.json)
+
 The main conclusion so far is that callback-level micro-optimizations are not
 reliably translating into user-visible wins unless they remove a real callback
 hop or a repeated protocol lookup. The remaining credible directions are:
