@@ -1255,3 +1255,30 @@ hop or a repeated protocol lookup. The remaining credible directions are:
 - Decision: reverted
 - Artifacts:
   - [`benchmarks/out/revision-ab-subprocess-exit-cache-seq.json`](out/revision-ab-subprocess-exit-cache-seq.json)
+
+### 49. Native subprocess exit delivery via completion port
+
+- Area:
+  - [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+  - `src/completion.rs` (reverted)
+  - `src/scheduler.rs` (reverted)
+- Change:
+  - replace stdlib child-watcher delivery with an rsloop-owned waitpid thread
+    that pushed subprocess exits through the existing completion port
+  - completion-port draining then called `transport._process_exited(returncode)`
+    on the loop thread
+- Rationale:
+  - this was the first deeper subprocess slice that removed
+    `call_soon_threadsafe()` from exit delivery instead of just caching a bound
+    method around it
+- Functional result:
+  - subprocess tests passed
+- Revision A/B against `HEAD`:
+  - `subprocess_exec`: `0.785807s -> 0.777260s` (`-1.09%`)
+- Conclusion:
+  - native exit delivery helped slightly, but not enough to keep
+  - the remaining subprocess gap is in stdio transport overhead, not the child
+    exit notification path
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/revision-ab-subprocess-native-exit-port.json`](out/revision-ab-subprocess-native-exit-port.json)
