@@ -408,6 +408,47 @@ performance pass, including changes that were reverted.
   - the failure points at remaining correctness work around TLS record-layer
     handling and read ordering
 
+### 27. Native stream reader/writer state with no per-instance rebinding
+
+- Area: [`python/rsloop/loop.py`](../python/rsloop/loop.py),
+  [`src/stream_transport.rs`](../src/stream_transport.rs),
+  [`tests/test_loop.py`](../tests/test_loop.py)
+- Change:
+  - add native-aware `RsloopStreamReader` / `RsloopStreamWriter` classes
+  - stop mutating per-connection reader and writer methods
+  - move plain-stream read waiter, drain, and close-wait bookkeeping behind
+    cached native state objects
+- Result versus clean `HEAD` on targeted `rsloop`-only A/B:
+  - `http1_keepalive_small` `0.244230791s -> 0.243691208s` (`-0.22%`)
+  - `asgi_json_echo` `0.124061125s -> 0.126072584s` (`+1.62%`)
+  - `asgi_streaming` `0.106495458s -> 0.117260292s` (`+10.11%`)
+  - `http1_streaming_response` `0.113535000s -> 0.113882292s` (`+0.31%`)
+  - `grpc_like_unary` `0.115282458s -> 0.118118167s` (`+2.46%`)
+  - `tls_http1_keepalive` `0.170259417s -> 0.162731625s` (`-4.42%`)
+  - `http1_connect_per_request` `0.040000667s -> 0.035883792s` (`-10.29%`)
+- Decision: reverted; the app-shaped regressions were too broad, especially
+  `asgi_streaming`
+
+### 28. Writer-only native state split
+
+- Area: [`python/rsloop/loop.py`](../python/rsloop/loop.py),
+  [`src/stream_transport.rs`](../src/stream_transport.rs),
+  [`tests/test_loop.py`](../tests/test_loop.py)
+- Change:
+  - keep only the native writer state and class-level writer methods
+  - restore the existing reader fast path and per-instance reader rebinding
+- Result versus clean `HEAD` on targeted `rsloop`-only A/B:
+  - `http1_keepalive_small` `0.244230791s -> 0.250213667s` (`+2.45%`)
+  - `asgi_json_echo` `0.124061125s -> 0.122171458s` (`-1.52%`)
+  - `asgi_streaming` `0.106495458s -> 0.114242084s` (`+7.27%`)
+  - `http1_streaming_response` `0.113535000s -> 0.114681833s` (`+1.01%`)
+  - `grpc_like_unary` `0.115282458s -> 0.114760541s` (`-0.45%`)
+  - `http1_connect_per_request` `0.040000667s -> 0.043870834s` (`+9.68%`)
+- Additional result:
+  - `tls_http1_keepalive` benchmark failed after a constructor-arity regression
+    in the SSL transport call site
+- Decision: reverted; too many regressions and a TLS correctness break
+
 ## Open Direction
 
 The main conclusion so far is that callback-level micro-optimizations are not
