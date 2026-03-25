@@ -72,6 +72,7 @@ struct NativeSslCache {
     outgoing_read: Py<PyAny>,
     transport_write: Option<Py<PyAny>>,
     stream_reader: Option<Py<PyAny>>,
+    stream_reader_wakeup_waiter: Option<Py<PyAny>>,
     stream_reader_buffer: Option<Py<PyByteArray>>,
     stream_reader_limit: usize,
     max_size: usize,
@@ -86,6 +87,10 @@ impl NativeSslCache {
             outgoing_read: self.outgoing_read.clone_ref(py),
             transport_write: self.transport_write.as_ref().map(|value| value.clone_ref(py)),
             stream_reader: self.stream_reader.as_ref().map(|value| value.clone_ref(py)),
+            stream_reader_wakeup_waiter: self
+                .stream_reader_wakeup_waiter
+                .as_ref()
+                .map(|value| value.clone_ref(py)),
             stream_reader_buffer: self
                 .stream_reader_buffer
                 .as_ref()
@@ -3177,12 +3182,16 @@ fn ssl_again_errors(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
 }
 
 fn build_native_ssl_cache(
-    _py: Python<'_>,
+    py: Python<'_>,
     protocol: &Bound<'_, PyAny>,
 ) -> PyResult<NativeSslCache> {
     let stream_reader = match protocol.getattr("_rsloop_stream_reader") {
         Ok(reader) if !reader.is_none() => Some(reader.unbind()),
         _ => None,
+    };
+    let stream_reader_wakeup_waiter = match stream_reader.as_ref() {
+        Some(reader) => Some(reader.bind(py).getattr("_wakeup_waiter")?.unbind()),
+        None => None,
     };
     let stream_reader_buffer = match protocol.getattr("_rsloop_stream_reader_buffer") {
         Ok(buffer) if !buffer.is_none() => {
@@ -3206,6 +3215,7 @@ fn build_native_ssl_cache(
         outgoing_read: protocol.getattr("_rsloop_outgoing_read")?.unbind(),
         transport_write,
         stream_reader,
+        stream_reader_wakeup_waiter,
         stream_reader_buffer,
         stream_reader_limit,
         max_size: protocol.getattr("max_size")?.extract::<usize>()?,
@@ -3298,7 +3308,11 @@ fn rsloop_sslproto_do_read_copied_cached(
             }
         }
         let reader = reader.bind(py);
-        wake_waiter(py, &reader)?;
+        if let Some(wakeup_waiter) = cache.stream_reader_wakeup_waiter.as_ref() {
+            wakeup_waiter.bind(py).call0()?;
+        } else {
+            wake_waiter(py, &reader)?;
+        }
         pause_reader_if_needed_limit(py, &reader, buffer.as_ptr(), cache.stream_reader_limit)?;
     }
 
