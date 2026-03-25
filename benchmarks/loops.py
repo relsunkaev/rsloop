@@ -4060,9 +4060,11 @@ def run_once_isolated(
         env = os.environ.copy()
         if loop_name == "rsloop" and profile_runtime:
             env["RSLOOP_PROFILE_SCHED_JSON"] = "1"
+            env["RSLOOP_PROFILE_ONEARG_JSON"] = "1"
         if loop_name == "rsloop" and profile_stream:
             env["RSLOOP_PROFILE_SCHED_JSON"] = "1"
             env["RSLOOP_PROFILE_STREAM_JSON"] = "1"
+            env["RSLOOP_PROFILE_ONEARG_JSON"] = "1"
         if profile_python_streams:
             env["BENCH_PROFILE_PY_STREAM_JSON"] = "1"
         if profile_python_cpu:
