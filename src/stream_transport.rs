@@ -2845,6 +2845,121 @@ fn clear_waiter(reader: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<()> {
     reader.setattr("_waiter", py.None())
 }
 
+fn pause_reader_if_needed(
+    py: Python<'_>,
+    reader: &Bound<'_, PyAny>,
+    bytearray: *mut ffi::PyObject,
+) -> PyResult<()> {
+    let reader_transport = reader.getattr("_transport")?;
+    if reader_transport.is_none() || reader.getattr("_paused")?.is_truthy()? {
+        return Ok(());
+    }
+
+    let limit: usize = reader.getattr("_limit")?.extract()?;
+    let buffered = bytearray_len(bytearray)?;
+    if buffered <= 2 * limit {
+        return Ok(());
+    }
+
+    match reader_transport.call_method0("pause_reading") {
+        Ok(_) => {
+            reader.setattr("_paused", true)?;
+            Ok(())
+        }
+        Err(err) if err.is_instance_of::<PyNotImplementedError>(py) => {
+            reader.setattr("_transport", py.None())?;
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn append_reader_payload(
+    _py: Python<'_>,
+    bytearray: *mut ffi::PyObject,
+    data: &Bound<'_, PyAny>,
+) -> PyResult<usize> {
+    if let Ok(bytes) = data.cast::<PyBytes>() {
+        let payload = bytes.as_bytes();
+        append_to_bytearray(bytearray, payload)?;
+        return Ok(payload.len());
+    }
+    if let Ok(bytearray_data) = data.cast::<PyByteArray>() {
+        let payload = unsafe {
+            let len = ffi::PyByteArray_Size(bytearray_data.as_ptr());
+            if len < 0 {
+                return Err(PyErr::fetch(Python::assume_attached()));
+            }
+            let src = ffi::PyByteArray_AsString(bytearray_data.as_ptr()) as *const u8;
+            if src.is_null() {
+                return Err(PyErr::fetch(Python::assume_attached()));
+            }
+            std::slice::from_raw_parts(src, len as usize)
+        };
+        append_to_bytearray(bytearray, payload)?;
+        return Ok(payload.len());
+    }
+
+    let mut total = 0usize;
+    for item in data.try_iter()? {
+        let item = item?;
+        if let Ok(bytes) = item.cast::<PyBytes>() {
+            let payload = bytes.as_bytes();
+            append_to_bytearray(bytearray, payload)?;
+            total += payload.len();
+            continue;
+        }
+        if let Ok(bytearray_data) = item.cast::<PyByteArray>() {
+            let payload = unsafe {
+                let len = ffi::PyByteArray_Size(bytearray_data.as_ptr());
+                if len < 0 {
+                    return Err(PyErr::fetch(Python::assume_attached()));
+                }
+                let src = ffi::PyByteArray_AsString(bytearray_data.as_ptr()) as *const u8;
+                if src.is_null() {
+                    return Err(PyErr::fetch(Python::assume_attached()));
+                }
+                std::slice::from_raw_parts(src, len as usize)
+            };
+            append_to_bytearray(bytearray, payload)?;
+            total += payload.len();
+            continue;
+        }
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "stream reader payload must be bytes-like or an iterable of bytes-like chunks",
+        ));
+    }
+    Ok(total)
+}
+
+#[pyfunction]
+pub(crate) fn feed_stream_reader_data(
+    py: Python<'_>,
+    reader: Py<PyAny>,
+    data: Py<PyAny>,
+) -> PyResult<()> {
+    let reader = reader.bind(py);
+    if reader.getattr("_eof")?.is_truthy()? {
+        return Err(pyo3::exceptions::PyAssertionError::new_err("feed_data after feed_eof"));
+    }
+
+    let buffer = reader.getattr("_buffer")?.cast_into::<PyByteArray>()?;
+    let appended = append_reader_payload(py, buffer.as_ptr(), &data.bind(py))?;
+    if appended == 0 {
+        return Ok(());
+    }
+
+    wake_waiter(py, &reader)?;
+    pause_reader_if_needed(py, &reader, buffer.as_ptr())
+}
+
+#[pyfunction]
+pub(crate) fn feed_stream_reader_eof(py: Python<'_>, reader: Py<PyAny>) -> PyResult<()> {
+    let reader = reader.bind(py);
+    reader.setattr("_eof", true)?;
+    wake_waiter(py, &reader)
+}
+
 fn copy_context_obj(py: Python<'_>) -> PyResult<Py<PyAny>> {
     static COPY_CONTEXT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
     let copy_context = COPY_CONTEXT.get_or_try_init(py, || -> PyResult<_> {

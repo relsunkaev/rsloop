@@ -4,6 +4,11 @@ from asyncio import sslproto as _sslproto
 from asyncio import streams as _streams
 from typing import Any
 
+from . import _rsloop
+
+_FEED_STREAM_READER_DATA = _rsloop.feed_stream_reader_data
+_FEED_STREAM_READER_EOF = _rsloop.feed_stream_reader_eof
+
 
 class RsloopSSLProtocol(_sslproto.SSLProtocol):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -55,8 +60,9 @@ class RsloopSSLProtocol(_sslproto.SSLProtocol):
             self._fatal_error(ex, "Fatal error on SSL protocol")
 
     def _do_read__copied(self) -> None:
+        reader = self._rsloop_stream_reader
         feed_data = self._rsloop_reader_feed_data
-        if feed_data is None:
+        if reader is None or feed_data is None:
             super()._do_read__copied()
             return
 
@@ -86,7 +92,10 @@ class RsloopSSLProtocol(_sslproto.SSLProtocol):
         if one:
             feed_data(first)
         elif not zero:
-            feed_data(b"".join(data))
+            if len(data) <= 2:
+                feed_data(b"".join(data))
+            else:
+                _FEED_STREAM_READER_DATA(reader, data)
         if not chunk:
             self._call_eof_received()
             self._start_shutdown()
@@ -94,7 +103,8 @@ class RsloopSSLProtocol(_sslproto.SSLProtocol):
     def _call_eof_received(self) -> None:
         feed_eof = self._rsloop_reader_feed_eof
         if (
-            feed_eof is not None
+            self._rsloop_stream_reader is not None
+            and feed_eof is not None
             and self._app_state == _sslproto.AppProtocolState.STATE_CON_MADE
         ):
             self._app_state = _sslproto.AppProtocolState.STATE_EOF

@@ -74,6 +74,10 @@ fn _rsloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(unix)]
     m.add_class::<StreamTransport>()?;
     #[cfg(unix)]
+    m.add_function(wrap_pyfunction!(stream_transport::feed_stream_reader_data, m)?)?;
+    #[cfg(unix)]
+    m.add_function(wrap_pyfunction!(stream_transport::feed_stream_reader_eof, m)?)?;
+    #[cfg(unix)]
     m.add_class::<TokioPoller>()?;
     #[cfg(unix)]
     m.add_class::<Scheduler>()?;
