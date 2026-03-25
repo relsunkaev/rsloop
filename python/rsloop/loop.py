@@ -38,15 +38,6 @@ _ORIGINAL_STREAMREADER_READEXACTLY = _streams.StreamReader.readexactly
 _ORIGINAL_STREAMREADER_READUNTIL = _streams.StreamReader.readuntil
 _TIMER_QUANTUM = 0.001 if sys.platform == "darwin" else 0.0
 _TIMER_IMMEDIATE_CUTOFF = _TIMER_QUANTUM * 0.75
-_RSLOOP_MODES = {"fast", "compat"}
-
-
-def _resolve_mode(mode: str | None = None) -> str:
-    selected = mode if mode is not None else os.environ.get("RSLOOP_MODE", "fast")
-    if selected not in _RSLOOP_MODES:
-        expected = ", ".join(sorted(_RSLOOP_MODES))
-        raise ValueError(f"invalid rsloop mode {selected!r}; expected one of: {expected}")
-    return selected
 
 
 def _signal_noop(_sig: int, _frame: Any = None) -> None:
@@ -470,10 +461,8 @@ class _SocketState:
 class RsloopEventLoop(_base_events.BaseEventLoop):
     """Tokio-backed asyncio loop with a native scheduling core."""
 
-    def __init__(self, *, mode: str | None = None) -> None:
-        self._rsloop_mode = _resolve_mode(mode)
-        if self._rsloop_mode == "fast":
-            _patch_stream_writer()
+    def __init__(self) -> None:
+        _patch_stream_writer()
         super().__init__()
         self._poller = _rsloop.TokioPoller()
         self._scheduler = _rsloop.Scheduler()
@@ -1304,8 +1293,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         self._take_fd_for_transport(sock)
         stream_transport_type = getattr(_rsloop, "StreamTransport", None)
         if (
-            self._rsloop_mode == "fast"
-            and stream_transport_type is not None
+            stream_transport_type is not None
             and isinstance(protocol, _streams.StreamReaderProtocol)
         ):
             extra = {} if extra is None else dict(extra)
@@ -1457,7 +1445,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
             ssl_shutdown_timeout=ssl_shutdown_timeout,
         )
         stream_transport_type = getattr(_rsloop, "StreamTransport", None)
-        if self._rsloop_mode == "fast" and stream_transport_type is not None:
+        if stream_transport_type is not None:
             extra = {} if extra is None else dict(extra)
             low_level_transport = stream_transport_type(
                 rawsock,
@@ -1778,21 +1766,17 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
 class RsloopEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
     """Event-loop policy that creates Rsloop event loops."""
 
-    def __init__(self, *, mode: str | None = None) -> None:
-        super().__init__()
-        self._rsloop_mode = _resolve_mode(mode)
-
     def new_event_loop(self) -> RsloopEventLoop:
-        return RsloopEventLoop(mode=self._rsloop_mode)
+        return RsloopEventLoop()
 
 
-def new_event_loop(*, mode: str | None = None) -> RsloopEventLoop:
-    return RsloopEventLoop(mode=mode)
+def new_event_loop() -> RsloopEventLoop:
+    return RsloopEventLoop()
 
 
-def install(*, mode: str | None = None) -> RsloopEventLoopPolicy:
+def install() -> RsloopEventLoopPolicy:
     """Install Rsloop as the active asyncio policy."""
 
-    policy = RsloopEventLoopPolicy(mode=mode)
+    policy = RsloopEventLoopPolicy()
     asyncio.set_event_loop_policy(policy)
     return policy

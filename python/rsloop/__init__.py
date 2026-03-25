@@ -22,10 +22,9 @@ def run(
     awaitable: Awaitable[Any],
     *,
     debug: bool | None = None,
-    mode: str | None = None,
 ) -> Any:
     with asyncio.Runner(
-        loop_factory=lambda: new_event_loop(mode=mode),
+        loop_factory=new_event_loop,
         debug=debug,
     ) as runner:
         return runner.run(awaitable)

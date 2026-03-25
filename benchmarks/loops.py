@@ -636,11 +636,11 @@ def parse_runtime_profile(stderr: str) -> dict[str, Any] | None:
     return profile
 
 
-def get_loop_factory(loop_name: str, rsloop_mode: str) -> LoopFactory:
+def get_loop_factory(loop_name: str) -> LoopFactory:
     if loop_name == "asyncio":
         return None
     if loop_name == "rsloop":
-        return lambda: rsloop.new_event_loop(mode=rsloop_mode)
+        return rsloop.new_event_loop
     if loop_name == "uvloop":
         if uvloop is None:
             raise RuntimeError("uvloop is not installed in this environment")
@@ -648,8 +648,8 @@ def get_loop_factory(loop_name: str, rsloop_mode: str) -> LoopFactory:
     raise ValueError(f"unknown loop {loop_name}")
 
 
-def run_on_loop(loop_name: str, coro: Awaitable[None], rsloop_mode: str) -> None:
-    loop_factory = get_loop_factory(loop_name, rsloop_mode)
+def run_on_loop(loop_name: str, coro: Awaitable[None]) -> None:
+    loop_factory = get_loop_factory(loop_name)
     with asyncio.Runner(loop_factory=loop_factory, debug=False) as runner:
         runner.run(coro)
 
@@ -4119,7 +4119,6 @@ def run_once(
     loop_name: str,
     spec: BenchmarkSpec,
     iterations: int,
-    rsloop_mode: str,
     profile_runtime: bool,
     profile_stream: bool,
     profile_python_streams: bool,
@@ -4136,7 +4135,7 @@ def run_once(
             PYTHON_CPU_PROFILER.start()
         started = time.perf_counter()
         try:
-            run_on_loop(loop_name, spec.func(iterations), rsloop_mode)
+            run_on_loop(loop_name, spec.func(iterations))
         except BenchmarkSkipped:
             raise
         finally:
@@ -4147,7 +4146,6 @@ def run_once(
         loop_name,
         spec,
         iterations,
-        rsloop_mode,
         profile_runtime,
         profile_stream,
         profile_python_streams,
@@ -4162,7 +4160,6 @@ def run_once_isolated(
     loop_name: str,
     spec: BenchmarkSpec,
     iterations: int,
-    rsloop_mode: str,
     profile_runtime: bool,
     profile_stream: bool,
     profile_python_streams: bool,
@@ -4185,8 +4182,6 @@ def run_once_isolated(
             spec.name,
             "--iterations",
             str(iterations),
-            "--rsloop-mode",
-            rsloop_mode,
             "--repeats",
             "1",
             "--warmups",
@@ -4196,8 +4191,6 @@ def run_once_isolated(
             "--json",
         ]
         env = os.environ.copy()
-        if loop_name == "rsloop":
-            env["RSLOOP_MODE"] = rsloop_mode
         if loop_name == "rsloop" and profile_runtime:
             env["RSLOOP_PROFILE_SCHED_JSON"] = "1"
             env["RSLOOP_PROFILE_ONEARG_JSON"] = "1"
@@ -4256,7 +4249,6 @@ def run_benchmark_group(
     loops: list[str],
     spec: BenchmarkSpec,
     iterations: int,
-    rsloop_mode: str,
     repeats: int,
     warmups: int,
     isolate_process: bool,
@@ -4282,7 +4274,6 @@ def run_benchmark_group(
                         loop_name,
                         spec,
                         iterations,
-                        rsloop_mode,
                         profile_runtime,
                         profile_stream,
                         profile_python_streams,
@@ -4309,7 +4300,6 @@ def run_benchmark_group(
                         loop_name,
                         spec,
                         iterations,
-                        rsloop_mode,
                         profile_runtime,
                         profile_stream,
                         profile_python_streams,
@@ -4347,7 +4337,6 @@ def run_benchmark_group(
                         loop_name,
                         spec,
                         iterations,
-                        rsloop_mode,
                         profile_runtime,
                         profile_stream,
                         profile_python_streams,
@@ -4365,7 +4354,6 @@ def run_benchmark_group(
                         loop_name,
                         spec,
                         iterations,
-                        rsloop_mode,
                         profile_runtime,
                         profile_stream,
                         profile_python_streams,
@@ -4575,7 +4563,6 @@ def write_output(payload: dict[str, Any], output: str | None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--loop", choices=["asyncio", "rsloop", "uvloop", "all"], default="all")
-    parser.add_argument("--rsloop-mode", choices=["fast", "compat"], default=None)
     parser.add_argument("--benchmark", choices=[*BENCHMARKS.keys(), "all"], default="all")
     parser.add_argument("--profile", choices=sorted(PROFILE_BENCHMARKS), default="default")
     parser.add_argument("--iterations", type=int, default=None)
@@ -4655,7 +4642,6 @@ def main() -> None:
         return
 
     loops = ["asyncio", "uvloop", "rsloop"] if args.loop == "all" else [args.loop]
-    rsloop_mode = args.rsloop_mode or os.environ.get("RSLOOP_MODE", "fast")
     specs = selected_benchmarks(args)
 
     results: list[BenchResult] = []
@@ -4685,7 +4671,6 @@ def main() -> None:
             selected_loops,
             spec,
             iterations,
-            rsloop_mode,
             args.repeats,
             args.warmups,
             isolate_process,
@@ -4717,7 +4702,6 @@ def main() -> None:
             "child_retries": max(0, args.child_retries),
             "repeats": args.repeats,
             "warmups": args.warmups,
-            "rsloop_mode": rsloop_mode,
             "profile_runtime": args.profile_runtime,
             "profile_stream": args.profile_stream,
             "profile_python_streams": profile_python_streams,

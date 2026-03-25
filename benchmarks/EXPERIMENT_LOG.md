@@ -128,29 +128,29 @@ performance pass, including changes that were reverted.
   - the TLS keepalive regression is not explained by the stream-buffer profile
     alone; see Open Direction
 
-### 23. Fast/compat mode boundary and real-workload perf gates
+### 23. Single-mode runtime boundary and real-workload perf gates
 
 - Area: [`python/rsloop/loop.py`](../python/rsloop/loop.py),
   [`python/rsloop/__init__.py`](../python/rsloop/__init__.py),
   [`benchmarks/loops.py`](../benchmarks/loops.py),
   [`benchmarks/revision_ab.py`](../benchmarks/revision_ab.py)
 - Change:
-  - add public `fast` / `compat` mode selection through
-    `rsloop.install()`, `rsloop.new_event_loop()`, and `RSLOOP_MODE`
-  - route the native stream and TLS transport fast paths only when
-    `mode="fast"`
-  - add benchmark-side `--rsloop-mode` support plus a `real` profile with the
-    app-shaped gate scenarios used for later subsystem rewrites
+  - add a `real` profile with the app-shaped gate scenarios used for later
+    subsystem rewrites
+  - simplify the public runtime surface back down to one default/native path
+    while keeping the new A/B measurement gates
 - Result:
-  - the mode boundary itself is not a meaningful speedup; it is kept because
-    it did not show a stable regression on the default `fast` path
+  - the boundary scaffolding itself is not a meaningful speedup; it is kept
+    only where it improved measurement discipline without changing steady-state
+    behavior
   - interleaved A/B paired medians vs clean `HEAD`:
     - `http1_keepalive_small` `0.940x`
     - `asgi_json_echo` `0.931x`
     - `tls_http1_keepalive` `0.987x` after a stricter 7-repeat confirmation
   - the stricter TLS run had a worse raw median (`+6.56%`) but still a better
     paired median, so it was treated as noise rather than a real regression
-- Decision: kept as the control boundary for future rewrites
+- Decision: kept only as benchmark/profile infrastructure; dropped the public
+  mode split so the native path stays the only mode
 
 ## Reverted Experiments
 

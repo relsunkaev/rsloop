@@ -37,7 +37,6 @@ def benchmark_once(
     *,
     benchmark: str,
     iterations: int,
-    rsloop_mode: str,
     profile_runtime: bool,
     profile_stream: bool,
     profile_python_streams: bool,
@@ -77,9 +76,7 @@ def benchmark_once(
         cmd.append("--profile-python-cpu")
     if profile_app_phases:
         cmd.append("--profile-app-phases")
-    env = os.environ.copy()
-    env["RSLOOP_MODE"] = rsloop_mode
-    payload = json.loads(run(cmd, cwd=worktree, env=env).stdout)
+    payload = json.loads(run(cmd, cwd=worktree).stdout)
     result = payload["results"][0]
     return {
         "sample": result["samples"][0],
@@ -127,7 +124,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark", choices=[*harness.BENCHMARKS.keys(), "all"], default="all")
     parser.add_argument("--profile", choices=sorted(harness.PROFILE_BENCHMARKS), default="default")
-    parser.add_argument("--rsloop-mode", choices=["fast", "compat"], default=None)
     parser.add_argument("--iterations", type=int, default=None)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
@@ -176,7 +172,6 @@ def main() -> None:
                         worktree,
                         benchmark=spec.name,
                         iterations=iterations,
-                        rsloop_mode=args.rsloop_mode or os.environ.get("RSLOOP_MODE", "fast"),
                         profile_runtime=args.profile_runtime,
                         profile_stream=args.profile_stream,
                         profile_python_streams=args.profile_python_streams,
@@ -203,7 +198,6 @@ def main() -> None:
                         worktree,
                         benchmark=spec.name,
                         iterations=iterations,
-                        rsloop_mode=args.rsloop_mode or os.environ.get("RSLOOP_MODE", "fast"),
                         profile_runtime=args.profile_runtime,
                         profile_stream=args.profile_stream,
                         profile_python_streams=args.profile_python_streams,
@@ -252,7 +246,6 @@ def main() -> None:
                 "warmups": args.warmups,
                 "child_retries": max(0, args.child_retries),
                 "interleaved_revisions": True,
-                "rsloop_mode": args.rsloop_mode or os.environ.get("RSLOOP_MODE", "fast"),
                 "profile_runtime": args.profile_runtime,
                 "profile_stream": args.profile_stream,
                 "profile_python_streams": args.profile_python_streams,

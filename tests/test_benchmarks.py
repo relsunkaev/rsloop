@@ -13,11 +13,11 @@ import native_sample  # noqa: E402
 
 
 class BenchmarkProfileParsingTests(unittest.TestCase):
-    def test_get_loop_factory_uses_requested_rsloop_mode(self) -> None:
+    def test_get_loop_factory_uses_rsloop_factory(self) -> None:
         with mock.patch.object(loops.rsloop, "new_event_loop", return_value=object()) as new_loop:
-            factory = loops.get_loop_factory("rsloop", "compat")
+            factory = loops.get_loop_factory("rsloop")
             factory()
-        new_loop.assert_called_once_with(mode="compat")
+        new_loop.assert_called_once_with()
 
     def test_parse_runtime_profile_preserves_all_run_channels(self) -> None:
         stderr = "\n".join(
@@ -75,7 +75,6 @@ class BenchmarkProfileParsingTests(unittest.TestCase):
                 "rsloop",
                 spec,
                 iterations=1,
-                rsloop_mode="fast",
                 profile_runtime=True,
                 profile_stream=False,
                 profile_python_streams=False,
@@ -87,11 +86,9 @@ class BenchmarkProfileParsingTests(unittest.TestCase):
 
         env = run.call_args.kwargs["env"]
         cmd = run.call_args.args[0]
-        self.assertIn("--rsloop-mode", cmd)
-        self.assertIn("fast", cmd)
+        self.assertNotIn("--rsloop-mode", cmd)
         self.assertEqual(env["RSLOOP_PROFILE_SCHED_JSON"], "1")
         self.assertEqual(env["RSLOOP_PROFILE_ONEARG_JSON"], "1")
-        self.assertEqual(env["RSLOOP_MODE"], "fast")
 
     def test_profile_sslproto_enables_sslproto_channel_for_children(self) -> None:
         spec = loops.BENCHMARKS["tls_http1_keepalive"]
@@ -121,7 +118,6 @@ class BenchmarkProfileParsingTests(unittest.TestCase):
                 "rsloop",
                 spec,
                 iterations=1,
-                rsloop_mode="compat",
                 profile_runtime=False,
                 profile_stream=False,
                 profile_python_streams=False,
@@ -133,10 +129,8 @@ class BenchmarkProfileParsingTests(unittest.TestCase):
 
         env = run.call_args.kwargs["env"]
         cmd = run.call_args.args[0]
-        self.assertIn("--rsloop-mode", cmd)
-        self.assertIn("compat", cmd)
+        self.assertNotIn("--rsloop-mode", cmd)
         self.assertEqual(env["BENCH_PROFILE_SSLPROTO_JSON"], "1")
-        self.assertEqual(env["RSLOOP_MODE"], "compat")
 
     def test_native_sample_parses_call_graph_frames(self) -> None:
         path = ROOT / "benchmarks" / "out" / "sample-parser-fixture.txt"

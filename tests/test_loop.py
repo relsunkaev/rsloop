@@ -52,36 +52,21 @@ class RsloopLoopTests(unittest.TestCase):
     def run_async(self, coro) -> None:
         return rsloop.run(coro)
 
-    def test_new_event_loop_uses_requested_mode(self) -> None:
-        loop = rsloop.new_event_loop(mode="compat")
+    def test_new_event_loop_returns_rsloop_loop(self) -> None:
+        loop = rsloop.new_event_loop()
         try:
-            self.assertEqual(loop._rsloop_mode, "compat")
+            self.assertIsInstance(loop, rsloop.RsloopEventLoop)
         finally:
             loop.close()
 
-    def test_new_event_loop_uses_env_default_mode(self) -> None:
-        previous = os.environ.get("RSLOOP_MODE")
-        os.environ["RSLOOP_MODE"] = "compat"
-        try:
-            loop = rsloop.new_event_loop()
-            try:
-                self.assertEqual(loop._rsloop_mode, "compat")
-            finally:
-                loop.close()
-        finally:
-            if previous is None:
-                os.environ.pop("RSLOOP_MODE", None)
-            else:
-                os.environ["RSLOOP_MODE"] = previous
-
-    def test_install_uses_requested_mode(self) -> None:
+    def test_install_sets_rsloop_policy(self) -> None:
         previous_policy = asyncio.get_event_loop_policy()
         try:
-            policy = rsloop.install(mode="compat")
-            self.assertEqual(policy._rsloop_mode, "compat")
+            policy = rsloop.install()
+            self.assertIsInstance(policy, rsloop.RsloopEventLoopPolicy)
             loop = policy.new_event_loop()
             try:
-                self.assertEqual(loop._rsloop_mode, "compat")
+                self.assertIsInstance(loop, rsloop.RsloopEventLoop)
             finally:
                 loop.close()
         finally:
