@@ -665,6 +665,59 @@ performance pass, including changes that were reverted.
 
 ## Open Direction
 
+### 34. Native datagram transport replacement
+
+- Area: [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+- Change:
+  - replace stdlib `_SelectorDatagramTransport` with an rsloop-owned datagram
+    transport using rsloop `_add_reader()` / `_add_writer()` directly
+  - activate `connection_made()`, reader registration, and the setup waiter
+    immediately instead of deferring them with `call_soon()`
+- Rationale:
+  - `udp_datagram_endpoint` was still stdlib-backed and behind `uvloop`
+  - the first low-risk cut was to own the transport without changing raw UDP
+    socket helpers or scheduler internals
+- Functional result:
+  - focused datagram and policy tests passed
+- Interleaved A/B versus clean `HEAD`:
+  - `udp_datagram_endpoint` `0.220391s -> 0.218247s` (`-0.97%`)
+- Conclusion:
+  - the transport swap was effectively neutral; the remaining UDP gap is not
+    in the thin Python transport wrapper
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/revision-ab-udp-datagram-native.json`](out/revision-ab-udp-datagram-native.json)
+
+### 35. Native write-pipe transport with writev batching
+
+- Area: [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+- Change:
+  - replace stdlib `_UnixWritePipeTransport` with an rsloop-owned write-pipe
+    transport
+  - keep connection lifecycle inline and replace stdlib's growing `bytearray`
+    buffer with queued chunks plus `os.writev()` when draining
+  - test a second variant that coalesced small writes into the queue before
+    attempting an immediate `os.write()`
+- Rationale:
+  - `pipe_write` remained one of the worst full-profile laggards
+  - write-side copy and flush behavior looked like the most promising lever
+- Functional result:
+  - focused subprocess/pipe tests passed for both variants
+- Interleaved A/B versus clean `HEAD`:
+  - writev queue variant:
+    `pipe_write` `0.011642s -> 0.011454s` (`-1.62%`)
+  - small-write coalescing variant:
+    `pipe_write` `0.014417s -> 0.014891s` (`+3.29%`)
+- Conclusion:
+  - the writev queue variant helped slightly but did not clear the keep bar
+  - small-write coalescing actively regressed the benchmark
+  - the real `pipe_write` gap is not going to close with a Python-only
+    transport swap
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/revision-ab-pipe-write-native.json`](out/revision-ab-pipe-write-native.json)
+  - [`benchmarks/out/revision-ab-pipe-write-native-v2.json`](out/revision-ab-pipe-write-native-v2.json)
+
 The main conclusion so far is that callback-level micro-optimizations are not
 reliably translating into user-visible wins unless they remove a real callback
 hop or a repeated protocol lookup. The remaining credible directions are:
