@@ -718,6 +718,55 @@ performance pass, including changes that were reverted.
   - [`benchmarks/out/revision-ab-pipe-write-native.json`](out/revision-ab-pipe-write-native.json)
   - [`benchmarks/out/revision-ab-pipe-write-native-v2.json`](out/revision-ab-pipe-write-native-v2.json)
 
+### 36. Native generic socket transport fallback
+
+- Area:
+  [`python/rsloop/loop.py`](../python/rsloop/loop.py),
+  [`src/stream_transport.rs`](../src/stream_transport.rs),
+  [`src/stream_registry.rs`](../src/stream_registry.rs),
+  [`tests/test_loop.py`](../tests/test_loop.py),
+  [`benchmarks/loops.py`](../benchmarks/loops.py)
+- Change:
+  - route all socket protocols through native `StreamTransport`, not just
+    `StreamReaderProtocol`
+  - keep stream-specific reader/writer rebinding only for
+    `StreamReaderProtocol`
+  - fix reentrant generic protocol control paths so `transport.close()` and
+    `pause_reading()` can be called safely from protocol callbacks
+  - add explicit tests for plain `Protocol` and `BufferedProtocol`
+  - add a focused `tcp_protocol_echo` benchmark
+- Rationale:
+  - stdlib `_SelectorSocketTransport` was still the generic fallback
+  - the Rust transport already had `reader is None` and buffered-protocol
+    paths, so the smallest architectural step was to use that core for
+    generic protocols too
+- Functional result:
+  - focused protocol tests passed after fixing reentrant close/registry borrows
+  - targeted unittest slice passed with benchmark parser coverage
+- Same-codebase interleaved A/B against forced selector fallback on
+  `tcp_protocol_echo`:
+  - first run: `0.188133s -> 0.149791s` (`-20.38%`)
+  - strict confirmation: `0.180764s -> 0.153646s` (`-15.00%`), 6/7 wins
+- Cross-loop result on the kept version:
+  - `tcp_protocol_echo`: `0.973x` raw median and `0.983x` paired vs `uvloop`
+- Guard checks on existing app-shaped cases:
+  - `http1_keepalive_small`: `1.088x` vs `uvloop`
+  - `asgi_json_echo`: `1.031x`
+  - `tls_http1_keepalive`: `1.643x`
+  - these stayed in the expected range for the existing codebase; no new
+    regression signal from this slice
+- Runtime trace note:
+  - after routing the benchmark through native transport dispatch, scheduler
+    `generic_fd_hits` dropped from `16386` to `1` and `stream_fd_hits` rose to
+    `16385`
+- Decision: kept
+- Artifacts:
+  - [`benchmarks/out/ab-tcp-protocol-echo-selector-vs-native.json`](out/ab-tcp-protocol-echo-selector-vs-native.json)
+  - [`benchmarks/out/ab-tcp-protocol-echo-selector-vs-native-strict.json`](out/ab-tcp-protocol-echo-selector-vs-native-strict.json)
+  - [`benchmarks/out/tcp-protocol-echo-all-final.json`](out/tcp-protocol-echo-all-final.json)
+  - [`benchmarks/out/tcp-protocol-echo-selector-runtime.json`](out/tcp-protocol-echo-selector-runtime.json)
+  - [`benchmarks/out/tcp-protocol-echo-native-runtime.json`](out/tcp-protocol-echo-native-runtime.json)
+
 The main conclusion so far is that callback-level micro-optimizations are not
 reliably translating into user-visible wins unless they remove a real callback
 hop or a repeated protocol lookup. The remaining credible directions are:
