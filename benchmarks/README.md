@@ -43,6 +43,18 @@ Run the full suite and save structured output:
   --output benchmarks/out/full.json
 ```
 
+Run the real-workload gate profile that future subsystem rewrites must clear:
+
+```bash
+.venv/bin/python benchmarks/loops.py \
+  --loop all \
+  --profile real \
+  --repeats 5 \
+  --warmups 1 \
+  --rsloop-mode fast \
+  --output benchmarks/out/real.json
+```
+
 Run a stricter, paired comparison with explicit retry policy:
 
 ```bash
@@ -114,6 +126,7 @@ Run an interleaved current-vs-`HEAD` revision comparison for rsloop itself:
   --benchmark asgi_json_echo \
   --repeats 3 \
   --warmups 1 \
+  --rsloop-mode fast \
   --profile-runtime \
   --profile-sslproto \
   --output benchmarks/out/asgi-json-revision-ab.json
@@ -123,6 +136,7 @@ Run an interleaved current-vs-`HEAD` revision comparison for rsloop itself:
 
 - `smoke`: fast sanity checks
 - `default`: balanced comparison set for routine iteration
+- `real`: app-shaped and subsystem-gate scenarios used to decide whether a change is worth keeping
 - `full`: all runnable scenarios, including heavier mixed-payload stream cases
 - The expanded `full` profile also includes control-plane task/future/timer storms, AF_UNIX raw-socket cases, datagram endpoint and `sock_sendto` / `sock_recvfrom` coverage, pipe and subprocess churn, signal handler churn, HTTP/1.1 request/response cases, TLS handshakes, `sock_sendfile()` transfers, websocket workloads, and application-shaped request/response cases.
 - `start_tls_upgrade` exercises plaintext-to-TLS upgrades via `StreamWriter.start_tls()`.
@@ -138,6 +152,7 @@ Run an interleaved current-vs-`HEAD` revision comparison for rsloop itself:
 - `--profile-python-cpu` captures a pyinstrument CPU sample for isolated child runs.
 - `--profile-app-phases` captures benchmark-level HTTP/ASGI/TLS phase markers for isolated child runs.
 - `--iterations` overrides the default iteration count for the selected scenarios.
+- `--rsloop-mode fast|compat` selects which rsloop mode to benchmark. The default is `fast`, and `RSLOOP_MODE` can override it.
 - `--no-interleave-loops` disables round-robin pairing if you need the old run shape.
 - `--child-retries` retries transient child failures before aborting the suite.
 - Runtime profile capture requires subprocess isolation; leave `--no-isolate-process` off when using it.

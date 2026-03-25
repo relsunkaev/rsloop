@@ -128,6 +128,30 @@ performance pass, including changes that were reverted.
   - the TLS keepalive regression is not explained by the stream-buffer profile
     alone; see Open Direction
 
+### 23. Fast/compat mode boundary and real-workload perf gates
+
+- Area: [`python/rsloop/loop.py`](../python/rsloop/loop.py),
+  [`python/rsloop/__init__.py`](../python/rsloop/__init__.py),
+  [`benchmarks/loops.py`](../benchmarks/loops.py),
+  [`benchmarks/revision_ab.py`](../benchmarks/revision_ab.py)
+- Change:
+  - add public `fast` / `compat` mode selection through
+    `rsloop.install()`, `rsloop.new_event_loop()`, and `RSLOOP_MODE`
+  - route the native stream and TLS transport fast paths only when
+    `mode="fast"`
+  - add benchmark-side `--rsloop-mode` support plus a `real` profile with the
+    app-shaped gate scenarios used for later subsystem rewrites
+- Result:
+  - the mode boundary itself is not a meaningful speedup; it is kept because
+    it did not show a stable regression on the default `fast` path
+  - interleaved A/B paired medians vs clean `HEAD`:
+    - `http1_keepalive_small` `0.940x`
+    - `asgi_json_echo` `0.931x`
+    - `tls_http1_keepalive` `0.987x` after a stricter 7-repeat confirmation
+  - the stricter TLS run had a worse raw median (`+6.56%`) but still a better
+    paired median, so it was treated as noise rather than a real regression
+- Decision: kept as the control boundary for future rewrites
+
 ## Reverted Experiments
 
 ### 4. Immediate small direct writes up to 256 bytes
