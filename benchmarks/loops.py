@@ -1096,6 +1096,10 @@ async def bench_tcp_sock_parallel(count: int) -> None:
     await tcp_sock_echo_parallel(count, clients=32, payload_size=64)
 
 
+async def bench_tcp_protocol_echo(count: int) -> None:
+    await tcp_protocol_echo(count, payload_size=64)
+
+
 async def bench_udp_pingpong(count: int) -> None:
     await udp_pingpong(count, payload_size=64)
 
@@ -1301,6 +1305,73 @@ async def tcp_stream_echo(count: int, payload_size: int) -> None:
                 raise RuntimeError(f"unexpected payload size={len(data)}")
         writer.close()
         await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def tcp_protocol_echo(count: int, payload_size: int) -> None:
+    loop = asyncio.get_running_loop()
+    payload = b"x" * payload_size
+    done = loop.create_future()
+
+    class EchoServer(asyncio.Protocol):
+        transport: asyncio.Transport | None = None
+
+        def connection_made(self, transport: asyncio.BaseTransport) -> None:
+            self.transport = transport  # type: ignore[assignment]
+
+        def data_received(self, data: bytes) -> None:
+            assert self.transport is not None
+            self.transport.write(data)
+
+    class Client(asyncio.Protocol):
+        transport: asyncio.Transport | None = None
+
+        def __init__(self) -> None:
+            self.pending = bytearray()
+            self.completed = 0
+
+        def connection_made(self, transport: asyncio.BaseTransport) -> None:
+            self.transport = transport  # type: ignore[assignment]
+            self.transport.write(payload)
+
+        def data_received(self, data: bytes) -> None:
+            self.pending.extend(data)
+            while len(self.pending) >= payload_size:
+                chunk = bytes(self.pending[:payload_size])
+                del self.pending[:payload_size]
+                if chunk != payload:
+                    if not done.done():
+                        done.set_exception(
+                            RuntimeError(f"unexpected payload size={len(chunk)}")
+                        )
+                    assert self.transport is not None
+                    self.transport.close()
+                    return
+                self.completed += 1
+                if self.completed == count:
+                    if not done.done():
+                        done.set_result(None)
+                    assert self.transport is not None
+                    self.transport.close()
+                    return
+                assert self.transport is not None
+                self.transport.write(payload)
+
+        def connection_lost(self, exc: BaseException | None) -> None:
+            if exc is not None and not done.done():
+                done.set_exception(exc)
+
+    server = await loop.create_server(EchoServer, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    try:
+        transport, _protocol = await loop.create_connection(Client, host, port)
+        try:
+            await done
+        finally:
+            transport.close()
     finally:
         server.close()
         await server.wait_closed()
@@ -3767,6 +3838,14 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         default_iterations=8_192,
         unit="messages",
         func=bench_tcp_sock_parallel,
+    ),
+    "tcp_protocol_echo": BenchmarkSpec(
+        name="tcp_protocol_echo",
+        description="TCP echo through create_connection()/create_server() with Protocol",
+        category="protocol",
+        default_iterations=8_192,
+        unit="roundtrips",
+        func=bench_tcp_protocol_echo,
     ),
     "udp_pingpong": BenchmarkSpec(
         name="udp_pingpong",

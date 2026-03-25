@@ -292,6 +292,110 @@ class RsloopLoopTests(unittest.TestCase):
 
         self.run_async(main())
 
+    def test_native_protocol_transport_roundtrip(self) -> None:
+        async def main() -> None:
+            loop = asyncio.get_running_loop()
+            payload = b"proto-native"
+            done = loop.create_future()
+
+            class EchoServer(asyncio.Protocol):
+                transport: asyncio.Transport | None = None
+
+                def connection_made(self, transport: asyncio.BaseTransport) -> None:
+                    self.transport = transport  # type: ignore[assignment]
+
+                def data_received(self, data: bytes) -> None:
+                    assert self.transport is not None
+                    self.transport.write(data)
+
+            class Client(asyncio.Protocol):
+                transport: asyncio.Transport | None = None
+
+                def __init__(self) -> None:
+                    self.received = bytearray()
+
+                def connection_made(self, transport: asyncio.BaseTransport) -> None:
+                    self.transport = transport  # type: ignore[assignment]
+                    self.transport.write(payload)
+
+                def data_received(self, data: bytes) -> None:
+                    self.received.extend(data)
+                    if bytes(self.received) == payload and not done.done():
+                        done.set_result(None)
+                    assert self.transport is not None
+                    self.transport.close()
+
+                def connection_lost(self, exc: BaseException | None) -> None:
+                    if exc is not None and not done.done():
+                        done.set_exception(exc)
+
+            server = await loop.create_server(EchoServer, "127.0.0.1", 0)
+            host, port = server.sockets[0].getsockname()[:2]
+            try:
+                transport, _protocol = await loop.create_connection(Client, host, port)
+                try:
+                    await asyncio.wait_for(done, 1)
+                finally:
+                    transport.close()
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        self.run_async(main())
+
+    def test_native_buffered_protocol_transport(self) -> None:
+        async def main() -> None:
+            loop = asyncio.get_running_loop()
+            payload = b"buffered-native"
+            done = loop.create_future()
+
+            class Server(asyncio.Protocol):
+                transport: asyncio.Transport | None = None
+
+                def connection_made(self, transport: asyncio.BaseTransport) -> None:
+                    self.transport = transport  # type: ignore[assignment]
+                    self.transport.write(payload)
+                    self.transport.write_eof()
+
+            class Client(asyncio.BufferedProtocol):
+                transport: asyncio.Transport | None = None
+
+                def __init__(self) -> None:
+                    self.received = bytearray()
+                    self.buffer = bytearray(128)
+
+                def connection_made(self, transport: asyncio.BaseTransport) -> None:
+                    self.transport = transport  # type: ignore[assignment]
+
+                def get_buffer(self, sizehint: int) -> memoryview:
+                    return memoryview(self.buffer)
+
+                def buffer_updated(self, nbytes: int) -> None:
+                    self.received.extend(self.buffer[:nbytes])
+
+                def eof_received(self) -> bool:
+                    if bytes(self.received) == payload and not done.done():
+                        done.set_result(None)
+                    return False
+
+                def connection_lost(self, exc: BaseException | None) -> None:
+                    if exc is not None and not done.done():
+                        done.set_exception(exc)
+
+            server = await loop.create_server(Server, "127.0.0.1", 0)
+            host, port = server.sockets[0].getsockname()[:2]
+            try:
+                transport, _protocol = await loop.create_connection(Client, host, port)
+                try:
+                    await asyncio.wait_for(done, 1)
+                finally:
+                    transport.close()
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        self.run_async(main())
+
     def test_native_readuntil_limit_overrun_found(self) -> None:
         async def main() -> None:
             release = asyncio.get_running_loop().create_future()
