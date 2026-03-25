@@ -820,3 +820,37 @@ hop or a repeated protocol lookup. The remaining credible directions are:
   but the latest TLS callback pass moved it from about `0.0607s` to `0.0500s`
   on the 256-request runtime sample; the next credible step is a deeper native
   SSLProtocol-style path or more callback specialization on top of it
+
+### 38. Rsloop-owned TLS protocol replacement
+
+- Area:
+  - [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+  - `python/rsloop/sslproto.py` (reverted)
+- Change:
+  - add an rsloop-owned `RsloopSSLProtocol` subclass of stdlib
+    `asyncio.sslproto.SSLProtocol`
+  - override the app-transport path and copied-read path to special-case exact
+    stdlib `StreamReaderProtocol` instances
+  - wire `_make_ssl_transport()` to use the new protocol, with a temporary
+    `RSLOOP_FORCE_STDLIB_SSLPROTO=1` override for same-codebase A/B
+- Rationale:
+  - this was the narrowest full-protocol replacement step that could attack the
+    wrapped TLS steady-state path directly instead of continuing to optimize
+    around stdlib `SSLProtocol`
+- Functional result:
+  - the first version broke `tls_http1_keepalive` with premature EOF because
+    the copied-read path treated `SSLWantRead` as EOF
+  - after fixing that sentinel bug, focused `start_tls` tests passed
+- Same-codebase interleaved A/B against forced stdlib `SSLProtocol`:
+  - `tls_http1_keepalive`: `0.208705s -> 0.218243s` (`+4.57%`)
+  - `start_tls_upgrade`: `0.064489s -> 0.049020s` (`-23.99%`)
+- Conclusion:
+  - the replacement helped upgrade/handshake behavior but regressed the main
+    wrapped steady-state target
+  - the design still inherits too much stdlib `SSLProtocol` behavior to change
+    the copied-read cost structure in the right direction
+  - if rsloop replaces TLS for performance, it likely needs a truly native
+    protocol/state machine instead of a stdlib subclass
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/ab-rsloop-sslproto-replacement.json`](out/ab-rsloop-sslproto-replacement.json)
