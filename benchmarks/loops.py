@@ -214,11 +214,20 @@ class SslProtoProfiler:
         if self._installed:
             return
         profiler = self
-        ssl_protocol = _sslproto.SSLProtocol
+        protocol_types = [_sslproto.SSLProtocol]
+        try:
+            from rsloop.sslproto import RsloopSSLProtocol
+        except Exception:
+            RsloopSSLProtocol = None
+        if RsloopSSLProtocol is not None:
+            protocol_types.append(RsloopSSLProtocol)
 
-        def wrap_method(name: str) -> None:
+        def wrap_method(ssl_protocol: type[Any], name: str) -> None:
+            if name not in ssl_protocol.__dict__:
+                return
+            key = f"{ssl_protocol.__module__}.{ssl_protocol.__name__}.{name}"
             original = getattr(ssl_protocol, name)
-            profiler._originals[name] = original
+            profiler._originals[key] = original
 
             def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
                 state_obj = getattr(self, "_state", None)
@@ -234,6 +243,7 @@ class SslProtoProfiler:
                 elif name == "_write_appdata" and args:
                     payload_bytes = sum(len(chunk) for chunk in args[0])
                 bucket = profiler._bucket(name, state, mode)
+                bucket["owner"] = ssl_protocol.__name__
                 started = time.perf_counter()
                 try:
                     return original(self, *args, **kwargs)
@@ -249,8 +259,9 @@ class SslProtoProfiler:
 
             setattr(ssl_protocol, name, wrapped)
 
-        for name in self._METHODS:
-            wrap_method(name)
+        for ssl_protocol in protocol_types:
+            for name in self._METHODS:
+                wrap_method(ssl_protocol, name)
         self._installed = True
 
     def emit(self) -> None:

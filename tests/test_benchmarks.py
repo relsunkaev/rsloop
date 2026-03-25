@@ -1,5 +1,6 @@
 import json
 import sys
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -131,6 +132,65 @@ class BenchmarkProfileParsingTests(unittest.TestCase):
         cmd = run.call_args.args[0]
         self.assertNotIn("--rsloop-mode", cmd)
         self.assertEqual(env["BENCH_PROFILE_SSLPROTO_JSON"], "1")
+
+    def test_sslproto_profiler_wraps_only_overrides_on_rsloop_subclass(self) -> None:
+        class FakeState:
+            name = "WRAPPED"
+
+        class FakeBase:
+            def __init__(self) -> None:
+                self._state = FakeState()
+                self._app_protocol_is_buffer = False
+
+            def buffer_updated(self, nbytes: int) -> None:
+                return None
+
+            def _do_read(self) -> None:
+                return None
+
+            def _do_read__copied(self) -> None:
+                return None
+
+            def _do_read__buffered(self) -> None:
+                return None
+
+            def _process_outgoing(self) -> None:
+                return None
+
+            def _write_appdata(self, chunks: tuple[bytes, ...]) -> None:
+                return None
+
+            def _control_ssl_reading(self) -> None:
+                return None
+
+            def _on_handshake_complete(self, exc: BaseException | None) -> None:
+                return None
+
+        class FakeRsloop(FakeBase):
+            def _do_read(self) -> None:
+                return None
+
+            def _process_outgoing(self) -> None:
+                return None
+
+        fake_module = types.ModuleType("rsloop.sslproto")
+        fake_module.RsloopSSLProtocol = FakeRsloop
+        profiler = loops.SslProtoProfiler()
+
+        with mock.patch.object(loops._sslproto, "SSLProtocol", FakeBase):
+            with mock.patch.dict(sys.modules, {"rsloop.sslproto": fake_module}):
+                profiler.install()
+                inst = FakeRsloop()
+                inst.buffer_updated(1)
+                inst._do_read()
+                inst._process_outgoing()
+
+        methods = {bucket["method"]: bucket for bucket in profiler._methods.values()}
+        self.assertEqual(methods["buffer_updated"]["count"], 1)
+        self.assertEqual(methods["_do_read"]["count"], 1)
+        self.assertEqual(methods["_process_outgoing"]["count"], 1)
+        self.assertEqual(methods["_do_read"]["owner"], "FakeRsloop")
+        self.assertEqual(methods["buffer_updated"]["owner"], "FakeBase")
 
     def test_native_sample_parses_call_graph_frames(self) -> None:
         path = ROOT / "benchmarks" / "out" / "sample-parser-fixture.txt"
