@@ -955,3 +955,65 @@ hop or a repeated protocol lookup. The remaining credible directions are:
   - [`benchmarks/out/revision-ab-start-tls-reader-helper-v3.json`](out/revision-ab-start-tls-reader-helper-v3.json)
   - [`benchmarks/out/revision-ab-http1-reader-helper-v3-strict.json`](out/revision-ab-http1-reader-helper-v3-strict.json)
   - [`benchmarks/out/revision-ab-asgi-reader-helper-v3.json`](out/revision-ab-asgi-reader-helper-v3.json)
+
+### 41. Native TLS copied-read hot path
+
+- Area:
+  - [`python/rsloop/sslproto.py`](../python/rsloop/sslproto.py)
+  - [`src/stream_transport.rs`](../src/stream_transport.rs)
+- Change:
+  - move the exact `RsloopSSLProtocol` copied-mode wrapped-read path out of
+    Python and into `StreamTransport`
+  - bypass Python `buffer_updated()` / `_do_read()` / `_do_read__copied()` on
+    the hot path
+  - keep handshake, buffered app protocols, and non-rsloop TLS shapes on the
+    existing fallback path
+  - cache bound TLS helpers once on the protocol object:
+    - incoming `MemoryBIO.write`
+    - `SSLObject.read`
+    - outgoing `MemoryBIO.read`
+    - transport `write`
+    - stream reader buffer and limit
+- Rationale:
+  - the remaining steady-state TLS gap was still dominated by Python wrapped
+    read dispatch after the earlier TLS wins
+  - the goal of this pass was to remove Python control flow from the stream
+    reader copied-read path instead of only making the existing Python code
+    cheaper
+- Tuning notes:
+  - first Rust cut regressed `tls_http1_keepalive` by `+6.61%`
+  - switching from generic helper/list delivery to direct native reader-buffer
+    append reduced that to `-0.39%`
+  - caching the bound TLS methods and reader buffer on the protocol made the
+    pass hold up materially
+- Functional result:
+  - `cargo test -q` passed
+  - `./.venv/bin/python -m unittest tests.test_loop tests.test_benchmarks -q`
+    passed
+- Revision A/B against `HEAD`:
+  - `tls_http1_keepalive`: `0.200402s -> 0.178998s` (`-10.68%`)
+  - `start_tls_upgrade`: `0.062691s -> 0.041565s` (`-33.70%`)
+- Strict guards:
+  - `http1_keepalive_small`: `0.322324s -> 0.321069s` (`-0.39%`)
+  - `asgi_json_echo`: `0.169061s -> 0.168592s` (`-0.28%`)
+- Cross-loop spot checks against `uvloop`:
+  - `tls_http1_keepalive`: `1.458x`
+  - `start_tls_upgrade`: `1.041x`
+  - `http1_keepalive_small`: `1.049x`
+  - `asgi_json_echo`: `1.042x`
+- Conclusion:
+  - moving the copied-read wrapped TLS path into Rust is a real same-codebase
+    win once the Rust side stops rebinding Python methods and appending through
+    generic Python iterables
+  - the main remaining TLS gap vs `uvloop` is now lower in the wrapped path
+    than the Python `SSLProtocol` control loop we started from
+- Decision: kept
+- Artifacts:
+  - [`benchmarks/out/revision-ab-tls-native-hotpath-v3.json`](out/revision-ab-tls-native-hotpath-v3.json)
+  - [`benchmarks/out/revision-ab-start-tls-native-hotpath-v3.json`](out/revision-ab-start-tls-native-hotpath-v3.json)
+  - [`benchmarks/out/revision-ab-http1-native-hotpath-v3-strict.json`](out/revision-ab-http1-native-hotpath-v3-strict.json)
+  - [`benchmarks/out/revision-ab-asgi-native-hotpath-v3.json`](out/revision-ab-asgi-native-hotpath-v3.json)
+  - [`benchmarks/out/tls-http1-keepalive-all-native-hotpath-v3.json`](out/tls-http1-keepalive-all-native-hotpath-v3.json)
+  - [`benchmarks/out/start-tls-upgrade-all-native-hotpath-v3.json`](out/start-tls-upgrade-all-native-hotpath-v3.json)
+  - [`benchmarks/out/http1-keepalive-small-all-native-hotpath-v3.json`](out/http1-keepalive-small-all-native-hotpath-v3.json)
+  - [`benchmarks/out/asgi-json-echo-all-native-hotpath-v3.json`](out/asgi-json-echo-all-native-hotpath-v3.json)
