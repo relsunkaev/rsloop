@@ -20,7 +20,7 @@ use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyStopIteration};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyAny, PyByteArray, PyBytes, PyDict, PyModule};
+use pyo3::types::{PyAny, PyByteArray, PyBytes, PyDict, PyModule, PySlice};
 
 use crate::handles::OneArgHandle;
 use crate::poller::TokioPoller;
@@ -129,6 +129,16 @@ fn buffered_protocol_methods(
     Ok((false, None, None))
 }
 
+fn is_rsloop_ssl_protocol(protocol: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let protocol_type = protocol.get_type();
+    if protocol_type.name()? != "RsloopSSLProtocol" {
+        return Ok(false);
+    }
+    let module_obj = protocol_type.getattr("__module__")?;
+    let module = module_obj.extract::<std::borrow::Cow<'_, str>>()?;
+    Ok(module == "rsloop.sslproto")
+}
+
 fn defer_transport_method(py: Python<'_>, transport: &Bound<'_, StreamTransport>, method: &str) -> PyResult<()> {
     let loop_obj = PyModule::import(py, "asyncio")?
         .getattr("get_running_loop")?
@@ -154,6 +164,7 @@ pub(crate) struct StreamCore {
     sock: Py<PyAny>,
     fd: RawFd,
     protocol: Py<PyAny>,
+    native_ssl_protocol: bool,
     buffered_protocol: bool,
     buffered_get_buffer: Option<Py<PyAny>>,
     buffered_buffer_updated: Option<Py<PyAny>>,
@@ -501,6 +512,7 @@ impl StreamTransport {
             None => PyDict::new(py).into_any().unbind(),
         };
         let protocol_ref = protocol.bind(py);
+        let native_ssl_protocol = is_rsloop_ssl_protocol(&protocol_ref)?;
         let (buffered_protocol, buffered_get_buffer, buffered_buffer_updated) =
             buffered_protocol_methods(&protocol_ref)?;
         let fd = sock.bind(py).call_method0("fileno")?.extract::<i32>()? as RawFd;
@@ -530,6 +542,7 @@ impl StreamTransport {
             sock,
             fd,
             protocol,
+            native_ssl_protocol,
             buffered_protocol,
             buffered_get_buffer,
             buffered_buffer_updated,
@@ -637,6 +650,7 @@ impl StreamTransport {
     fn set_protocol(slf: Py<Self>, py: Python<'_>, protocol: Py<PyAny>) -> PyResult<()> {
         let core = slf.borrow(py).core.clone();
         let protocol_ref = protocol.bind(py);
+        let native_ssl_protocol = is_rsloop_ssl_protocol(&protocol_ref)?;
         let (buffered_protocol, buffered_get_buffer, buffered_buffer_updated) =
             buffered_protocol_methods(&protocol_ref)?;
         if trace_stream_enabled() {
@@ -648,6 +662,7 @@ impl StreamTransport {
         }
         let mut core = core.borrow_mut();
         core.protocol = protocol;
+        core.native_ssl_protocol = native_ssl_protocol;
         core.buffered_protocol = buffered_protocol;
         core.buffered_get_buffer = buffered_get_buffer;
         core.buffered_buffer_updated = buffered_buffer_updated;
@@ -1172,6 +1187,9 @@ impl StreamCore {
             return Ok(());
         }
         if self.buffered_protocol {
+            if self.native_ssl_protocol {
+                return self.on_readable_native_ssl(py);
+            }
             if trace_stream_enabled() {
                 eprintln!("stream-transport ssl-on_readable fd={}", self.fd);
             }
@@ -1231,6 +1249,56 @@ impl StreamCore {
                     }
                     self.feed_read_buffer_inner(py, n)?;
                     if self.read_paused {
+                        return Ok(());
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) => {
+                    return self.finish_close(
+                        py,
+                        Some(
+                            PyRuntimeError::new_err(err.to_string())
+                                .into_value(py)
+                                .into_any(),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    fn on_readable_native_ssl(&mut self, py: Python<'_>) -> PyResult<()> {
+        let protocol = self.protocol.clone_ref(py);
+        let ssl_view = protocol.bind(py).getattr("_ssl_buffer_view")?.unbind();
+        loop {
+            let buffer = PyBuffer::<u8>::get(&ssl_view.bind(py))?;
+            let Some(cells) = buffer.as_mut_slice(py) else {
+                return self.finish_close(
+                    py,
+                    Some(
+                        PyRuntimeError::new_err(
+                            "buffer_updated() requires a writable C-contiguous buffer",
+                        )
+                        .into_value(py)
+                        .into_any(),
+                    ),
+                );
+            };
+            let slice = unsafe { cell_slice_as_bytes_mut(cells) };
+            match recv_into(self.fd, slice) {
+                Ok(0) => {
+                    self.remove_reader(py)?;
+                    protocol.bind(py).call_method0("eof_received")?;
+                    return Ok(());
+                }
+                Ok(n) => {
+                    self.record_profile_event("ssl_native_read", n, self.pending_write_bytes);
+                    if let Err(err) =
+                        rsloop_sslproto_buffer_updated(py, &protocol.bind(py), &ssl_view.bind(py), n)
+                    {
+                        return self.finish_close(py, Some(err.into_value(py).into_any()));
+                    }
+                    if self.read_paused || self.closed {
                         return Ok(());
                     }
                 }
@@ -2850,12 +2918,20 @@ fn pause_reader_if_needed(
     reader: &Bound<'_, PyAny>,
     bytearray: *mut ffi::PyObject,
 ) -> PyResult<()> {
+    let limit: usize = reader.getattr("_limit")?.extract()?;
+    pause_reader_if_needed_limit(py, reader, bytearray, limit)
+}
+
+fn pause_reader_if_needed_limit(
+    py: Python<'_>,
+    reader: &Bound<'_, PyAny>,
+    bytearray: *mut ffi::PyObject,
+    limit: usize,
+) -> PyResult<()> {
     let reader_transport = reader.getattr("_transport")?;
     if reader_transport.is_none() || reader.getattr("_paused")?.is_truthy()? {
         return Ok(());
     }
-
-    let limit: usize = reader.getattr("_limit")?.extract()?;
     let buffered = bytearray_len(bytearray)?;
     if buffered <= 2 * limit {
         return Ok(());
@@ -2958,6 +3034,222 @@ pub(crate) fn feed_stream_reader_eof(py: Python<'_>, reader: Py<PyAny>) -> PyRes
     let reader = reader.bind(py);
     reader.setattr("_eof", true)?;
     wake_waiter(py, &reader)
+}
+
+fn sslproto_state_do_handshake(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static VALUE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    Ok(VALUE
+        .get_or_try_init(py, || -> PyResult<_> {
+            Ok(py
+                .import("asyncio.sslproto")?
+                .getattr("SSLProtocolState")?
+                .getattr("DO_HANDSHAKE")?
+                .unbind())
+        })?
+        .bind(py))
+}
+
+fn sslproto_state_wrapped(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static VALUE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    Ok(VALUE
+        .get_or_try_init(py, || -> PyResult<_> {
+            Ok(py
+                .import("asyncio.sslproto")?
+                .getattr("SSLProtocolState")?
+                .getattr("WRAPPED")?
+                .unbind())
+        })?
+        .bind(py))
+}
+
+fn sslproto_state_flushing(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static VALUE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    Ok(VALUE
+        .get_or_try_init(py, || -> PyResult<_> {
+            Ok(py
+                .import("asyncio.sslproto")?
+                .getattr("SSLProtocolState")?
+                .getattr("FLUSHING")?
+                .unbind())
+        })?
+        .bind(py))
+}
+
+fn sslproto_state_shutdown(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static VALUE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    Ok(VALUE
+        .get_or_try_init(py, || -> PyResult<_> {
+            Ok(py
+                .import("asyncio.sslproto")?
+                .getattr("SSLProtocolState")?
+                .getattr("SHUTDOWN")?
+                .unbind())
+        })?
+        .bind(py))
+}
+
+fn app_protocol_state_con_made(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static VALUE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    Ok(VALUE
+        .get_or_try_init(py, || -> PyResult<_> {
+            Ok(py
+                .import("asyncio.sslproto")?
+                .getattr("AppProtocolState")?
+                .getattr("STATE_CON_MADE")?
+                .unbind())
+        })?
+        .bind(py))
+}
+
+fn app_protocol_state_eof(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static VALUE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    Ok(VALUE
+        .get_or_try_init(py, || -> PyResult<_> {
+            Ok(py
+                .import("asyncio.sslproto")?
+                .getattr("AppProtocolState")?
+                .getattr("STATE_EOF")?
+                .unbind())
+        })?
+        .bind(py))
+}
+
+fn ssl_again_errors(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static VALUE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    Ok(VALUE
+        .get_or_try_init(py, || -> PyResult<_> {
+            Ok(py.import("asyncio.sslproto")?.getattr("SSLAgainErrors")?.unbind())
+        })?
+        .bind(py))
+}
+
+fn rsloop_sslproto_buffer_updated(
+    py: Python<'_>,
+    protocol: &Bound<'_, PyAny>,
+    ssl_view: &Bound<'_, PyAny>,
+    nbytes: usize,
+) -> PyResult<()> {
+    let slice = PySlice::new(py, 0, nbytes as isize, 1);
+    let payload = ssl_view.get_item(slice)?;
+    protocol.getattr("_rsloop_incoming_write")?.call1((payload,))?;
+
+    let state = protocol.getattr("_state")?;
+    if state.as_ptr() == sslproto_state_do_handshake(py)?.as_ptr() {
+        protocol.call_method0("_do_handshake")?;
+        return Ok(());
+    }
+    let wrapped = state.as_ptr() == sslproto_state_wrapped(py)?.as_ptr();
+    let flushing = state.as_ptr() == sslproto_state_flushing(py)?.as_ptr();
+    if wrapped || flushing {
+        if !protocol.getattr("_app_reading_paused")?.is_truthy()? {
+            if protocol.getattr("_app_protocol_is_buffer")?.is_truthy()? {
+                protocol.call_method0("_do_read__buffered")?;
+            } else {
+                rsloop_sslproto_do_read_copied(py, protocol)?;
+            }
+            if protocol.getattr("_write_backlog")?.is_truthy()? {
+                protocol.call_method0("_do_write")?;
+            } else {
+                rsloop_sslproto_process_outgoing(py, protocol)?;
+            }
+        }
+        protocol.call_method0("_control_ssl_reading")?;
+        return Ok(());
+    }
+    if state.as_ptr() == sslproto_state_shutdown(py)?.as_ptr() {
+        protocol.call_method0("_do_shutdown")?;
+    }
+    Ok(())
+}
+
+fn rsloop_sslproto_do_read_copied(py: Python<'_>, protocol: &Bound<'_, PyAny>) -> PyResult<()> {
+    let reader = protocol.getattr("_rsloop_stream_reader")?;
+    if reader.is_none() {
+        protocol.call_method0("_do_read__copied")?;
+        return Ok(());
+    }
+
+    let sslobj_read = protocol.getattr("_rsloop_sslobj_read")?;
+    let max_size = protocol.getattr("max_size")?.extract::<usize>()?;
+    let mut chunks: Vec<Py<PyBytes>> = Vec::new();
+    let mut total = 0usize;
+    let mut saw_eof = false;
+    loop {
+        match sslobj_read.call1((max_size,)) {
+            Ok(chunk) => {
+                let chunk = chunk.cast_into::<PyBytes>()?;
+                if chunk.as_bytes().is_empty() {
+                    saw_eof = true;
+                    break;
+                }
+                total += chunk.as_bytes().len();
+                chunks.push(chunk.unbind());
+            }
+            Err(err) if err.matches(py, ssl_again_errors(py)?)? => break,
+            Err(err) => return Err(err),
+        }
+    }
+
+    if !chunks.is_empty() {
+        let buffer = protocol
+            .getattr("_rsloop_stream_reader_buffer")?
+            .cast_into::<PyByteArray>()?;
+        let limit = protocol
+            .getattr("_rsloop_stream_reader_limit")?
+            .extract::<usize>()?;
+        match chunks.len() {
+            1 => {
+                append_to_bytearray(buffer.as_ptr(), chunks[0].bind(py).as_bytes())?;
+            }
+            _ => {
+                let mut joined = Vec::with_capacity(total);
+                for chunk in &chunks {
+                    joined.extend_from_slice(chunk.bind(py).as_bytes());
+                }
+                append_to_bytearray(buffer.as_ptr(), &joined)?;
+            }
+        }
+        wake_waiter(py, &reader)?;
+        pause_reader_if_needed_limit(py, &reader, buffer.as_ptr(), limit)?;
+    }
+
+    if saw_eof {
+        rsloop_sslproto_call_eof_received(py, protocol)?;
+        protocol.call_method0("_start_shutdown")?;
+    }
+    Ok(())
+}
+
+fn rsloop_sslproto_process_outgoing(_py: Python<'_>, protocol: &Bound<'_, PyAny>) -> PyResult<()> {
+    if protocol.getattr("_ssl_writing_paused")?.is_truthy()? {
+        return Ok(());
+    }
+    let data = protocol.getattr("_rsloop_outgoing_read")?.call0()?;
+    if data.is_truthy()? {
+        let transport_write = protocol.getattr("_rsloop_transport_write")?;
+        if transport_write.is_none() {
+            protocol.getattr("_transport")?.call_method1("write", (data,))?;
+        } else {
+            transport_write.call1((data,))?;
+        }
+    }
+    protocol.call_method0("_control_app_writing")?;
+    Ok(())
+}
+
+fn rsloop_sslproto_call_eof_received(
+    py: Python<'_>,
+    protocol: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let reader = protocol.getattr("_rsloop_stream_reader")?;
+    let app_state = protocol.getattr("_app_state")?;
+    if !reader.is_none() && app_state.as_ptr() == app_protocol_state_con_made(py)?.as_ptr() {
+        protocol.setattr("_app_state", app_protocol_state_eof(py)?)?;
+        feed_stream_reader_eof(py, reader.unbind())?;
+        return Ok(());
+    }
+    protocol.call_method0("_call_eof_received")?;
+    Ok(())
 }
 
 fn copy_context_obj(py: Python<'_>) -> PyResult<Py<PyAny>> {

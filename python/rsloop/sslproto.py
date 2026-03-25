@@ -4,32 +4,37 @@ from asyncio import sslproto as _sslproto
 from asyncio import streams as _streams
 from typing import Any
 
-from . import _rsloop
-
-_FEED_STREAM_READER_DATA = _rsloop.feed_stream_reader_data
-_FEED_STREAM_READER_EOF = _rsloop.feed_stream_reader_eof
-
-
 class RsloopSSLProtocol(_sslproto.SSLProtocol):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._rsloop_stream_reader = None
-        self._rsloop_reader_feed_data = None
-        self._rsloop_reader_feed_eof = None
+        self._rsloop_stream_reader_buffer = None
+        self._rsloop_stream_reader_limit = 0
+        self._rsloop_incoming_write = None
+        self._rsloop_sslobj_read = None
+        self._rsloop_outgoing_read = None
+        self._rsloop_transport_write = None
         super().__init__(*args, **kwargs)
+        self._rsloop_incoming_write = self._incoming.write
+        self._rsloop_sslobj_read = self._sslobj.read
+        self._rsloop_outgoing_read = self._outgoing.read
 
     def _set_app_protocol(self, app_protocol: Any) -> None:
         super()._set_app_protocol(app_protocol)
         self._rsloop_stream_reader = None
-        self._rsloop_reader_feed_data = None
-        self._rsloop_reader_feed_eof = None
+        self._rsloop_stream_reader_buffer = None
+        self._rsloop_stream_reader_limit = 0
         if type(app_protocol) is not _streams.StreamReaderProtocol:
             return
         reader = app_protocol._stream_reader
         if reader is None:
             return
         self._rsloop_stream_reader = reader
-        self._rsloop_reader_feed_data = reader.feed_data
-        self._rsloop_reader_feed_eof = reader.feed_eof
+        self._rsloop_stream_reader_buffer = reader._buffer
+        self._rsloop_stream_reader_limit = reader._limit
+
+    def connection_made(self, transport: Any) -> None:
+        super().connection_made(transport)
+        self._rsloop_transport_write = self._transport.write
 
     def _process_outgoing(self) -> None:
         if self._ssl_writing_paused or not self._outgoing.pending:
@@ -37,77 +42,3 @@ class RsloopSSLProtocol(_sslproto.SSLProtocol):
         data = self._outgoing.read()
         if data:
             self._transport.write(data)
-
-    def _do_read(self) -> None:
-        if self._state not in (
-            _sslproto.SSLProtocolState.WRAPPED,
-            _sslproto.SSLProtocolState.FLUSHING,
-        ):
-            return
-        try:
-            if not self._app_reading_paused:
-                if self._app_protocol_is_buffer:
-                    self._do_read__buffered()
-                else:
-                    self._do_read__copied()
-                if self._write_backlog:
-                    self._do_write()
-                else:
-                    self._process_outgoing()
-                    self._control_app_writing()
-            self._control_ssl_reading()
-        except Exception as ex:
-            self._fatal_error(ex, "Fatal error on SSL protocol")
-
-    def _do_read__copied(self) -> None:
-        reader = self._rsloop_stream_reader
-        feed_data = self._rsloop_reader_feed_data
-        if reader is None or feed_data is None:
-            super()._do_read__copied()
-            return
-
-        chunk = b"1"
-        zero = True
-        one = False
-        sslobj_read = self._sslobj.read
-        max_size = self.max_size
-
-        try:
-            while True:
-                chunk = sslobj_read(max_size)
-                if not chunk:
-                    break
-                if zero:
-                    zero = False
-                    one = True
-                    first = chunk
-                elif one:
-                    one = False
-                    data = [first, chunk]
-                else:
-                    data.append(chunk)
-        except _sslproto.SSLAgainErrors:
-            pass
-
-        if one:
-            feed_data(first)
-        elif not zero:
-            if len(data) <= 2:
-                feed_data(b"".join(data))
-            else:
-                _FEED_STREAM_READER_DATA(reader, data)
-        if not chunk:
-            self._call_eof_received()
-            self._start_shutdown()
-
-    def _call_eof_received(self) -> None:
-        feed_eof = self._rsloop_reader_feed_eof
-        if (
-            self._rsloop_stream_reader is not None
-            and feed_eof is not None
-            and self._app_state == _sslproto.AppProtocolState.STATE_CON_MADE
-        ):
-            self._app_state = _sslproto.AppProtocolState.STATE_EOF
-            feed_eof()
-            return
-        super()._call_eof_received()
