@@ -1055,3 +1055,55 @@ hop or a repeated protocol lookup. The remaining credible directions are:
   - [`benchmarks/out/revision-ab-start-tls-native-write-v2.json`](out/revision-ab-start-tls-native-write-v2.json)
   - [`benchmarks/out/revision-ab-http1-native-write-v2-strict.json`](out/revision-ab-http1-native-write-v2-strict.json)
   - [`benchmarks/out/revision-ab-asgi-native-write-v2.json`](out/revision-ab-asgi-native-write-v2.json)
+
+### 43. StreamReader `_paused` cache in native stream path
+
+- Area:
+  - [`src/stream_transport.rs`](../src/stream_transport.rs)
+- Change:
+  - cache `StreamReader._paused` in `StreamCore` and use that cached flag in
+    the native read path instead of reading the Python attribute on every chunk
+    and every resume check
+- Rationale:
+  - the plain-stream hot loop still hit `reader.getattr("_paused")` several
+    times per read / resume path
+- Functional result:
+  - build passed
+  - focused TCP stream tests passed
+- Revision A/B against `HEAD`:
+  - `http1_keepalive_small`: `0.316714s -> 0.314416s` (`-0.73%`)
+  - `asgi_streaming`: `0.133377s -> 0.135299s` (`+1.44%`)
+  - `asgi_json_echo`: `0.159218s -> 0.163348s` (`+2.59%`)
+- Conclusion:
+  - the saved Python attribute lookups were too small to matter
+  - the cached-state version regressed the app-shaped stream cases we care
+    about most, so it is not worth keeping
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/revision-ab-http1-reader-paused-cache.json`](out/revision-ab-http1-reader-paused-cache.json)
+  - [`benchmarks/out/revision-ab-asgi-streaming-reader-paused-cache.json`](out/revision-ab-asgi-streaming-reader-paused-cache.json)
+  - [`benchmarks/out/revision-ab-asgi-json-reader-paused-cache.json`](out/revision-ab-asgi-json-reader-paused-cache.json)
+
+### 44. Socket helper optimistic future completion
+
+- Area:
+  - [`src/socket_state.rs`](../src/socket_state.rs)
+- Change:
+  - remove repeated `Future.done()` polling from the native socket helper loop
+  - switch completions to optimistic `set_result` / `set_exception` /
+    `cancel()` with `InvalidStateError` ignored on cancellation races
+- Rationale:
+  - the native socket helper path still called back into Python just to ask if
+    the future was already done before every completion
+- Functional result:
+  - focused socket-helper / datagram tests passed
+- Revision A/B against `HEAD`:
+  - `tcp_connect_parallel`: `0.043621s -> 0.043415s` (`-0.47%`)
+  - `tcp_churn_small_io`: `0.026208s -> 0.027484s` (`+4.87%`)
+- Conclusion:
+  - removing `done()` polling is directionally sensible, but the current change
+    did not produce a meaningful win and regressed churn-heavy connection traffic
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/revision-ab-tcp-connect-parallel-socket-future-fastpath.json`](out/revision-ab-tcp-connect-parallel-socket-future-fastpath.json)
+  - [`benchmarks/out/revision-ab-tcp-churn-small-io-socket-future-fastpath.json`](out/revision-ab-tcp-churn-small-io-socket-future-fastpath.json)
