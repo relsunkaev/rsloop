@@ -1107,3 +1107,51 @@ hop or a repeated protocol lookup. The remaining credible directions are:
 - Artifacts:
   - [`benchmarks/out/revision-ab-tcp-connect-parallel-socket-future-fastpath.json`](out/revision-ab-tcp-connect-parallel-socket-future-fastpath.json)
   - [`benchmarks/out/revision-ab-tcp-churn-small-io-socket-future-fastpath.json`](out/revision-ab-tcp-churn-small-io-socket-future-fastpath.json)
+
+### 45. Native TLS cache handoff for wrapped reads
+
+- Area:
+  - [`src/stream_transport.rs`](../src/stream_transport.rs)
+- Change:
+  - cache stable `RsloopSSLProtocol` objects once at transport activation /
+    protocol switch:
+    - `_ssl_buffer_view`
+    - `_rsloop_incoming_write`
+    - `_rsloop_sslobj_read`
+    - `_rsloop_outgoing_read`
+    - `_rsloop_transport_write`
+    - copied-mode `StreamReader` objects / buffer / limit
+  - use that cached state in the native wrapped-read path instead of repeated
+    `getattr()` lookups on every TLS fragment
+- Rationale:
+  - after moving copied wrapped reads into native code, the hot path still
+    re-fetched several Python attributes per readable event and per copied-read
+    drain
+  - this was measurable boundary churn on the remaining steady-state TLS path
+- Functional result:
+  - `cargo test -q` passed
+  - `./.venv/bin/python -m unittest tests.test_loop tests.test_benchmarks -q`
+    passed
+- Revision A/B against `HEAD`:
+  - `tls_http1_keepalive`: `0.179753s -> 0.173030s` (`-3.74%`)
+  - `start_tls_upgrade`: `0.043507s -> 0.040906s` (`-5.98%`)
+- Guard checks:
+  - `http1_keepalive_small`: `0.314166s -> 0.311057s` (`-0.99%`)
+  - `asgi_json_echo`: `0.162751s -> 0.162911s` (`+0.10%`)
+- Cross-loop spot checks vs `uvloop`:
+  - `tls_http1_keepalive`: `1.376x`
+  - `start_tls_upgrade`: `0.776x`
+  - `http1_keepalive_small`: `1.049x`
+- Conclusion:
+  - caching the stable TLS protocol handles was worth keeping
+  - it improved the TLS target and upgrade path while keeping plain HTTP / ASGI
+    effectively flat
+- Decision: kept
+- Artifacts:
+  - [`benchmarks/out/revision-ab-tls-cache-handoff.json`](out/revision-ab-tls-cache-handoff.json)
+  - [`benchmarks/out/revision-ab-starttls-cache-handoff.json`](out/revision-ab-starttls-cache-handoff.json)
+  - [`benchmarks/out/revision-ab-http1-cache-handoff-strict.json`](out/revision-ab-http1-cache-handoff-strict.json)
+  - [`benchmarks/out/revision-ab-asgi-cache-handoff.json`](out/revision-ab-asgi-cache-handoff.json)
+  - [`benchmarks/out/tls-http1-all-cache-handoff.json`](out/tls-http1-all-cache-handoff.json)
+  - [`benchmarks/out/start-tls-all-cache-handoff.json`](out/start-tls-all-cache-handoff.json)
+  - [`benchmarks/out/http1-all-cache-handoff.json`](out/http1-all-cache-handoff.json)
