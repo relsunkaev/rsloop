@@ -1448,3 +1448,153 @@ hop or a repeated protocol lookup. The remaining credible directions are:
   - [`benchmarks/out/ab_pipebatch_pipe_read.json`](out/ab_pipebatch_pipe_read.json)
   - [`benchmarks/out/ab_pipebatch_subprocess_exec.json`](out/ab_pipebatch_subprocess_exec.json)
   - [`benchmarks/out/ab_pipebatch_subprocess_shell.json`](out/ab_pipebatch_subprocess_shell.json)
+
+### 55. Stream readable hot-path clone elision (native TLS + protocol reads)
+
+- Area:
+  - [`src/stream_transport.rs`](../src/stream_transport.rs) (reverted)
+- Change:
+  - remove per-event `NativeSslCache::clone_ref()` in
+    `on_readable_native_ssl()` by switching to scoped borrowed cache access
+  - remove per-call `protocol.clone_ref()` in `on_readable_protocol()` and use
+    direct bound access
+  - add local dispatch enum to keep borrow scopes short while preserving error
+    handling behavior
+- Rationale:
+  - `tls_http1_keepalive` profiling showed high `fd_dispatch` + `ready` time,
+    and the TLS readable path hit per-event object cloning many times
+- Functional result:
+  - `cargo test -q` passed
+  - `./.venv/bin/maturin develop --release` passed
+  - `./.venv/bin/python -m unittest tests.test_loop tests.test_benchmarks -q`
+    passed
+- Revision A/B (9 repeats, 2 warmups) against `HEAD`:
+  - `tls_http1_keepalive`: `0.176644s -> 0.178985s` (`+1.33%`)
+  - `http1_keepalive_small`: `0.316429s -> 0.318345s` (`+0.61%`)
+  - `http1_streaming_response`: `0.139889s -> 0.139014s` (`-0.63%`)
+  - `asgi_json_echo`: `0.165814s -> 0.166116s` (`+0.18%`)
+  - `grpc_like_unary`: `0.139939s -> 0.143629s` (`+2.64%`)
+- Conclusion:
+  - despite one small win, this patch regressed most guarded app/TLS paths and
+    did not meet keep criteria
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/ab_noclone_tls_http1_keepalive.json`](out/ab_noclone_tls_http1_keepalive.json)
+  - [`benchmarks/out/ab_noclone_http1_keepalive_small.json`](out/ab_noclone_http1_keepalive_small.json)
+  - [`benchmarks/out/ab_noclone_http1_streaming_response.json`](out/ab_noclone_http1_streaming_response.json)
+  - [`benchmarks/out/ab_noclone_asgi_json_echo.json`](out/ab_noclone_asgi_json_echo.json)
+  - [`benchmarks/out/ab_noclone_grpc_like_unary.json`](out/ab_noclone_grpc_like_unary.json)
+
+### 56. Native TLS copied-read single-chunk fast path
+
+- Area:
+  - [`src/stream_transport.rs`](../src/stream_transport.rs) (reverted)
+- Change:
+  - in `rsloop_sslproto_do_read_copied_cached()`, split the collected chunks
+    into a dedicated first-chunk slot plus an extra-chunks vector
+  - avoid building a joined `Vec<u8>` when exactly one TLS chunk is read
+  - keep the existing multi-chunk join path for compatibility
+- Rationale:
+  - `tls_http1_keepalive` profiling showed significant copied-mode TLS read
+    traffic, and the single-chunk case is common in small request/response
+    exchanges
+- Functional result:
+  - `cargo test -q` passed
+  - `./.venv/bin/maturin develop --release` passed
+  - `./.venv/bin/python -m unittest tests.test_loop tests.test_benchmarks -q`
+    passed
+- Revision A/B (9 repeats, 2 warmups) against `HEAD`:
+  - `tls_http1_keepalive`: `0.156718s -> 0.166323s` (`+6.13%`)
+  - `http1_keepalive_small`: `0.315670s -> 0.313990s` (`-0.53%`)
+  - `http1_streaming_response`: `0.136780s -> 0.139259s` (`+1.81%`)
+  - `asgi_json_echo`: `0.171266s -> 0.168024s` (`-1.89%`)
+  - `grpc_like_unary`: `0.125168s -> 0.127756s` (`+2.07%`)
+- Focused retests (13 repeats, 3 warmups):
+  - `tls_http1_keepalive`: `0.178534s -> 0.167004s` (`-6.46%`)
+  - `http1_streaming_response`: `0.134227s -> 0.135449s` (`+0.91%`)
+- Conclusion:
+  - results were unstable across reruns, and the guarded full set still showed
+    unacceptable regressions
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/ab_tlschunk2_final_tls_http1_keepalive.json`](out/ab_tlschunk2_final_tls_http1_keepalive.json)
+  - [`benchmarks/out/ab_tlschunk2_final_http1_keepalive_small.json`](out/ab_tlschunk2_final_http1_keepalive_small.json)
+  - [`benchmarks/out/ab_tlschunk2_final_http1_streaming_response.json`](out/ab_tlschunk2_final_http1_streaming_response.json)
+  - [`benchmarks/out/ab_tlschunk2_final_asgi_json_echo.json`](out/ab_tlschunk2_final_asgi_json_echo.json)
+  - [`benchmarks/out/ab_tlschunk2_final_grpc_like_unary.json`](out/ab_tlschunk2_final_grpc_like_unary.json)
+  - [`benchmarks/out/ab_tlschunk2_retest_tls_http1_keepalive.json`](out/ab_tlschunk2_retest_tls_http1_keepalive.json)
+  - [`benchmarks/out/ab_tlschunk2_retest_http1_streaming_response.json`](out/ab_tlschunk2_retest_http1_streaming_response.json)
+
+### 57. Native TLS bound-method cache for SSLProtocol control calls
+
+- Area:
+  - [`src/stream_transport.rs`](../src/stream_transport.rs) (reverted)
+- Change:
+  - cache hot `SSLProtocol` bound methods in `NativeSslCache`:
+    `_do_handshake`, `_do_read__buffered`, `_do_read__copied`, `_do_write`,
+    `_control_ssl_reading`, `_do_shutdown`, `_start_shutdown`,
+    `_control_app_writing`
+  - replace string-based `protocol.call_method0("...")` calls with direct bound
+    method invocations through the cache
+- Rationale:
+  - TLS profile data showed frequent `_control_ssl_reading` and
+    `_process_outgoing` activity where repeated Python attribute lookups could
+    plausibly add overhead
+- Functional result:
+  - `cargo test -q` passed
+  - `./.venv/bin/maturin develop --release` passed
+  - `./.venv/bin/python -m unittest tests.test_loop tests.test_benchmarks -q`
+    passed
+- Revision A/B (9 repeats, 2 warmups) against `HEAD`:
+  - `tls_http1_keepalive`: `0.167889s -> 0.171759s` (`+2.31%`)
+  - `http1_keepalive_small`: `0.322922s -> 0.318976s` (`-1.22%`)
+  - `http1_streaming_response`: `0.137175s -> 0.137568s` (`+0.29%`)
+  - `asgi_json_echo`: `0.168547s -> 0.170428s` (`+1.12%`)
+  - `grpc_like_unary`: `0.125285s -> 0.125162s` (`-0.10%`)
+- Conclusion:
+  - small wins did not offset regressions on `tls_http1_keepalive` and
+    `asgi_json_echo`
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/ab_tlscache_tls_http1_keepalive.json`](out/ab_tlscache_tls_http1_keepalive.json)
+  - [`benchmarks/out/ab_tlscache_http1_keepalive_small.json`](out/ab_tlscache_http1_keepalive_small.json)
+  - [`benchmarks/out/ab_tlscache_http1_streaming_response.json`](out/ab_tlscache_http1_streaming_response.json)
+  - [`benchmarks/out/ab_tlscache_asgi_json_echo.json`](out/ab_tlscache_asgi_json_echo.json)
+  - [`benchmarks/out/ab_tlscache_grpc_like_unary.json`](out/ab_tlscache_grpc_like_unary.json)
+
+### 58. Native TLS method cache + single-chunk copied-read fast path
+
+- Area:
+  - [`src/stream_transport.rs`](../src/stream_transport.rs) (reverted)
+- Change:
+  - combine entry 56 single-chunk copied-read fast path with entry 57 bound
+    method cache in one candidate
+- Rationale:
+  - earlier regressions may have been cross-coupled between lookup overhead and
+    copied-read handling, so this tested the combined interaction explicitly
+- Functional result:
+  - `cargo test -q` passed
+  - `./.venv/bin/maturin develop --release` passed
+  - `./.venv/bin/python -m unittest tests.test_loop tests.test_benchmarks -q`
+    passed
+- Revision A/B (9 repeats, 2 warmups) against `HEAD`:
+  - `tls_http1_keepalive`: `0.161663s -> 0.163280s` (`+1.00%`)
+  - `http1_keepalive_small`: `0.317958s -> 0.315943s` (`-0.63%`)
+  - `http1_streaming_response`: `0.137942s -> 0.138939s` (`+0.72%`)
+  - `asgi_json_echo`: `0.163531s -> 0.163423s` (`-0.07%`)
+  - `grpc_like_unary`: `0.124571s -> 0.122903s` (`-1.34%`)
+- Focused retests (13 repeats, 3 warmups):
+  - `tls_http1_keepalive`: `0.160039s -> 0.169783s` (`+6.09%`)
+  - `http1_streaming_response`: `0.135364s -> 0.134752s` (`-0.45%`)
+- Conclusion:
+  - despite several small wins, the TLS guard regressed again on strict retest
+    and failed keep criteria
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/ab_tlscachechunk_tls_http1_keepalive.json`](out/ab_tlscachechunk_tls_http1_keepalive.json)
+  - [`benchmarks/out/ab_tlscachechunk_http1_keepalive_small.json`](out/ab_tlscachechunk_http1_keepalive_small.json)
+  - [`benchmarks/out/ab_tlscachechunk_http1_streaming_response.json`](out/ab_tlscachechunk_http1_streaming_response.json)
+  - [`benchmarks/out/ab_tlscachechunk_asgi_json_echo.json`](out/ab_tlscachechunk_asgi_json_echo.json)
+  - [`benchmarks/out/ab_tlscachechunk_grpc_like_unary.json`](out/ab_tlscachechunk_grpc_like_unary.json)
+  - [`benchmarks/out/ab_tlscachechunk_retest_tls_http1_keepalive.json`](out/ab_tlscachechunk_retest_tls_http1_keepalive.json)
+  - [`benchmarks/out/ab_tlscachechunk_retest_http1_streaming_response.json`](out/ab_tlscachechunk_retest_http1_streaming_response.json)
