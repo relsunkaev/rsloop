@@ -1282,3 +1282,31 @@ hop or a repeated protocol lookup. The remaining credible directions are:
 - Decision: reverted
 - Artifacts:
   - [`benchmarks/out/revision-ab-subprocess-native-exit-port.json`](out/revision-ab-subprocess-native-exit-port.json)
+
+### 50. Native pipe transports for subprocess stdio
+
+- Area:
+  - [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+  - [`src/pipe_transport.rs`](../src/pipe_transport.rs) (reverted)
+  - [`src/lib.rs`](../src/lib.rs) (reverted)
+- Change:
+  - replace stdlib `_UnixReadPipeTransport` and `_UnixWritePipeTransport`
+    with rsloop-owned native read/write pipe transports
+  - wire `connect_read_pipe()` and `connect_write_pipe()` through the native
+    transports so subprocess stdio uses the same path
+- Rationale:
+  - `pipe_write` was still dominated by stdlib transport overhead
+  - subprocess uses those same pipe transports for stdin/stdout/stderr, so a
+    deeper stdio rewrite was the next plausible subsystem cut
+- Functional result:
+  - subprocess smoke tests passed after the transport wiring
+- Revision A/B against `HEAD`:
+  - `pipe_read`: `0.007682s -> 0.008124s` (`+5.75%`)
+  - `subprocess_exec`: `0.766242s -> 0.765284s` (`-0.12%`)
+- Conclusion:
+  - the native pipe transports did not produce a keepable win
+  - read-side overhead regressed, and subprocess stayed effectively flat
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/revision-ab-pipe-read-native-transport.json`](out/revision-ab-pipe-read-native-transport.json)
+  - [`benchmarks/out/revision-ab-subprocess-native-transport.json`](out/revision-ab-subprocess-native-transport.json)
