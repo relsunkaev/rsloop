@@ -1598,3 +1598,40 @@ hop or a repeated protocol lookup. The remaining credible directions are:
   - [`benchmarks/out/ab_tlscachechunk_grpc_like_unary.json`](out/ab_tlscachechunk_grpc_like_unary.json)
   - [`benchmarks/out/ab_tlscachechunk_retest_tls_http1_keepalive.json`](out/ab_tlscachechunk_retest_tls_http1_keepalive.json)
   - [`benchmarks/out/ab_tlscachechunk_retest_http1_streaming_response.json`](out/ab_tlscachechunk_retest_http1_streaming_response.json)
+
+### 59. Callback dispatch via `PyObject_Vectorcall` for zero/one-arg handles
+
+- Area:
+  - [`src/handles.rs`](../src/handles.rs) (reverted)
+- Change:
+  - replace `PyObject_CallOneArg` with `PyObject_Vectorcall` in:
+    - `run_one_arg_handle()`
+    - `run_one_arg_direct()`
+    - single-arg tuple branch of `run_handle()`
+  - replace `PyObject_CallNoArgs` with zero-arg `PyObject_Vectorcall` in
+    `run_zero_arg_handle()`
+- Rationale:
+  - `tcp_echo_1b` profiling showed `Task.task_wakeup` one-arg callback dispatch
+    dominating one-arg callback time, so this tested whether direct vectorcall
+    framing would outperform `CallOneArg`/`CallNoArgs`
+- Functional result:
+  - `cargo test -q` passed
+  - `./.venv/bin/maturin develop --release` passed
+  - `./.venv/bin/python -m unittest tests.test_loop tests.test_benchmarks -q`
+    passed
+- Revision A/B (9 repeats, 2 warmups) against `HEAD`:
+  - `call_soon`: `0.017858s -> 0.017966s` (`+0.61%`)
+  - `call_soon_threadsafe`: `0.011335s -> 0.011626s` (`+2.57%`)
+  - `tcp_echo_1b`: `0.271541s -> 0.278371s` (`+2.52%`)
+  - `tcp_echo_parallel`: `0.205287s -> 0.202679s` (`-1.27%`)
+  - `tcp_rpc`: `0.261534s -> 0.261728s` (`+0.07%`)
+- Conclusion:
+  - one stream win did not offset scheduler and key stream regressions;
+    `CallOneArg`/`CallNoArgs` remained better for this workload mix
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/ab_vectorcall_call_soon.json`](out/ab_vectorcall_call_soon.json)
+  - [`benchmarks/out/ab_vectorcall_call_soon_threadsafe.json`](out/ab_vectorcall_call_soon_threadsafe.json)
+  - [`benchmarks/out/ab_vectorcall_tcp_echo_1b.json`](out/ab_vectorcall_tcp_echo_1b.json)
+  - [`benchmarks/out/ab_vectorcall_tcp_echo_parallel.json`](out/ab_vectorcall_tcp_echo_parallel.json)
+  - [`benchmarks/out/ab_vectorcall_tcp_rpc.json`](out/ab_vectorcall_tcp_rpc.json)
