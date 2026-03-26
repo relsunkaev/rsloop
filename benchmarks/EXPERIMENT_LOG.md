@@ -1,6 +1,6 @@
 # Performance Experiment Log
 
-Last updated: 2026-03-25
+Last updated: 2026-03-26
 
 This file tracks the optimization experiments tried during the current rsloop
 performance pass, including changes that were reverted.
@@ -1310,3 +1310,141 @@ hop or a repeated protocol lookup. The remaining credible directions are:
 - Artifacts:
   - [`benchmarks/out/revision-ab-pipe-read-native-transport.json`](out/revision-ab-pipe-read-native-transport.json)
   - [`benchmarks/out/revision-ab-subprocess-native-transport.json`](out/revision-ab-subprocess-native-transport.json)
+
+### 51. Scheduler skip-poll fast path with self-pipe awareness (scan + signal lookup)
+
+- Area:
+  - [`src/scheduler.rs`](../src/scheduler.rs) (reverted)
+  - [`src/poller.rs`](../src/poller.rs) (reverted)
+- Change:
+  - add a ready-queue fast path to skip zero-timeout `poll()` when no external
+    fds were registered beyond completion port / self-pipe
+  - drain completion port and self-pipe directly on that path
+  - gate with Python-side signal-handler presence lookup
+- Rationale:
+  - runtime profiles showed high scheduler `select` time on callback-heavy
+    paths and high `ready` time on some stream workloads
+- Functional result:
+  - no functional breakage observed in this draft
+- Revision A/B snapshots against `HEAD`:
+  - targeted set (7 repeats) was mixed:
+    - `pipe_write`: `-6.39%`
+    - `tcp_connect_parallel`: `-26.22%`
+    - `sleep_zero`: `+5.10%`
+    - `tls_http1_keepalive`: `+5.47%`
+  - `real` profile (5 repeats): `5 improved / 5 regressed`, mean `-0.75%`
+  - `default` profile (3 repeats): `7 improved / 5 regressed`, mean `+0.25%`
+  - conflict retest (9 repeats):
+    - `call_soon`: `+1.51%`
+    - `call_soon_threadsafe`: `+4.84%`
+    - `sleep_zero`: `+1.18%`
+    - `tcp_connect`: `+6.94%`
+    - `tls_http1_keepalive`: `-7.31%`
+- Conclusion:
+  - too unstable and not reliably positive across scheduler-critical paths
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/ab_default_skip_poll.json`](out/ab_default_skip_poll.json)
+  - [`benchmarks/out/ab_real_skip_poll.json`](out/ab_real_skip_poll.json)
+  - [`benchmarks/out/ab_retest_call_soon_skip_poll.json`](out/ab_retest_call_soon_skip_poll.json)
+  - [`benchmarks/out/ab_retest_call_soon_threadsafe_skip_poll.json`](out/ab_retest_call_soon_threadsafe_skip_poll.json)
+  - [`benchmarks/out/ab_retest_sleep_zero_skip_poll.json`](out/ab_retest_sleep_zero_skip_poll.json)
+  - [`benchmarks/out/ab_retest_tcp_connect_skip_poll.json`](out/ab_retest_tcp_connect_skip_poll.json)
+  - [`benchmarks/out/ab_retest_tls_http1_keepalive_skip_poll.json`](out/ab_retest_tls_http1_keepalive_skip_poll.json)
+
+### 52. Scheduler skip-poll fast path without per-tick signal-handler lookup
+
+- Area:
+  - [`src/scheduler.rs`](../src/scheduler.rs) (reverted)
+  - [`src/poller.rs`](../src/poller.rs) (reverted)
+- Change:
+  - remove Python `_signal_handlers` lookup from the skip-poll hot path
+  - keep direct self-pipe drain behavior
+- Rationale:
+  - hypothesis: per-tick Python lookup caused callback benchmark regressions
+- Revision A/B conflict retest (9 repeats):
+  - `call_soon`: `+2.03%`
+  - `call_soon_threadsafe`: `+1.10%`
+  - `sleep_zero`: `+2.93%`
+  - `tcp_connect`: `+0.30%`
+  - `tls_http1_keepalive`: `+2.12%`
+- Conclusion:
+  - removing the lookup reduced one regression but did not recover the set;
+    overall still net negative
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/ab_retest2_call_soon_skip_poll.json`](out/ab_retest2_call_soon_skip_poll.json)
+  - [`benchmarks/out/ab_retest2_call_soon_threadsafe_skip_poll.json`](out/ab_retest2_call_soon_threadsafe_skip_poll.json)
+  - [`benchmarks/out/ab_retest2_sleep_zero_skip_poll.json`](out/ab_retest2_sleep_zero_skip_poll.json)
+  - [`benchmarks/out/ab_retest2_tcp_connect_skip_poll.json`](out/ab_retest2_tcp_connect_skip_poll.json)
+  - [`benchmarks/out/ab_retest2_tls_http1_keepalive_skip_poll.json`](out/ab_retest2_tls_http1_keepalive_skip_poll.json)
+
+### 53. Scheduler skip-poll with native wake/signal flags
+
+- Area:
+  - [`src/scheduler.rs`](../src/scheduler.rs)
+  - [`src/poller.rs`](../src/poller.rs)
+  - [`src/loop_api.rs`](../src/loop_api.rs)
+  - [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+- Change:
+  - replace Python-side signal lookup with `LoopApi` atomic
+    `signal_handlers_active`
+  - add `LoopApi.is_wakeup_pending()` and gate direct self-pipe drain on that
+    flag to avoid unnecessary read syscalls
+  - use constant-time `poller.is_only_registered_fds(completion_fd, self_pipe)`
+    for skip-poll eligibility
+- Rationale:
+  - keep the skip-poll idea, but remove Python boundary churn and avoid
+    unconditional self-pipe drains
+- Functional result:
+  - `cargo test -q` passed
+  - `./.venv/bin/maturin develop --release` passed
+  - `./.venv/bin/python -m unittest tests.test_loop tests.test_benchmarks -q`
+    passed
+- Revision A/B conflict retest (9 repeats):
+  - `call_soon`: `+2.04%`
+  - `call_soon_threadsafe`: `+2.24%`
+  - `sleep_zero`: `+1.71%`
+  - `tcp_connect`: `+10.12%`
+  - `tls_http1_keepalive`: `+7.31%`
+- Conclusion:
+  - this direction clearly regressed key scheduler/network paths in strict
+    retest
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/ab_retest3_call_soon_skip_poll.json`](out/ab_retest3_call_soon_skip_poll.json)
+  - [`benchmarks/out/ab_retest3_call_soon_threadsafe_skip_poll.json`](out/ab_retest3_call_soon_threadsafe_skip_poll.json)
+  - [`benchmarks/out/ab_retest3_sleep_zero_skip_poll.json`](out/ab_retest3_sleep_zero_skip_poll.json)
+  - [`benchmarks/out/ab_retest3_tcp_connect_skip_poll.json`](out/ab_retest3_tcp_connect_skip_poll.json)
+  - [`benchmarks/out/ab_retest3_tls_http1_keepalive_skip_poll.json`](out/ab_retest3_tls_http1_keepalive_skip_poll.json)
+
+### 54. Python write-pipe batching transport
+
+- Area:
+  - [`python/rsloop/loop.py`](../python/rsloop/loop.py) (reverted)
+- Change:
+  - add `RsloopUnixWritePipeTransport` subclass that removes immediate
+    `os.write()` attempts from `write()`
+  - batch burst writes in the transport buffer and flush via writable callback
+  - route `_make_write_pipe_transport()` through that subclass
+- Rationale:
+  - `pipe_write` CPU profile showed stdlib `_UnixWritePipeTransport.write()`
+    dominating, with one syscall-heavy write path per chunk
+  - hypothesis: batching would reduce per-chunk syscall overhead
+- Functional result:
+  - `./.venv/bin/python -m unittest tests.test_loop tests.test_benchmarks -q`
+    passed
+- Revision A/B (9 repeats, 2 warmups) against `HEAD`:
+  - `pipe_write`: `0.003745s -> 0.003928s` (`+4.87%`)
+  - `pipe_read`: `0.009154s -> 0.009227s` (`+0.80%`)
+  - `subprocess_exec`: `0.826643s -> 0.824528s` (`-0.26%`)
+  - `subprocess_shell`: `1.021239s -> 1.004787s` (`-1.61%`)
+- Conclusion:
+  - slight subprocess gains did not justify regressing the target path
+  - this batching strategy is not a keepable write-pipe optimization
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/ab_pipebatch_pipe_write.json`](out/ab_pipebatch_pipe_write.json)
+  - [`benchmarks/out/ab_pipebatch_pipe_read.json`](out/ab_pipebatch_pipe_read.json)
+  - [`benchmarks/out/ab_pipebatch_subprocess_exec.json`](out/ab_pipebatch_subprocess_exec.json)
+  - [`benchmarks/out/ab_pipebatch_subprocess_shell.json`](out/ab_pipebatch_subprocess_shell.json)
