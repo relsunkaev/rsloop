@@ -23,6 +23,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAny, PyByteArray, PyBytes, PyDict, PyModule, PySlice};
 
 use crate::handles::OneArgHandle;
+use crate::tls::RsloopTLSConn;
 use crate::poller::TokioPoller;
 use crate::scheduler::Scheduler;
 use crate::stream_registry::StreamTransportRegistry;
@@ -236,6 +237,8 @@ pub(crate) struct StreamCore {
     protocol_paused: bool,
     connection_lost_sent: bool,
     pub(crate) write_queued: bool,
+    /// Native rustls connection. Some when transport created with RsloopTLSContext.
+    pub(crate) rustls_conn: Option<RsloopTLSConn>,
 }
 
 #[pyclass(module = "rsloop._rsloop", unsendable)]
@@ -620,6 +623,7 @@ impl StreamTransport {
             protocol_paused: false,
             connection_lost_sent: false,
             write_queued: false,
+            rustls_conn: None,
         }));
         Ok(Self {
             _start_tls_compatible: true,
@@ -766,6 +770,7 @@ impl StreamTransport {
                     let bytes = coerce_bytes(py, &data)?;
                     bytes.bind(py).as_bytes().to_vec()
                 };
+
                 match try_send_bytes(self.fd, &bytes) {
                     Ok(sent) if sent == bytes.len() => Ok(()),
                     Ok(sent) => Err(PyRuntimeError::new_err(format!(
@@ -911,6 +916,78 @@ impl StreamTransport {
     pub(crate) fn on_read_error(&mut self, py: Python<'_>, exc: Py<PyAny>) -> PyResult<()> {
         self.core.borrow_mut().on_read_error(py, exc)
     }
+
+    fn activate_with_rustls(
+        slf: Py<Self>,
+        py: Python<'_>,
+        tls_ctx: Bound<'_, crate::tls::RsloopTLSContext>,
+        hostname: &str,
+        reader: Py<PyAny>,
+        protocol: Py<PyAny>,
+    ) -> PyResult<()> {
+        let rustls_conn = {
+            let ctx = tls_ctx.borrow();
+            match &ctx.inner {
+                crate::tls::TlsConfigInner::Client(cfg) => {
+                    crate::tls::RsloopTLSConn::new_client(cfg.clone(), hostname)
+                        .map_err(|e| PyRuntimeError::new_err(format!("TLS client: {e}")))?
+                }
+                crate::tls::TlsConfigInner::Server(cfg) => {
+                    crate::tls::RsloopTLSConn::new_server(cfg.clone())
+                        .map_err(|e| PyRuntimeError::new_err(format!("TLS server: {e}")))?
+                }
+            }
+        };
+
+        let core = slf.borrow(py).core.clone();
+        let fd = core.borrow().fd;
+
+        {
+            let mut c = core.borrow_mut();
+            c.rustls_conn = Some(rustls_conn);
+            c.protocol = protocol.clone_ref(py);
+            let reader_ref = reader.bind(py);
+            c.buffer = Some(
+                reader_ref.getattr("_buffer")?.cast_into::<PyByteArray>()?.unbind(),
+            );
+            c.limit = reader_ref.getattr("_limit")?.extract()?;
+            c.reader = Some(reader.clone_ref(py));
+        }
+
+        let transport_any = slf.bind(py).clone().into_any().unbind();
+        reader.bind(py).setattr("readexactly", create_bound_readexactly(py, &transport_any)?)?;
+        reader.bind(py).setattr("readuntil", create_bound_readuntil(py, &transport_any)?)?;
+
+        protocol.bind(py).call_method1("connection_made", (&transport_any,))?;
+
+        let transports = core.borrow().transports.clone_ref(py);
+        let registry = core.borrow().registry.clone_ref(py);
+        transports.bind(py).set_item(fd, &transport_any)?;
+        registry.bind(py).borrow_mut().register_inner(fd, core.clone());
+
+        // Kick the initial TLS state machine.  For a client connection this
+        // drives process_records once with empty incoming, which produces the
+        // TLS ClientHello as outgoing ciphertext.  For a server, this is a
+        // no-op (BlockedHandshake) since the server waits for the client hello.
+        {
+            let mut c = core.borrow_mut();
+            let needs_send = if let Some(conn) = c.rustls_conn.as_mut() {
+                match conn.kick_handshake() {
+                    Ok(needs) => needs,
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+            if needs_send {
+                c.flush_rustls_outgoing(py)?;
+            }
+        }
+
+        let result = core.borrow_mut().sync_interest(py);
+        result
+    }
+
 }
 
 impl StreamCore {
@@ -993,6 +1070,18 @@ impl StreamCore {
             }
         }
 
+        // For rustls connections, drain is not instant if the handshake isn't
+        // done yet or there's still plaintext/ciphertext queued.
+        if self.rustls_conn.is_some() {
+            let handshake_done = self.rustls_conn.as_ref().map_or(false, |c| c.handshake_done());
+            let has_pending = !self.write_queue.is_empty()
+                || self.write_waiting_for_writable
+                || self.rustls_conn.as_ref().map_or(false, |c| !c.outgoing().is_empty());
+            if !handshake_done || has_pending {
+                return Ok(None); // fall through to slow drain path
+            }
+        }
+
         if !self.closing && !self.protocol_paused {
             if let Some(ready) = self.ready_drain.as_ref() {
                 return Ok(Some(ready.clone_ref(py)));
@@ -1025,6 +1114,15 @@ impl StreamCore {
 
     fn write(&mut self, py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
         self.ensure_can_write()?;
+        if self.rustls_conn.is_some() {
+            let plaintext: Vec<u8> = if let Ok(bytes) = data.cast::<PyBytes>() {
+                bytes.as_bytes().to_vec()
+            } else {
+                let bytes = coerce_bytes(py, &data)?;
+                bytes.bind(py).as_bytes().to_vec()
+            };
+            return self.write_rustls(py, &plaintext);
+        }
         if self.is_buffered_protocol(py)? {
             if let Ok(bytes) = data.cast::<PyBytes>() {
                 return self.write_direct_bytes(py, bytes.as_bytes());
@@ -1240,6 +1338,10 @@ impl StreamCore {
         if self.closing || self.closed || self.read_paused {
             return Ok(());
         }
+        // Native rustls path handles both handshake and data transfer.
+        if self.rustls_conn.is_some() {
+            return self.on_readable_rustls(py);
+        }
         if self.buffered_protocol {
             if self.native_ssl_protocol {
                 return self.on_readable_native_ssl(py);
@@ -1323,6 +1425,7 @@ impl StreamCore {
 
     fn on_readable_native_ssl(&mut self, py: Python<'_>) -> PyResult<()> {
         let protocol = self.protocol.clone_ref(py);
+        let protocol = protocol.bind(py);
         let ssl_cache = self
             .native_ssl_cache
             .as_ref()
@@ -1346,13 +1449,13 @@ impl StreamCore {
             match recv_into(self.fd, slice) {
                 Ok(0) => {
                     self.remove_reader(py)?;
-                    protocol.bind(py).call_method0("eof_received")?;
+                    protocol.call_method0("eof_received")?;
                     return Ok(());
                 }
                 Ok(n) => {
                     self.record_profile_event("ssl_native_read", n, self.pending_write_bytes);
                     if let Err(err) =
-                        rsloop_sslproto_buffer_updated_cached(py, &protocol.bind(py), &ssl_cache, n)
+                        rsloop_sslproto_buffer_updated_cached(py, &protocol, &ssl_cache, n)
                     {
                         return self.finish_close(py, Some(err.into_value(py).into_any()));
                     }
@@ -1377,11 +1480,14 @@ impl StreamCore {
 
     fn on_readable_protocol(&mut self, py: Python<'_>) -> PyResult<()> {
         let protocol = self.protocol.clone_ref(py);
+        let protocol = protocol.bind(py);
+        let eof_received = protocol.getattr("eof_received")?;
+        let data_received = protocol.getattr("data_received")?;
         loop {
             match recv_into(self.fd, &mut self.read_buffer) {
                 Ok(0) => {
                     self.remove_reader(py)?;
-                    let keep_open = protocol.bind(py).call_method0("eof_received")?;
+                    let keep_open = eof_received.call0()?;
                     if !keep_open.is_truthy()? {
                         self.finish_close(py, None)?;
                     }
@@ -1392,7 +1498,7 @@ impl StreamCore {
                         return Ok(());
                     }
                     let payload = PyBytes::new(py, &self.read_buffer[..n]);
-                    if let Err(err) = protocol.bind(py).call_method1("data_received", (payload,)) {
+                    if let Err(err) = data_received.call1((payload,)) {
                         return self.finish_close(py, Some(err.into_value(py).into_any()));
                     }
                     if self.closed || self.read_paused {
@@ -1473,12 +1579,16 @@ impl StreamCore {
             self.pending_write_bytes,
             self.write_queue.len(),
         );
+        if self.rustls_conn.is_some() {
+            return self.on_writable_rustls(py);
+        }
         self.write_waiting_for_writable = false;
         self.sync_interest(py)?;
         self.flush_write_phase(py)
     }
 
     pub(crate) fn flush_write_phase(&mut self, py: Python<'_>) -> PyResult<()> {
+
         let queued_before = self.pending_write_bytes;
         let mut phase_sent = 0usize;
         if trace_stream_enabled() {
@@ -1534,6 +1644,35 @@ impl StreamCore {
             }
             if self.closing {
                 self.finish_close(py, None)?;
+            }
+        }
+
+        // Speculative read: after a full write flush on a plain reader-backed
+        // stream, the peer may already have a response sitting in the kernel
+        // receive buffer.  One non-blocking recv here can deliver it without
+        // paying a full poll/select round trip.  Gated to non-SSL,
+        // non-closing, non-paused transports whose write queue just drained.
+        if !self.closing
+            && !self.closed
+            && !self.read_paused
+            && !self.buffered_protocol
+            && self.reader.is_some()
+            && self.reader_registered
+            && self.pending_write_bytes == 0
+        {
+            match recv_into(self.fd, &mut self.read_buffer) {
+                Ok(0) => {
+                    self.remove_reader(py)?;
+                    self.feed_eof_inner(py)?;
+                    if self.closing && self.pending_write_bytes == 0 {
+                        self.finish_close(py, None)?;
+                    }
+                }
+                Ok(n) => {
+                    self.record_profile_event("speculative_read", n, self.pending_write_bytes);
+                    self.feed_read_buffer_inner(py, n)?;
+                }
+                Err(_) => {}
             }
         }
 
@@ -2381,6 +2520,345 @@ impl StreamCore {
         }
         Ok(())
     }
+    // -----------------------------------------------------------------------
+    // Native rustls TLS data path
+    // -----------------------------------------------------------------------
+
+    fn on_readable_rustls(&mut self, py: Python<'_>) -> PyResult<()> {
+        if trace_stream_enabled() {
+            eprintln!("stream-transport on_readable_RUSTLS fd={}", self.fd);
+        }
+
+        // Phase 1: recv ciphertext into the rustls incoming buffer.
+        let buf_size = self.read_buffer.len();
+        let conn = self.rustls_conn.as_mut().expect("rustls_conn is Some");
+        let incoming = conn.incoming_mut();
+        let start = incoming.len();
+        incoming.resize(start + buf_size, 0);
+        let n = match recv_into(self.fd, &mut incoming[start..]) {
+            Ok(0) => {
+                incoming.truncate(start);
+                self.remove_reader(py)?;
+                self.feed_eof_inner(py)?;
+                if self.closing && self.pending_write_bytes == 0 {
+                    self.finish_close(py, None)?;
+                }
+                return Ok(());
+            }
+            Ok(n) => { incoming.truncate(start + n); n }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                incoming.truncate(start);
+                return Ok(());
+            }
+            Err(e) => {
+                incoming.truncate(start);
+                return self.finish_close(
+                    py,
+                    Some(PyRuntimeError::new_err(e.to_string()).into_value(py).into_any()),
+                );
+            }
+        };
+        self.record_profile_event("rustls_read", n, self.pending_write_bytes);
+
+        // Phase 2: decrypt.  Plaintext is appended directly to the reader
+        // bytearray when available, avoiding an intermediate Vec allocation
+        // and copy for the common (buffered reader) path.
+        let buf_ptr = self.buffer.as_ref().map(|b| b.as_ptr());
+        let mut plaintext_vec: Vec<u8> = Vec::new();
+        let plaintext_target = if buf_ptr.is_some() { &mut plaintext_vec } else { &mut plaintext_vec };
+        let (plain_len, needs_send) = {
+            let conn = self.rustls_conn.as_mut().unwrap();
+            match conn.process_incoming(plaintext_target) {
+                Ok(result) => result,
+                Err(e) => {
+                    return self.finish_close(
+                        py,
+                        Some(PyRuntimeError::new_err(format!("TLS error: {e}")).into_value(py).into_any()),
+                    );
+                }
+            }
+        };
+
+        // Phase 3: flush any outgoing TLS handshake/alert data.
+        if needs_send {
+            self.flush_rustls_outgoing(py)?;
+        }
+
+        let peer_closed = self.rustls_conn.as_ref().map_or(false, |c| c.peer_closed());
+
+        // Phase 4: deliver plaintext.
+        // For the reader path: append to bytearray, then INLINE resolve
+        // any pending readexactly/readuntil waiter (bypassing the completion
+        // queue entirely).  This saves ~2-3us per read vs the queue path.
+        if plain_len > 0 {
+            if let Some(buf_ptr) = buf_ptr {
+                append_to_bytearray(buf_ptr, &plaintext_vec)?;
+                let reader_opt = self.reader.as_ref().map(|r| r.clone_ref(py));
+                if let Some(reader_owned) = reader_opt {
+                    let reader = reader_owned.bind(py);
+                    if self.pending_read.is_some() {
+                        // Inline completion: resolve the waiter directly
+                        // instead of going through queue_completion →
+                        // drain_completion_queue → finish_result.
+                        self.try_finish_pending_read_inline(py, &reader)?;
+                    } else if current_exception(&reader)?.is_none() {
+                        // No pending readexactly/readuntil; wake the generic
+                        // waiter (e.g. reader.read() or readline()).
+                        wake_waiter(py, &reader)?;
+                    }
+                    pause_reader_if_needed(py, &reader, buf_ptr)?;
+                }
+            } else {
+                // Generic protocol path (no reader).
+                let payload = PyBytes::new(py, &plaintext_vec);
+                if let Err(e) = self.protocol.bind(py).call_method1("data_received", (payload,)) {
+                    return self.finish_close(py, Some(e.into_value(py).into_any()));
+                }
+            }
+        }
+
+        if peer_closed {
+            self.remove_reader(py)?;
+            self.feed_eof_inner(py)?;
+        }
+
+        // If the handshake just completed and there's queued plaintext to send,
+        // process it now.  Also resolve any pending drain futures if the queue
+        // is empty after this.
+        let handshake_done = self.rustls_conn.as_ref().map_or(false, |c| c.handshake_done());
+        if handshake_done && !self.write_queue.is_empty() {
+            let queued: Vec<PendingWrite> =
+                std::mem::take(&mut self.write_queue).into_iter().collect();
+            self.pending_write_bytes = 0;
+            for pending in queued {
+                let data: Vec<u8> = match pending.data {
+                    PendingWriteData::Owned(v) => v[pending.sent..].to_vec(),
+                    PendingWriteData::PyBytes(b) => b.bind(py).as_bytes()[pending.sent..].to_vec(),
+                };
+                if !data.is_empty() {
+                    self.write_rustls(py, &data)?;
+                }
+            }
+        }
+        // Resolve drains if everything is flushed.
+        if handshake_done
+            && self.write_queue.is_empty()
+            && !self.write_waiting_for_writable
+            && self.rustls_conn.as_ref().map_or(true, |c| c.outgoing().is_empty())
+        {
+            if !self.pending_drains.is_empty() {
+                self.queue_pending_drains(py, None)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Inline version of try_finish_pending_read for the rustls path.
+    /// Resolves the waiter directly, bypassing the completion queue.
+    fn try_finish_pending_read_inline(
+        &mut self,
+        py: Python<'_>,
+        reader: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        let Some(pending) = self.pending_read.as_ref() else {
+            return Ok(false);
+        };
+        let buffer = self.buffer.as_ref().expect("buffer").as_ptr();
+        let buffered = self.read_buffer_len(buffer)?;
+        match &pending.kind {
+            PendingReadKind::Exact(size) => {
+                let size = *size;
+                if buffered < size { return Ok(false); }
+                let pending = self.pending_read.take().unwrap();
+                let data = self.consume_read_buffer_exact(py, buffer, size)?;
+                reader.setattr("_waiter", py.None())?;
+                StreamWaiter::finish_result(&pending.waiter, py, data)?;
+                self.record_profile_event("read_inline", size, buffered);
+                Ok(true)
+            }
+            PendingReadKind::Until { separator, offset } => {
+                let found = find_subsequence_in_bytearray(
+                    buffer, separator, self.read_buffer_offset + *offset)?;
+                if let Some(index) = found {
+                    let sep_len = separator.len();
+                    let consumed = index.checked_sub(self.read_buffer_offset)
+                        .ok_or_else(|| PyRuntimeError::new_err("bad offset"))?;
+                    if consumed > self.limit {
+                        let exc = limit_overrun_error(py, consumed, true)?;
+                        let pending = self.pending_read.take().unwrap();
+                        reader.setattr("_waiter", py.None())?;
+                        StreamWaiter::finish_exception(&pending.waiter, py, exc)?;
+                        return Ok(true);
+                    }
+                    let size = consumed + sep_len;
+                    let pending = self.pending_read.take().unwrap();
+                    let data = self.consume_read_buffer_exact(py, buffer, size)?;
+                    reader.setattr("_waiter", py.None())?;
+                    StreamWaiter::finish_result(&pending.waiter, py, data)?;
+                    self.record_profile_event("read_inline", size, buffered);
+                    return Ok(true);
+                }
+                let next_offset = next_readuntil_offset(buffered, separator.len());
+                if next_offset <= self.limit {
+                    if let Some(p) = self.pending_read.as_mut() {
+                        if let PendingReadKind::Until { offset, .. } = &mut p.kind {
+                            *offset = next_offset;
+                        }
+                    }
+                    return Ok(false);
+                }
+                let pending = self.pending_read.take().unwrap();
+                let exc = limit_overrun_error(py, next_offset, false)?;
+                reader.setattr("_waiter", py.None())?;
+                StreamWaiter::finish_exception(&pending.waiter, py, exc)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Speculative read for rustls: after write flush, try a non-blocking recv
+    /// to process the next request without a poll round-trip.
+    fn try_speculative_read_rustls(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.closing || self.closed || self.read_paused || self.rustls_conn.is_none() {
+            return Ok(());
+        }
+        let buf_size = self.read_buffer.len();
+        let conn = self.rustls_conn.as_mut().unwrap();
+        let incoming = conn.incoming_mut();
+        let start = incoming.len();
+        incoming.resize(start + buf_size, 0);
+        match recv_into(self.fd, &mut incoming[start..]) {
+            Ok(n) if n > 0 => {
+                incoming.truncate(start + n);
+                self.record_profile_event("rustls_spec_read", n, 0);
+                let mut plaintext: Vec<u8> = Vec::new();
+                let (plain_len, needs_send) = {
+                    let conn = self.rustls_conn.as_mut().unwrap();
+                    match conn.process_incoming(&mut plaintext) {
+                        Ok(r) => r,
+                        Err(_) => return Ok(()),
+                    }
+                };
+                if needs_send { self.flush_rustls_outgoing(py)?; }
+                if plain_len > 0 {
+                    if let Some(buf) = self.buffer.as_ref() {
+                        let buf_ptr = buf.as_ptr();
+                        append_to_bytearray(buf_ptr, &plaintext)?;
+                        let reader_opt = self.reader.as_ref().map(|r| r.clone_ref(py));
+                        if let Some(ro) = reader_opt {
+                            let reader = ro.bind(py);
+                            if self.pending_read.is_some() {
+                                self.try_finish_pending_read_inline(py, reader)?;
+                            } else if current_exception(reader)?.is_none() {
+                                wake_waiter(py, reader)?;
+                            }
+                            pause_reader_if_needed(py, reader, buf_ptr)?;
+                        }
+                    }
+                }
+            }
+            _ => {
+                let conn = self.rustls_conn.as_mut().unwrap();
+                conn.incoming_mut().truncate(start);
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_rustls_outgoing(&mut self, py: Python<'_>) -> PyResult<()> {
+        let conn = match self.rustls_conn.as_mut() { Some(c) => c, None => return Ok(()) };
+        if conn.outgoing().is_empty() { return Ok(()); }
+        let mut sent_total = 0usize;
+        let outgoing_len = conn.outgoing().len();
+        loop {
+            if sent_total >= outgoing_len { break; }
+            match try_send_bytes(self.fd, &conn.outgoing()[sent_total..]) {
+                Ok(0) => break,
+                Ok(n) => sent_total += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    return self.finish_close(
+                        py,
+                        Some(PyRuntimeError::new_err(format!("TLS send: {e}")).into_value(py).into_any()),
+                    );
+                }
+            }
+        }
+        if sent_total > 0 {
+            self.rustls_conn.as_mut().unwrap().outgoing_mut().drain(..sent_total);
+        }
+        if !self.rustls_conn.as_ref().unwrap().outgoing().is_empty() {
+            self.write_waiting_for_writable = true;
+            self.sync_interest(py)?;
+        }
+        Ok(())
+    }
+
+    fn write_rustls(&mut self, py: Python<'_>, plaintext: &[u8]) -> PyResult<()> {
+        if plaintext.is_empty() { return Ok(()); }
+        if !self.rustls_conn.as_ref().map_or(false, |c| c.handshake_done()) {
+            self.write_queue.push_back(PendingWrite {
+                data: PendingWriteData::Owned(plaintext.to_vec()),
+                sent: 0,
+            });
+            self.pending_write_bytes += plaintext.len();
+            return Ok(());
+        }
+        let conn = self.rustls_conn.as_mut().unwrap();
+        match conn.encrypt_append(plaintext) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                self.write_queue.push_back(PendingWrite {
+                    data: PendingWriteData::Owned(plaintext.to_vec()),
+                    sent: 0,
+                });
+                self.pending_write_bytes += plaintext.len();
+                return Ok(());
+            }
+            Err(e) => return Err(PyRuntimeError::new_err(format!("TLS encrypt: {e}"))),
+        }
+        self.flush_rustls_outgoing(py)
+    }
+
+    fn on_writable_rustls(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.write_waiting_for_writable = false;
+        self.flush_rustls_outgoing(py)?;
+
+        if self.rustls_conn.as_ref().map_or(false, |c| c.handshake_done())
+            && !self.write_queue.is_empty()
+        {
+            let queued: Vec<PendingWrite> = std::mem::take(&mut self.write_queue).into_iter().collect();
+            self.pending_write_bytes = 0;
+            for pending in queued {
+                let data: Vec<u8> = match pending.data {
+                    PendingWriteData::Owned(v) => v[pending.sent..].to_vec(),
+                    PendingWriteData::PyBytes(b) => b.bind(py).as_bytes()[pending.sent..].to_vec(),
+                };
+                if !data.is_empty() {
+                    self.write_rustls(py, &data)?;
+                }
+            }
+        }
+
+        self.sync_interest(py)?;
+
+        if !self.write_waiting_for_writable
+            && self.rustls_conn.as_ref().map_or(true, |c| c.outgoing().is_empty())
+            && self.write_queue.is_empty()
+        {
+            self.maybe_resume_protocol(py)?;
+            if !self.pending_drains.is_empty() {
+                self.queue_pending_drains(py, None)?;
+            }
+            // Speculative read: the peer may have already sent data while
+            // we were flushing the write.  Try a non-blocking read to
+            // process it without waiting for the next poll cycle.
+            self.try_speculative_read_rustls(py)?;
+        }
+        Ok(())
+    }
+
 }
 
 fn trace_stream_enabled() -> bool {
@@ -2678,7 +3156,11 @@ unsafe extern "C" fn stream_transport_write_c(
         let transport = Bound::from_borrowed_ptr(py, slf).cast_into_unchecked::<StreamTransport>();
         let core = transport.borrow().core.clone();
         let mut transport_ref = core.borrow_mut();
-        if ffi::PyBytes_Check(arg) != 0 {
+        // PyBytes fast path: skip type dispatch for the common case.
+        // When a rustls connection is attached, we MUST go through
+        // StreamCore::write() to encrypt; otherwise call
+        // write_bytes_object_inner directly.
+        if ffi::PyBytes_Check(arg) != 0 && transport_ref.rustls_conn.is_none() {
             transport_ref.ensure_can_write()?;
             let data = Bound::<PyAny>::from_borrowed_ptr(py, arg).cast_into_unchecked::<PyBytes>();
             transport_ref.write_bytes_object_inner(py, &data)?;

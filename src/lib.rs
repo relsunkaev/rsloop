@@ -22,6 +22,8 @@ mod socket_state;
 mod stream_registry;
 #[cfg(unix)]
 mod stream_transport;
+#[cfg(unix)]
+mod tls;
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -47,6 +49,8 @@ use socket_state::SocketState;
 use stream_registry::StreamTransportRegistry;
 #[cfg(unix)]
 use stream_transport::StreamTransport;
+#[cfg(unix)]
+use tls::RsloopTLSContext;
 
 #[pymodule]
 fn _rsloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -87,5 +91,7 @@ fn _rsloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SocketState>()?;
     #[cfg(unix)]
     m.add_class::<StreamTransportRegistry>()?;
+    #[cfg(unix)]
+    m.add_class::<RsloopTLSContext>()?;
     Ok(())
 }

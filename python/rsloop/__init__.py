@@ -5,6 +5,11 @@ from typing import Any
 from ._rsloop import backend_name, run_in_tokio, sleep, wrap_future
 from .loop import RsloopEventLoop, RsloopEventLoopPolicy, install, new_event_loop
 
+try:
+    from ._rsloop import RsloopTLSContext
+except ImportError:
+    RsloopTLSContext = None  # type: ignore[assignment,misc]
+
 __all__ = [
     "backend_name",
     "RsloopEventLoop",
@@ -12,6 +17,7 @@ __all__ = [
     "install",
     "new_event_loop",
     "run",
+    "RsloopTLSContext",
     "run_in_tokio",
     "sleep",
     "wrap_future",

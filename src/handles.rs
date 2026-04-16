@@ -999,6 +999,11 @@ impl HandleArgs {
         args: *const *mut ffi::PyObject,
         arg_count: usize,
     ) -> PyResult<Self> {
+        if arg_count == 2 {
+            let arg0 = Bound::from_borrowed_ptr(py, *args.add(0)).unbind();
+            let arg1 = Bound::from_borrowed_ptr(py, *args.add(1)).unbind();
+            return Ok(Self::Two([arg0, arg1]));
+        }
         Ok(Self::Tuple(tuple_from_fastcall(py, args, arg_count)?))
     }
 

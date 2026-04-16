@@ -513,6 +513,12 @@ impl Scheduler {
         let mut stats = stats;
         let mut tick = TickSample::default();
         let mut generic_ready_handles = Vec::new();
+        let loop_obj_bound = loop_obj.bind(py);
+        let read_from_self_cb = if self_pipe_fd.is_some() {
+            Some(loop_obj_bound.getattr("_read_from_self")?.unbind())
+        } else {
+            None
+        };
         if let Some(native_api) = native_api {
             let native_api = native_api.bind(py);
             let mut fallback = native_api.borrow().drain_ready_fallback();
@@ -595,7 +601,9 @@ impl Scheduler {
                 for (fd, mask) in fd_events.iter().copied() {
                     tick.fd_events += 1;
                     if self_pipe_fd.is_some_and(|self_pipe_fd| fd == self_pipe_fd) {
-                        loop_obj.bind(py).call_method0("_read_from_self")?;
+                        if let Some(read_from_self) = read_from_self_cb.as_ref() {
+                            read_from_self.bind(py).call0()?;
+                        }
                         continue;
                     }
                     if stream_registry.dispatch_one(py, fd, mask)? {
@@ -627,7 +635,9 @@ impl Scheduler {
                 for (fd, mask) in fd_events.iter().copied() {
                     tick.fd_events += 1;
                     if self_pipe_fd.is_some_and(|self_pipe_fd| fd == self_pipe_fd) {
-                        loop_obj.bind(py).call_method0("_read_from_self")?;
+                        if let Some(read_from_self) = read_from_self_cb.as_ref() {
+                            read_from_self.bind(py).call0()?;
+                        }
                         continue;
                     }
                     if !socket_registry.dispatch_one(py, fd, mask)? {
@@ -647,22 +657,24 @@ impl Scheduler {
                     )?;
                 }
             } else {
-                let mut python_fd_events = Vec::new();
+                generic_fd_events.clear();
                 for (fd, mask) in fd_events.iter().copied() {
                     tick.fd_events += 1;
                     if self_pipe_fd.is_some_and(|self_pipe_fd| fd == self_pipe_fd) {
-                        loop_obj.bind(py).call_method0("_read_from_self")?;
+                        if let Some(read_from_self) = read_from_self_cb.as_ref() {
+                            read_from_self.bind(py).call0()?;
+                        }
                         continue;
                     }
                     tick.generic_fd_hits += 1;
-                    python_fd_events.push((fd, mask));
+                    generic_fd_events.push((fd, mask));
                 }
-                if !python_fd_events.is_empty() {
+                if !generic_fd_events.is_empty() {
                     collect_generic_fd_events(
                         py,
                         loop_obj,
                         fd_registry,
-                        &*python_fd_events,
+                        &*generic_fd_events,
                         &mut generic_ready_handles,
                     )?;
                 }
@@ -721,6 +733,7 @@ impl Scheduler {
             debug,
             slow_callback_duration,
             ready_batch,
+            stats.is_some(),
             &mut tick,
         )?;
         if let Some(stats) = stats.as_deref_mut() {
@@ -759,6 +772,7 @@ impl Scheduler {
                     debug,
                     slow_callback_duration,
                     ready_batch,
+                    stats.is_some(),
                     &mut tick,
                 )?;
                 if let Some(stats) = stats.as_deref_mut() {
@@ -846,6 +860,7 @@ impl Scheduler {
         debug: bool,
         slow_callback_duration: f64,
         ready_batch: &mut Vec<Py<PyAny>>,
+        collect_tick_breakdown: bool,
         tick: &mut TickSample,
     ) -> PyResult<()> {
         if self.ready_remote_len.load(AtomicOrdering::Acquire) == 0
@@ -872,17 +887,21 @@ impl Scheduler {
             self.ready_remote_len
                 .fetch_sub(drained_remote, AtomicOrdering::AcqRel);
         }
-        tick.ready_local_items += ready_local_items as u32;
-        tick.ready_remote_items += drained_remote as u32;
-        tick.ready_handles += (ready_local_items + drained_remote) as u32;
+        if collect_tick_breakdown {
+            tick.ready_local_items += ready_local_items as u32;
+            tick.ready_remote_items += drained_remote as u32;
+            tick.ready_handles += (ready_local_items + drained_remote) as u32;
+        }
 
         for handle in ready_batch.drain(..) {
-            match native_handle_kind(py, &handle) {
-                Some(NativeHandleKind::ZeroArg) => tick.ready_zero_arg += 1,
-                Some(NativeHandleKind::OneArg) => tick.ready_one_arg += 1,
-                Some(NativeHandleKind::Handle) => tick.ready_handle_native += 1,
-                Some(NativeHandleKind::Future) => tick.ready_future_native += 1,
-                None => tick.ready_python += 1,
+            if collect_tick_breakdown {
+                match native_handle_kind(py, &handle) {
+                    Some(NativeHandleKind::ZeroArg) => tick.ready_zero_arg += 1,
+                    Some(NativeHandleKind::OneArg) => tick.ready_one_arg += 1,
+                    Some(NativeHandleKind::Handle) => tick.ready_handle_native += 1,
+                    Some(NativeHandleKind::Future) => tick.ready_future_native += 1,
+                    None => tick.ready_python += 1,
+                }
             }
             run_ready_handle(py, loop_obj, &handle, debug, slow_callback_duration)?;
         }

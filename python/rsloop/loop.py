@@ -14,7 +14,6 @@ import threading
 import sys
 import ssl
 from asyncio import base_events as _base_events
-from asyncio import base_subprocess as _base_subprocess
 from asyncio import constants as _constants
 from asyncio import coroutines as _coroutines
 from asyncio import exceptions as _exceptions
@@ -30,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import _rsloop
+from .pipe_transport import RsloopReadPipeTransport, RsloopWritePipeTransport
 from .sslproto import RsloopSSLProtocol
 
 
@@ -58,7 +58,13 @@ class RsloopStreamWriter:
         "sendfile_static",
     )
 
-    def __init__(self, transport: Any, protocol: Any, reader: Any, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(
+        self,
+        transport: Any,
+        protocol: Any,
+        reader: Any,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
         self._transport = transport
         self._protocol = protocol
         self._reader = reader
@@ -67,11 +73,17 @@ class RsloopStreamWriter:
         bind_write = getattr(transport, "bind_write", None)
         self.write = bind_write() if bind_write is not None else self._write
         bind_drain = getattr(transport, "bind_drain", None)
-        self.drain = bind_drain(self._drain_fallback) if bind_drain is not None else self._drain_fallback
+        self.drain = (
+            bind_drain(self._drain_fallback)
+            if bind_drain is not None
+            else self._drain_fallback
+        )
         bind_close = getattr(transport, "bind_close", None)
         self.close = bind_close() if bind_close is not None else self._close
         bind_wait_closed = getattr(transport, "bind_wait_closed", None)
-        self.wait_closed = bind_wait_closed() if bind_wait_closed is not None else self._wait_closed
+        self.wait_closed = (
+            bind_wait_closed() if bind_wait_closed is not None else self._wait_closed
+        )
         self.sendfile_static = self._sendfile_static_fallback
 
     def __repr__(self) -> str:
@@ -256,9 +268,9 @@ class _SocketState:
         self._loop = loop
         self._sock = sock
         self.fd = sock.fileno()
-        self._read_ops: collections.deque[_RecvRequest | _RecvIntoRequest | _AcceptRequest] = (
-            collections.deque()
-        )
+        self._read_ops: collections.deque[
+            _RecvRequest | _RecvIntoRequest | _AcceptRequest
+        ] = collections.deque()
         self._write_ops: collections.deque[_SendRequest | _ConnectRequest] = (
             collections.deque()
         )
@@ -282,9 +294,7 @@ class _SocketState:
         future.add_done_callback(self._wake_reader)
         self._ensure_reader()
 
-    def enqueue_accept(
-        self, future: asyncio.Future[tuple[socket.socket, Any]]
-    ) -> None:
+    def enqueue_accept(self, future: asyncio.Future[tuple[socket.socket, Any]]) -> None:
         self._read_ops.append(_AcceptRequest(future))
         future.add_done_callback(self._wake_reader)
         self._ensure_reader()
@@ -498,13 +508,13 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         self.call_soon = self._bind_native_callable(
             "bind_call_soon", self._compat_call_soon
         )
-        self._call_soon = getattr(self._native_api, "_call_soon", self._compat__call_soon)
+        self._call_soon = getattr(
+            self._native_api, "_call_soon", self._compat__call_soon
+        )
         self.call_soon_threadsafe = self._bind_native_callable(
             "bind_call_soon_threadsafe", self._compat_call_soon_threadsafe
         )
-        self.call_at = self._bind_native_callable(
-            "bind_call_at", self._compat_call_at
-        )
+        self.call_at = self._bind_native_callable("bind_call_at", self._compat_call_at)
         self.call_later = self._bind_native_callable(
             "bind_call_later", self._compat_call_later
         )
@@ -607,7 +617,9 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
             self._csock.send(b"\0")
         except OSError:
             if self._debug:
-                logger.debug("Fail to write a null byte into the self-pipe", exc_info=True)
+                logger.debug(
+                    "Fail to write a null byte into the self-pipe", exc_info=True
+                )
 
     def add_reader(self, fd: Any, callback: Any, *args: Any) -> None:
         self._ensure_fd_no_transport(fd)
@@ -647,12 +659,16 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         return self._remove_writer(fd)
 
     def add_signal_handler(self, sig: int, callback: Any, *args: Any) -> None:
-        if _coroutines.iscoroutine(callback) or _coroutines._iscoroutinefunction(callback):
+        if _coroutines.iscoroutine(callback) or _coroutines._iscoroutinefunction(
+            callback
+        ):
             raise TypeError("coroutines cannot be used with add_signal_handler()")
         self._check_signal(sig)
         self._check_closed()
         try:
-            signal.set_wakeup_fd(self._csock.fileno() if self._csock is not None else -1)
+            signal.set_wakeup_fd(
+                self._csock.fileno() if self._csock is not None else -1
+            )
         except (ValueError, OSError) as exc:
             raise RuntimeError(str(exc))
 
@@ -1041,7 +1057,9 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         finally:
             future = None
 
-    async def sock_recvfrom(self, sock: socket.socket, bufsize: int) -> tuple[bytes, Any]:
+    async def sock_recvfrom(
+        self, sock: socket.socket, bufsize: int
+    ) -> tuple[bytes, Any]:
         _base_events._check_ssl_socket(sock)
         if self._debug and sock.gettimeout() != 0:
             raise ValueError("the socket must be non-blocking")
@@ -1073,7 +1091,9 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         future = self.create_future()
         fd = sock.fileno()
         self._ensure_fd_no_transport(fd)
-        handle = self._add_reader(fd, self._sock_recvfrom_into, future, sock, buf, nbytes)
+        handle = self._add_reader(
+            fd, self._sock_recvfrom_into, future, sock, buf, nbytes
+        )
         future.add_done_callback(
             functools.partial(self._sock_read_done, fd, handle=handle)
         )
@@ -1162,7 +1182,9 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         else:
             fut.set_result(n)
 
-    def _sock_add_cancellation_callback(self, fut: asyncio.Future[Any], sock: socket.socket) -> None:
+    def _sock_add_cancellation_callback(
+        self, fut: asyncio.Future[Any], sock: socket.socket
+    ) -> None:
         def cb(done: asyncio.Future[Any]) -> None:
             if done.cancelled():
                 fd = sock.fileno()
@@ -1171,7 +1193,9 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
 
         fut.add_done_callback(cb)
 
-    def _sock_sendfile_update_filepos(self, fileno: int, offset: int, total_sent: int) -> None:
+    def _sock_sendfile_update_filepos(
+        self, fileno: int, offset: int, total_sent: int
+    ) -> None:
         if total_sent > 0:
             os.lseek(fileno, offset, os.SEEK_SET)
 
@@ -1265,7 +1289,9 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         try:
             os.sendfile
         except AttributeError:
-            raise _exceptions.SendfileNotAvailableError("os.sendfile() is not available")
+            raise _exceptions.SendfileNotAvailableError(
+                "os.sendfile() is not available"
+            )
         try:
             fileno = file.fileno()
         except (AttributeError, OSError):
@@ -1278,7 +1304,9 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         if not blocksize:
             return 0
         fut = self.create_future()
-        self._sock_sendfile_native_impl(fut, None, sock, fileno, offset, count, blocksize, 0)
+        self._sock_sendfile_native_impl(
+            fut, None, sock, fileno, offset, count, blocksize, 0
+        )
         return await fut
 
     def _make_socket_transport(
@@ -1362,7 +1390,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         waiter: asyncio.Future[Any] | None = None,
         extra: dict[str, Any] | None = None,
     ) -> asyncio.Transport:
-        return _unix_events._UnixReadPipeTransport(self, pipe, protocol, waiter, extra)
+        return RsloopReadPipeTransport(self, pipe, protocol, waiter, extra)
 
     def _make_write_pipe_transport(
         self,
@@ -1371,7 +1399,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         waiter: asyncio.Future[Any] | None = None,
         extra: dict[str, Any] | None = None,
     ) -> asyncio.Transport:
-        return _unix_events._UnixWritePipeTransport(self, pipe, protocol, waiter, extra)
+        return RsloopWritePipeTransport(self, pipe, protocol, waiter, extra)
 
     async def _make_subprocess_transport(
         self,
@@ -1414,9 +1442,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
             raise
         return transport
 
-    def _child_watcher_callback(
-        self, pid: int, returncode: int, transp: Any
-    ) -> None:
+    def _child_watcher_callback(self, pid: int, returncode: int, transp: Any) -> None:
         self.call_soon_threadsafe(transp._process_exited, returncode)
 
     def _make_ssl_transport(
@@ -1435,6 +1461,27 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
     ) -> asyncio.Transport:
         self._ensure_fd_no_transport(rawsock)
         self._take_fd_for_transport(rawsock)
+
+        # --- Native rustls path ---
+        # When sslcontext is a RsloopTLSContext we bypass stdlib SSL entirely.
+        RsloopTLSContext = getattr(_rsloop, "RsloopTLSContext", None)
+        stream_transport_type = getattr(_rsloop, "StreamTransport", None)
+        if (
+            RsloopTLSContext is not None
+            and isinstance(sslcontext, RsloopTLSContext)
+            and stream_transport_type is not None
+        ):
+            return self._make_rustls_transport(
+                rawsock,
+                protocol,
+                sslcontext,
+                waiter,
+                server_side=server_side,
+                server_hostname=server_hostname,
+                extra=extra,
+            )
+
+        # --- stdlib SSL path (existing) ---
         ssl_protocol = RsloopSSLProtocol(
             self,
             protocol,
@@ -1445,7 +1492,6 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
             ssl_handshake_timeout=ssl_handshake_timeout,
             ssl_shutdown_timeout=ssl_shutdown_timeout,
         )
-        stream_transport_type = getattr(_rsloop, "StreamTransport", None)
         if stream_transport_type is not None:
             extra = {} if extra is None else dict(extra)
             low_level_transport = stream_transport_type(
@@ -1467,6 +1513,62 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
                 self, rawsock, ssl_protocol, None, extra, server
             )
         return ssl_protocol._app_transport
+
+    def _make_rustls_transport(
+        self,
+        rawsock: socket.socket,
+        protocol: asyncio.Protocol,
+        tls_ctx: Any,
+        waiter: asyncio.Future[Any] | None,
+        *,
+        server_side: bool = False,
+        server_hostname: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> asyncio.Transport:
+        """Set up a StreamTransport driven by the native rustls TLS path.
+
+        Called when `sslcontext` is a `RsloopTLSContext`.  Builds a plain
+        `StreamTransport`, attaches the rustls connection via
+        `activate_with_rustls`, then calls `protocol.connection_made()` to
+        complete setup and resolve `waiter`.
+
+        Supports both `StreamReaderProtocol` (stream helper) and raw
+        `asyncio.Protocol` users.
+        """
+        extra = {} if extra is None else dict(extra)
+        sni = server_hostname or ""
+
+        # Extract the StreamReader if the protocol is StreamReaderProtocol.
+        # This is the reader the user's handle(reader, writer) callback will use.
+        reader = getattr(protocol, "_stream_reader", None)
+
+        low_level_transport = _rsloop.StreamTransport(
+            rawsock,
+            protocol,
+            self,
+            self._poller,
+            self._stream_registry,
+            self._transports,
+            extra,
+            reader,  # None for raw Protocol users
+            65536,
+        )
+
+        # Attach rustls and drive connection_made through activate_with_rustls.
+        # For raw protocols (no reader), activate_with_rustls still sets up the
+        # rustls connection; protocol.data_received() delivers plaintext.
+        if reader is not None:
+            low_level_transport.activate_with_rustls(tls_ctx, sni, reader, protocol)
+        else:
+            # Generic protocol path: attach rustls then call connection_made.
+            low_level_transport.activate_with_rustls_generic(tls_ctx, sni, protocol)
+
+        # Resolve the waiter that _accept_connection2 / _create_connection_transport
+        # is awaiting.  connection_made was already called inside activate_with_rustls.
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
+
+        return low_level_transport
 
     async def _create_connection_transport(
         self,
@@ -1584,7 +1686,11 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         if not isinstance(exc, OSError):
             raise exc
         err_no = getattr(exc, "errno", None)
-        if err_no == errno.EBADF or sock.fileno() < 0 or "Bad file descriptor" in str(exc):
+        if (
+            err_no == errno.EBADF
+            or sock.fileno() < 0
+            or "Bad file descriptor" in str(exc)
+        ):
             return
         if err_no in (errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM):
             self.call_exception_handler(
@@ -1746,7 +1852,10 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         if completion_port is not None:
             self._poller.set_interest(completion_port.fileno(), False, False)
             completion_port.close()
-        if getattr(self, "_ssock", None) is not None or getattr(self, "_csock", None) is not None:
+        if (
+            getattr(self, "_ssock", None) is not None
+            or getattr(self, "_csock", None) is not None
+        ):
             self._close_self_pipe()
         if self._signal_handlers:
             for sig in list(self._signal_handlers):

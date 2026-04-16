@@ -419,9 +419,7 @@ def enable_abortive_close(writer: asyncio.StreamWriter) -> None:
         return
 
 
-async def close_writer(
-    writer: asyncio.StreamWriter, *, abortive: bool = False
-) -> None:
+async def close_writer(writer: asyncio.StreamWriter, *, abortive: bool = False) -> None:
     if abortive:
         enable_abortive_close(writer)
     writer.close()
@@ -1047,11 +1045,15 @@ async def bench_tcp_rpc_asymmetric_hugereq_smallresp(count: int) -> None:
 
 
 async def bench_tcp_upload_parallel(count: int) -> None:
-    await tcp_stream_rpc_parallel(count, clients=16, request_size=16 * 1024, response_size=1)
+    await tcp_stream_rpc_parallel(
+        count, clients=16, request_size=16 * 1024, response_size=1
+    )
 
 
 async def bench_tcp_download_parallel(count: int) -> None:
-    await tcp_stream_rpc_parallel(count, clients=16, request_size=1, response_size=16 * 1024)
+    await tcp_stream_rpc_parallel(
+        count, clients=16, request_size=1, response_size=16 * 1024
+    )
 
 
 async def bench_tcp_rpc_pipeline_4k_parallel(count: int) -> None:
@@ -1069,7 +1071,9 @@ async def bench_tcp_echo_parallel_128(count: int) -> None:
 
 
 async def bench_tcp_rpc_pipeline_deep(count: int) -> None:
-    await tcp_stream_rpc_pipeline(count, request_size=64, response_size=256, pipeline=64)
+    await tcp_stream_rpc_pipeline(
+        count, request_size=64, response_size=256, pipeline=64
+    )
 
 
 async def bench_tcp_rpc_pipeline_unbalanced(count: int) -> None:
@@ -1088,7 +1092,9 @@ async def bench_tcp_stream_half_close(count: int) -> None:
 
 
 async def bench_tcp_echo_mixed_parallel(count: int) -> None:
-    await tcp_stream_echo_mixed_parallel(count, clients=16, payload_sizes=(64, 256, 1024, 4096))
+    await tcp_stream_echo_mixed_parallel(
+        count, clients=16, payload_sizes=(64, 256, 1024, 4096)
+    )
 
 
 async def bench_tcp_bulk(count: int) -> None:
@@ -1225,7 +1231,9 @@ async def bench_tcp_accept_burst(count: int) -> None:
 async def bench_tcp_churn_small_io(count: int) -> None:
     payload = b"x"
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         try:
             data = await reader.readexactly(1)
             if data != payload:
@@ -1289,7 +1297,9 @@ async def bench_tcp_idle_fanout_large(count: int) -> None:
 async def tcp_stream_echo(count: int, payload_size: int) -> None:
     payload = b"x" * payload_size
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         label_stream_endpoint(reader, writer, "server")
         try:
             while True:
@@ -1399,7 +1409,9 @@ async def tcp_stream_echo_fragmented(
         for offset in range(0, payload_size, fragment_size)
     ]
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         label_stream_endpoint(reader, writer, "server")
         try:
             while True:
@@ -1440,7 +1452,9 @@ async def tcp_stream_echo_burst_no_drain(
     payload = b"x" * payload_size
     burst = max(1, burst)
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         label_stream_endpoint(reader, writer, "server")
         pending = 0
         try:
@@ -1491,7 +1505,9 @@ async def tcp_stream_echo_backpressured(
 ) -> None:
     payload = b"x" * payload_size
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         label_stream_endpoint(reader, writer, "server")
         transport = writer.transport
         seen = 0
@@ -1534,7 +1550,9 @@ async def tcp_stream_echo_parallel(count: int, clients: int, payload_size: int) 
     payload = b"x" * payload_size
     per_client_counts = split_evenly(count, clients)
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         label_stream_endpoint(reader, writer, "server")
         try:
             while True:
@@ -1575,7 +1593,9 @@ async def tcp_stream_rpc(count: int, request_size: int, response_size: int) -> N
     request = b"r" * request_size
     response = b"s" * response_size
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         label_stream_endpoint(reader, writer, "server")
         try:
             while True:
@@ -1619,7 +1639,9 @@ async def tcp_stream_rpc_parallel(
     response = b"s" * response_size
     per_client_counts = split_evenly(count, clients)
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         label_stream_endpoint(reader, writer, "server")
         try:
             while True:
@@ -1668,7 +1690,9 @@ async def tcp_stream_rpc_pipeline(
     response = b"s" * response_size
     pipeline = max(1, pipeline)
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         label_stream_endpoint(reader, writer, "server")
         try:
             while True:
@@ -1718,7 +1742,9 @@ async def tcp_stream_rpc_pipeline_parallel(
     per_client_counts = split_evenly(count, clients)
     pipeline = max(1, pipeline)
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         label_stream_endpoint(reader, writer, "server")
         try:
             while True:
@@ -1775,7 +1801,9 @@ async def tcp_stream_rpc_pipeline_unbalanced(
     weights = [8] * heavy_clients + [1] * light_clients
     per_client_counts = split_weighted(count, weights)
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         label_stream_endpoint(reader, writer, "server")
         try:
             while True:
@@ -1789,7 +1817,9 @@ async def tcp_stream_rpc_pipeline_unbalanced(
             writer.close()
             await writer.wait_closed()
 
-    server = await asyncio.start_server(handle, "127.0.0.1", 0, backlog=max(128, len(weights)))
+    server = await asyncio.start_server(
+        handle, "127.0.0.1", 0, backlog=max(128, len(weights))
+    )
     host, port = server.sockets[0].getsockname()[:2]
 
     async def client(iterations: int) -> None:
@@ -1824,9 +1854,13 @@ async def tcp_stream_echo_mixed_parallel(
     payload_sizes: tuple[int, ...],
 ) -> None:
     per_client_counts = split_evenly(count, clients)
-    payloads = [bytes([65 + index % 26]) * size for index, size in enumerate(payload_sizes)]
+    payloads = [
+        bytes([65 + index % 26]) * size for index, size in enumerate(payload_sizes)
+    ]
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         label_stream_endpoint(reader, writer, "server")
         try:
             index = 0
@@ -1874,7 +1908,9 @@ async def tcp_stream_half_close(count: int, payload_size: int) -> None:
     expected = count * payload_size
     flush_every = 16
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         total = 0
         try:
             while True:
@@ -2196,13 +2232,20 @@ async def write_fixed_body(
             await writer.drain()
 
 
-_TLS_CONTEXTS: tuple[ssl.SSLContext, ssl.SSLContext] | None = None
+_TLS_CONTEXTS: dict[bool, tuple[Any, Any]] = {}
 
 
-def tls_contexts() -> tuple[ssl.SSLContext, ssl.SSLContext]:
+def tls_contexts(*, native_rsloop: bool = True) -> tuple[Any, Any]:
+    """Return (server_context, client_context) for TLS benchmarks.
+
+    When running under rsloop, returns ``RsloopTLSContext`` instances backed
+    by the native rustls engine.  For asyncio and uvloop, returns standard
+    ``ssl.SSLContext`` objects.
+    """
     global _TLS_CONTEXTS
-    if _TLS_CONTEXTS is not None:
-        return _TLS_CONTEXTS
+    cached = _TLS_CONTEXTS.get(native_rsloop)
+    if cached is not None:
+        return cached
 
     tempdir = Path(tempfile.mkdtemp(prefix="rsloop-bench-tls-"))
     certfile = tempdir / "cert.pem"
@@ -2231,13 +2274,24 @@ def tls_contexts() -> tuple[ssl.SSLContext, ssl.SSLContext]:
     if completed.returncode != 0:
         raise RuntimeError("failed to generate TLS test certificate")
 
+    # For rsloop, use the native rustls TLS engine.
+    if native_rsloop and os.environ.get("RSLOOP_BENCH_LOOP") == "rsloop":
+        RsloopTLSContext = getattr(rsloop, "RsloopTLSContext", None)
+        if RsloopTLSContext is not None:
+            server_context = RsloopTLSContext.server(
+                certfile.read_bytes(), keyfile.read_bytes()
+            )
+            client_context = RsloopTLSContext.client(verify=False)
+            _TLS_CONTEXTS[native_rsloop] = (server_context, client_context)
+            return _TLS_CONTEXTS[native_rsloop]
+
     server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     server_context.load_cert_chain(certfile=str(certfile), keyfile=str(keyfile))
     client_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
     client_context.check_hostname = False
     client_context.verify_mode = ssl.CERT_NONE
-    _TLS_CONTEXTS = (server_context, client_context)
-    return _TLS_CONTEXTS
+    _TLS_CONTEXTS[native_rsloop] = (server_context, client_context)
+    return _TLS_CONTEXTS[native_rsloop]
 
 
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -2333,7 +2387,9 @@ async def http1_roundtrip(
     )
     per_client_counts = split_evenly(count, clients)
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         label_stream_endpoint(reader, writer, "server")
         try:
             if close_each_request:
@@ -2422,7 +2478,9 @@ async def http1_roundtrip(
     )
     host, port = server.sockets[0].getsockname()[:2]
 
-    async def open_client_connection() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    async def open_client_connection() -> tuple[
+        asyncio.StreamReader, asyncio.StreamWriter
+    ]:
         while True:
             try:
                 with app_phase_scope("http.client.connect"):
@@ -2526,7 +2584,9 @@ async def http1_roundtrip(
         if clients == 1:
             await client(count)
         else:
-            await asyncio.gather(*(client(iterations) for iterations in per_client_counts))
+            await asyncio.gather(
+                *(client(iterations) for iterations in per_client_counts)
+            )
     finally:
         server.close()
         await server.wait_closed()
@@ -2542,7 +2602,9 @@ async def websocket_echo_roundtrip(
     payload = b"x" * payload_size
     per_client_counts = split_evenly(count, clients)
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         label_stream_endpoint(reader, writer, "server")
         try:
             headers, request_path = await read_http_request_headers(reader)
@@ -2558,7 +2620,9 @@ async def websocket_echo_roundtrip(
             while True:
                 frame = await read_websocket_frame(reader)
                 if frame != payload:
-                    raise RuntimeError(f"unexpected websocket payload size={len(frame)}")
+                    raise RuntimeError(
+                        f"unexpected websocket payload size={len(frame)}"
+                    )
                 writer.write(encode_websocket_frame(frame, masked=False))
                 await writer.drain()
         except asyncio.IncompleteReadError:
@@ -2586,7 +2650,9 @@ async def websocket_echo_roundtrip(
                 await writer.drain()
                 echoed = await read_websocket_frame(reader)
                 if echoed != payload:
-                    raise RuntimeError(f"unexpected websocket payload size={len(echoed)}")
+                    raise RuntimeError(
+                        f"unexpected websocket payload size={len(echoed)}"
+                    )
         finally:
             writer.close()
             await writer.wait_closed()
@@ -2612,7 +2678,9 @@ async def websocket_broadcast(
     done = asyncio.get_running_loop().create_future()
     connected = 0
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         nonlocal connected
         label_stream_endpoint(reader, writer, "server")
         try:
@@ -2639,7 +2707,9 @@ async def websocket_broadcast(
                 for _ in range(count):
                     frame = await read_websocket_frame(reader)
                     if frame != payload:
-                        raise RuntimeError(f"unexpected websocket payload size={len(frame)}")
+                        raise RuntimeError(
+                            f"unexpected websocket payload size={len(frame)}"
+                        )
                     encoded = encode_websocket_frame(frame, masked=False)
                     for subscriber in subscribers:
                         subscriber.write(encoded)
@@ -2672,7 +2742,9 @@ async def websocket_broadcast(
             for _ in range(count):
                 frame = await read_websocket_frame(reader)
                 if frame != payload:
-                    raise RuntimeError(f"unexpected websocket payload size={len(frame)}")
+                    raise RuntimeError(
+                        f"unexpected websocket payload size={len(frame)}"
+                    )
         finally:
             writer.close()
             await writer.wait_closed()
@@ -2727,11 +2799,15 @@ async def framed_rpc_roundtrip(
         body = await reader.readexactly(size)
         return body
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         label_stream_endpoint(reader, writer, "server")
         try:
             while True:
-                with app_phase_scope("grpc.server.read_message", payload_bytes=request_size):
+                with app_phase_scope(
+                    "grpc.server.read_message", payload_bytes=request_size
+                ):
                     body = await read_message(reader)
                 if body != request:
                     raise RuntimeError(f"unexpected framed body size={len(body)}")
@@ -2760,7 +2836,9 @@ async def framed_rpc_roundtrip(
                 ):
                     writer.write(encode_message(request))
                     await writer.drain()
-                with app_phase_scope("grpc.client.read_message", payload_bytes=response_size):
+                with app_phase_scope(
+                    "grpc.client.read_message", payload_bytes=response_size
+                ):
                     body = await read_message(reader)
                 if body != response:
                     raise RuntimeError(f"unexpected framed body size={len(body)}")
@@ -2963,7 +3041,9 @@ async def bench_uds_rpc_parallel(count: int) -> None:
         async def handle(conn: socket.socket, iterations: int) -> None:
             try:
                 for _ in range(iterations):
-                    data = await recv_exact(asyncio.get_running_loop(), conn, len(payload))
+                    data = await recv_exact(
+                        asyncio.get_running_loop(), conn, len(payload)
+                    )
                     if data != payload:
                         raise RuntimeError(f"unexpected payload size={len(data)}")
                     await asyncio.get_running_loop().sock_sendall(conn, data)
@@ -2983,7 +3063,9 @@ async def bench_uds_rpc_parallel(count: int) -> None:
                 await asyncio.get_running_loop().sock_connect(sock, str(path))
                 for _ in range(iterations):
                     await asyncio.get_running_loop().sock_sendall(sock, payload)
-                    data = await recv_exact(asyncio.get_running_loop(), sock, len(payload))
+                    data = await recv_exact(
+                        asyncio.get_running_loop(), sock, len(payload)
+                    )
                     if data != payload:
                         raise RuntimeError(f"unexpected payload size={len(data)}")
             finally:
@@ -2991,7 +3073,9 @@ async def bench_uds_rpc_parallel(count: int) -> None:
 
         accept_task = asyncio.create_task(acceptor())
         try:
-            await asyncio.gather(*(client(iterations) for iterations in per_client_counts))
+            await asyncio.gather(
+                *(client(iterations) for iterations in per_client_counts)
+            )
             await accept_task
             if server_tasks:
                 await asyncio.gather(*server_tasks)
@@ -3092,7 +3176,9 @@ async def bench_tls_handshake_parallel(count: int) -> None:
     accepted = 0
     done = asyncio.get_running_loop().create_future()
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         nonlocal accepted
         label_stream_endpoint(reader, writer, "server")
         accepted += 1
@@ -3130,7 +3216,9 @@ async def bench_tls_handshake_parallel(count: int) -> None:
     try:
         batch_size = 8
         for start in range(0, count, batch_size):
-            await asyncio.gather(*(client() for _ in range(min(batch_size, count - start))))
+            await asyncio.gather(
+                *(client() for _ in range(min(batch_size, count - start)))
+            )
             await asyncio.sleep(0)
         await done
     finally:
@@ -3354,7 +3442,9 @@ async def bench_pipe_read(count: int) -> None:
                 write_file.write(payload)
 
     writer_task = asyncio.create_task(asyncio.to_thread(writer))
-    transport, _protocol = await loop.connect_read_pipe(lambda: ReaderProtocol(), read_file)
+    transport, _protocol = await loop.connect_read_pipe(
+        lambda: ReaderProtocol(), read_file
+    )
     try:
         await done
     finally:
@@ -3456,7 +3546,9 @@ async def bench_signal_handler_churn(count: int) -> None:
 
 
 async def bench_start_tls_upgrade(count: int) -> None:
-    server_context, client_context = tls_contexts()
+    # start_tls() still routes through the loop-level stdlib upgrade path,
+    # which expects ssl.SSLContext rather than RsloopTLSContext.
+    server_context, client_context = tls_contexts(native_rsloop=False)
 
     async def handle(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -3552,7 +3644,9 @@ async def bench_sock_sendfile(count: int) -> None:
                         break
                     received.extend(chunk)
                 if bytes(received) != expected:
-                    raise RuntimeError(f"unexpected sendfile payload size={len(received)}")
+                    raise RuntimeError(
+                        f"unexpected sendfile payload size={len(received)}"
+                    )
                 writer.close()
                 await writer.wait_closed()
             await server_task
@@ -4281,6 +4375,7 @@ def run_once_isolated(
             "--json",
         ]
         env = os.environ.copy()
+        env["RSLOOP_BENCH_LOOP"] = loop_name
         if loop_name == "rsloop" and profile_runtime:
             env["RSLOOP_PROFILE_SCHED_JSON"] = "1"
             env["RSLOOP_PROFILE_ONEARG_JSON"] = "1"
@@ -4352,7 +4447,9 @@ def run_benchmark_group(
     child_retries: int,
 ) -> tuple[list[BenchResult], list[dict[str, Any]] | None]:
     sample_map: dict[str, list[float]] = {loop_name: [] for loop_name in loops}
-    profile_map: dict[str, list[dict[str, Any]]] = {loop_name: [] for loop_name in loops}
+    profile_map: dict[str, list[dict[str, Any]]] = {
+        loop_name: [] for loop_name in loops
+    }
     round_records: list[dict[str, Any]] = []
 
     if interleave_loops and len(loops) > 1:
@@ -4534,8 +4631,12 @@ def compute_paired_comparisons(
                     "loop": loop_name,
                     "baseline": baseline,
                     "ratio_to_baseline": result.median / baseline_result.median,
-                    "paired_ratio_median": statistics.median(ratios) if ratios else None,
-                    "paired_ratio_iqr": interquartile_range(ratios) if len(ratios) >= 2 else 0.0,
+                    "paired_ratio_median": statistics.median(ratios)
+                    if ratios
+                    else None,
+                    "paired_ratio_iqr": interquartile_range(ratios)
+                    if len(ratios) >= 2
+                    else 0.0,
                     "paired_rounds": len(ratios),
                     "paired_wins": wins if loop_name != baseline else len(ratios),
                 }
@@ -4638,7 +4739,9 @@ def result_payload(
         "baseline": baseline,
         "results": payload_results,
         "rounds": rounds_by_benchmark,
-        "comparisons": compute_paired_comparisons(results, baseline, rounds_by_benchmark),
+        "comparisons": compute_paired_comparisons(
+            results, baseline, rounds_by_benchmark
+        ),
     }
 
 
@@ -4652,13 +4755,21 @@ def write_output(payload: dict[str, Any], output: str | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--loop", choices=["asyncio", "rsloop", "uvloop", "all"], default="all")
-    parser.add_argument("--benchmark", choices=[*BENCHMARKS.keys(), "all"], default="all")
-    parser.add_argument("--profile", choices=sorted(PROFILE_BENCHMARKS), default="default")
+    parser.add_argument(
+        "--loop", choices=["asyncio", "rsloop", "uvloop", "all"], default="all"
+    )
+    parser.add_argument(
+        "--benchmark", choices=[*BENCHMARKS.keys(), "all"], default="all"
+    )
+    parser.add_argument(
+        "--profile", choices=sorted(PROFILE_BENCHMARKS), default="default"
+    )
     parser.add_argument("--iterations", type=int, default=None)
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--warmups", type=int, default=2)
-    parser.add_argument("--baseline", choices=["asyncio", "uvloop", "rsloop"], default="uvloop")
+    parser.add_argument(
+        "--baseline", choices=["asyncio", "uvloop", "rsloop"], default="uvloop"
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--list", action="store_true")
@@ -4739,13 +4850,17 @@ def main() -> None:
     isolate_process = not args.no_isolate_process and not args.child_run
     interleave_loops = not args.no_interleave_loops and not args.child_run
     if (
-        args.profile_runtime
-        or args.profile_stream
-        or profile_python_streams
-        or profile_sslproto
-        or profile_python_cpu
-        or profile_app_phases
-    ) and not isolate_process and not args.child_run:
+        (
+            args.profile_runtime
+            or args.profile_stream
+            or profile_python_streams
+            or profile_sslproto
+            or profile_python_cpu
+            or profile_app_phases
+        )
+        and not isolate_process
+        and not args.child_run
+    ):
         raise SystemExit("profiling requires subprocess isolation")
     enable_local_profilers = args.child_run or not isolate_process
     if profile_python_streams and enable_local_profilers:
@@ -4756,7 +4871,11 @@ def main() -> None:
         install_app_phase_profiler()
     for spec in specs:
         iterations = args.iterations or spec.default_iterations
-        selected_loops = [loop_name for loop_name in loops if loop_name != "uvloop" or uvloop is not None]
+        selected_loops = [
+            loop_name
+            for loop_name in loops
+            if loop_name != "uvloop" or uvloop is not None
+        ]
         group_results, round_records = run_benchmark_group(
             selected_loops,
             spec,

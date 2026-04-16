@@ -19,4 +19,7 @@ mio = { version = "1", features = ["os-ext", "os-poll"] }
 parking_lot = "0.12"
 pyo3 = { version = "0.28.2", features = ["extension-module"] }
 pyo3-async-runtimes = { version = "0.28.0", features = ["tokio-runtime"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
