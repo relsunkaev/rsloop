@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::time::Duration;
+use std::io;
 
 use pyo3::prelude::*;
 use pyo3::IntoPyObjectExt;
@@ -62,6 +63,30 @@ pub fn wrap_future<'py>(
     })
 }
 
+#[pyfunction]
+pub fn register_waitpid_exit_callback<'py>(
+    _py: Python<'py>,
+    loop_obj: Bound<'py, PyAny>,
+    pid: i32,
+    transport: Bound<'py, PyAny>,
+) -> PyResult<()> {
+    let loop_obj = loop_obj.unbind();
+    let callback = transport.getattr("_process_exited")?.unbind();
+    pyo3_async_runtimes::tokio::get_runtime().spawn_blocking(move || {
+        let returncode = match waitpid_blocking(pid) {
+            Ok(code) => code,
+            Err(_) => return,
+        };
+        Python::attach(move |py| {
+            let _ = loop_obj.bind(py).call_method1(
+                "call_soon_threadsafe",
+                (callback.bind(py), returncode),
+            );
+        });
+    });
+    Ok(())
+}
+
 fn spawn_into_python<'py, F, T>(py: Python<'py>, fut: F) -> PyResult<Bound<'py, PyAny>>
 where
     F: Future<Output = PyResult<T>> + Send + 'static,
@@ -88,4 +113,25 @@ where
     });
 
     Ok(py_future.into_bound(py))
+}
+
+fn waitpid_blocking(pid: i32) -> io::Result<i32> {
+    let mut status: libc::c_int = 0;
+    loop {
+        let rc = unsafe { libc::waitpid(pid, &mut status as *mut _, 0) };
+        if rc == -1 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if libc::WIFEXITED(status) {
+            return Ok(libc::WEXITSTATUS(status) as i32);
+        }
+        if libc::WIFSIGNALED(status) {
+            return Ok(-(libc::WTERMSIG(status) as i32));
+        }
+        return Ok(0);
+    }
 }

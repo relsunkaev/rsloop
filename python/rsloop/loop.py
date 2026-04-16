@@ -13,6 +13,7 @@ import socket
 import threading
 import sys
 import ssl
+from concurrent.futures import ThreadPoolExecutor
 from asyncio import base_events as _base_events
 from asyncio import constants as _constants
 from asyncio import coroutines as _coroutines
@@ -34,15 +35,67 @@ from .sslproto import RsloopSSLProtocol
 
 
 logger = _selector_events.logger
+_RUST_READ_PIPE_TRANSPORT = getattr(_rsloop, "ReadPipeTransport", None)
+_RUST_WAITPID_REGISTER = None
 _ORIGINAL_STREAMWRITER = _streams.StreamWriter
 _ORIGINAL_STREAMREADER_READEXACTLY = _streams.StreamReader.readexactly
 _ORIGINAL_STREAMREADER_READUNTIL = _streams.StreamReader.readuntil
-_TIMER_QUANTUM = 0.001 if sys.platform == "darwin" else 0.0
+_TIMER_QUANTUM = 0.0
 _TIMER_IMMEDIATE_CUTOFF = _TIMER_QUANTUM * 0.75
 
 
 def _signal_noop(_sig: int, _frame: Any = None) -> None:
     return None
+
+
+class _PooledChildWatcher:
+    def __init__(self, max_workers: int | None = None) -> None:
+        if max_workers is None:
+            cpu_count = os.cpu_count() or 1
+            max_workers = max(4, min(32, cpu_count))
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="rsloop-waitpid",
+        )
+
+    def add_child_handler(
+        self, pid: int, callback: Callable[..., Any], *args: Any
+    ) -> None:
+        loop = _events.get_running_loop()
+        self._executor.submit(self._do_waitpid, loop, pid, callback, args)
+
+    @staticmethod
+    def _do_waitpid(
+        loop: asyncio.AbstractEventLoop,
+        expected_pid: int,
+        callback: Callable[..., Any],
+        args: tuple[Any, ...],
+    ) -> None:
+        try:
+            pid, status = os.waitpid(expected_pid, 0)
+        except ChildProcessError:
+            pid = expected_pid
+            returncode = 255
+            logger.warning(
+                "Unknown child process pid %d, will report returncode 255",
+                pid,
+            )
+        else:
+            returncode = os.waitstatus_to_exitcode(status)
+            if loop.get_debug():
+                logger.debug(
+                    "process %s exited with returncode %s",
+                    expected_pid,
+                    returncode,
+                )
+
+        if loop.is_closed():
+            logger.warning("Loop %r that handles pid %r is closed", loop, pid)
+            return
+        loop.call_soon_threadsafe(callback, pid, returncode, *args)
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=False)
 
 
 class RsloopStreamWriter:
@@ -486,7 +539,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         self._watcher = (
             _unix_events._PidfdChildWatcher()
             if hasattr(os, "pidfd_open") and _unix_events.can_use_pidfd()
-            else _unix_events._ThreadedChildWatcher()
+            else _PooledChildWatcher()
         )
         self._native_run_forever = getattr(self._scheduler, "run_forever_native", None)
         self._install_native_bindings()
@@ -1390,6 +1443,10 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         waiter: asyncio.Future[Any] | None = None,
         extra: dict[str, Any] | None = None,
     ) -> asyncio.Transport:
+        if _RUST_READ_PIPE_TRANSPORT is not None:
+            transport = _RUST_READ_PIPE_TRANSPORT(self, pipe, protocol, extra)
+            transport.activate(waiter)
+            return transport
         return RsloopReadPipeTransport(self, pipe, protocol, waiter, extra)
 
     def _make_write_pipe_transport(
@@ -1427,11 +1484,17 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
             extra=extra,
             **kwargs,
         )
-        self._watcher.add_child_handler(
-            transport.get_pid(),
-            self._child_watcher_callback,
-            transport,
-        )
+        if (
+            _RUST_WAITPID_REGISTER is not None
+            and not (hasattr(os, "pidfd_open") and _unix_events.can_use_pidfd())
+        ):
+            _RUST_WAITPID_REGISTER(self, transport.get_pid(), transport)
+        else:
+            self._watcher.add_child_handler(
+                transport.get_pid(),
+                self._child_watcher_callback,
+                transport,
+            )
         try:
             await waiter
         except (SystemExit, KeyboardInterrupt):
@@ -1443,6 +1506,9 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         return transport
 
     def _child_watcher_callback(self, pid: int, returncode: int, transp: Any) -> None:
+        if self._thread_id is not None and threading.get_ident() == self._thread_id:
+            transp._process_exited(returncode)
+            return
         self.call_soon_threadsafe(transp._process_exited, returncode)
 
     def _make_ssl_transport(
@@ -1860,6 +1926,11 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         if self._signal_handlers:
             for sig in list(self._signal_handlers):
                 self.remove_signal_handler(sig)
+        watcher = getattr(self, "_watcher", None)
+        if watcher is not None:
+            close_watcher = getattr(watcher, "close", None)
+            if close_watcher is not None:
+                close_watcher()
         poller = getattr(self, "_poller", None)
         if poller is not None:
             poller.close()

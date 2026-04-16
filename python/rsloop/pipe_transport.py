@@ -18,6 +18,7 @@ _LOGGER = _selector_events.logger
 _WRITEV_MAX = max(1, min(64, os.sysconf("SC_IOV_MAX")))
 _SMALL_WRITE_MERGE_LIMIT = 64 * 1024
 _SMALL_WRITE_CHUNK_LIMIT = 1024
+_READ_OPPORTUNISTIC_THRESHOLD = 64 * 1024
 
 
 class RsloopReadPipeTransport(_transports.ReadTransport):
@@ -37,6 +38,8 @@ class RsloopReadPipeTransport(_transports.ReadTransport):
         self._pipe = pipe
         self._fileno = pipe.fileno()
         self._protocol = protocol
+        self._data_received_cb = protocol.data_received
+        self._eof_received_cb = protocol.eof_received
         self._closing = False
         self._paused = False
 
@@ -76,6 +79,8 @@ class RsloopReadPipeTransport(_transports.ReadTransport):
 
     def set_protocol(self, protocol: Any) -> None:
         self._protocol = protocol
+        self._data_received_cb = protocol.data_received
+        self._eof_received_cb = protocol.eof_received
 
     def get_protocol(self) -> Any:
         return self._protocol
@@ -102,12 +107,28 @@ class RsloopReadPipeTransport(_transports.ReadTransport):
             return
 
         if data:
-            self._protocol.data_received(data)
+            self._data_received_cb(data)
+            if len(data) < _READ_OPPORTUNISTIC_THRESHOLD:
+                return
+            try:
+                extra = os.read(self._fileno, self.max_size)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError as exc:
+                self._fatal_error(exc, "Fatal read error on pipe transport")
+                return
+            if extra:
+                self._data_received_cb(extra)
+                return
+            self._closing = True
+            self._loop._remove_reader(self._fileno)
+            self._loop.call_soon(self._eof_received_cb)
+            self._loop.call_soon(self._call_connection_lost, None)
             return
 
         self._closing = True
         self._loop._remove_reader(self._fileno)
-        self._loop.call_soon(self._protocol.eof_received)
+        self._loop.call_soon(self._eof_received_cb)
         self._loop.call_soon(self._call_connection_lost, None)
 
     def _fatal_error(self, exc: BaseException, message: str) -> None:

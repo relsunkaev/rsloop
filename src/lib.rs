@@ -13,6 +13,8 @@ mod loop_api;
 #[cfg(unix)]
 mod poller;
 #[cfg(unix)]
+mod pipe_transport;
+#[cfg(unix)]
 mod scheduler;
 #[cfg(unix)]
 mod socket_registry;
@@ -40,6 +42,8 @@ use loop_api::LoopApi;
 #[cfg(unix)]
 use poller::TokioPoller;
 #[cfg(unix)]
+use pipe_transport::ReadPipeTransport;
+#[cfg(unix)]
 use scheduler::Scheduler;
 #[cfg(unix)]
 use socket_registry::SocketStateRegistry;
@@ -59,6 +63,7 @@ fn _rsloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bridge::sleep, m)?)?;
     m.add_function(wrap_pyfunction!(bridge::run_in_tokio, m)?)?;
     m.add_function(wrap_pyfunction!(bridge::wrap_future, m)?)?;
+    m.add_function(wrap_pyfunction!(bridge::register_waitpid_exit_callback, m)?)?;
     #[cfg(unix)]
     m.add_class::<CompletionPort>()?;
     #[cfg(unix)]
@@ -77,6 +82,8 @@ fn _rsloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LoopApi>()?;
     #[cfg(unix)]
     m.add_class::<StreamTransport>()?;
+    #[cfg(unix)]
+    m.add_class::<ReadPipeTransport>()?;
     #[cfg(unix)]
     m.add_function(wrap_pyfunction!(stream_transport::feed_stream_reader_data, m)?)?;
     #[cfg(unix)]
