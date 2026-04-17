@@ -1669,3 +1669,59 @@ hop or a repeated protocol lookup. The remaining credible directions are:
 - Artifacts:
   - [`benchmarks/out/subprocess_exec-native-spawn-rerun.json`](out/subprocess_exec-native-spawn-rerun.json)
   - [`benchmarks/out/subprocess_shell-native-spawn-rerun.json`](out/subprocess_shell-native-spawn-rerun.json)
+
+### 61. Dedicated no-pipe subprocess spawn/exit benchmark
+
+- Area:
+  - [`benchmarks/loops.py`](../benchmarks/loops.py)
+  - [`tests/test_loop.py`](../tests/test_loop.py)
+- Change:
+  - add `subprocess_spawn_exit`, a dedicated benchmark that spawns a short-lived
+    child with `stdin=None`, `stdout=None`, `stderr=None`, then only waits for
+    exit
+  - add a dispatch-selection test that counts native-path vs `Popen` fallback
+    calls so widening the fast path cannot silently drift
+- Rationale:
+  - the native spawn win needs a benchmark that isolates spawn/exit from stdio
+    pipe traffic before we widen the supported keyword surface
+- Functional result:
+  - `./.venv/bin/python -m unittest tests.test_loop.RsloopLoopTests.test_native_subprocess_pipes tests.test_loop.RsloopLoopTests.test_native_subprocess_protocol_ordering tests.test_loop.RsloopLoopTests.test_native_subprocess_callbacks_run_on_loop_thread tests.test_loop.RsloopLoopTests.test_native_subprocess_fallback_kwargs tests.test_loop.RsloopLoopTests.test_native_subprocess_dispatch_selection` passed
+- Benchmark rerun (5 repeats, 1 warmup, baseline `uvloop`):
+  - `subprocess_spawn_exit`: rsloop `1.007x`, paired `1.007x`, wins `1/5`
+- Conclusion:
+  - the isolated benchmark confirms that the remaining subprocess gap after the
+    native spawn cut is now very small at the spawn boundary itself
+  - this benchmark should be the acceptance gate for future native subprocess
+    widening such as `cwd`
+- Decision: kept
+- Artifacts:
+  - [`benchmarks/out/subprocess_spawn_exit-rerun.json`](out/subprocess_spawn_exit-rerun.json)
+
+### 62. Native `cwd` support for subprocess spawn on macOS
+
+- Area:
+  - [`src/native_subprocess.rs`](../src/native_subprocess.rs)
+  - [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+  - [`tests/test_loop.py`](../tests/test_loop.py)
+- Change:
+  - add a local macOS binding for `posix_spawn_file_actions_addchdir_np`
+  - extend `_rsloop.spawn_subprocess(...)` and loop-side native-path selection
+    to support `cwd`
+  - update tests so `cwd` is now asserted to use the native path, with an
+    explicit unsupported-kwarg fallback guard still covering `preexec_fn`
+- Rationale:
+  - `cwd` was the most likely next real-world miss after `env`, and the new
+    `subprocess_spawn_exit` benchmark was in place to verify widening did not
+    give back the spawn-boundary win
+- Functional result:
+  - `./.venv/bin/maturin develop --release` passed
+  - `./.venv/bin/python -m unittest tests.test_loop.RsloopLoopTests.test_native_subprocess_pipes tests.test_loop.RsloopLoopTests.test_native_subprocess_protocol_ordering tests.test_loop.RsloopLoopTests.test_native_subprocess_callbacks_run_on_loop_thread tests.test_loop.RsloopLoopTests.test_native_subprocess_fallback_kwargs tests.test_loop.RsloopLoopTests.test_native_subprocess_dispatch_selection` passed
+- Benchmark rerun (5 repeats, 1 warmup, baseline `uvloop`):
+  - `subprocess_spawn_exit`: rsloop `0.974x`, paired `1.008x`, wins `2/5`
+- Conclusion:
+  - the absolute run was noisy across all loops, but the paired spawn-only
+    comparison stayed effectively flat, so native `cwd` support did not
+    materially regress the spawn boundary
+- Decision: kept
+- Artifacts:
+  - [`benchmarks/out/subprocess_spawn_exit-cwd-rerun.json`](out/subprocess_spawn_exit-cwd-rerun.json)

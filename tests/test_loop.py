@@ -10,9 +10,11 @@ import sys
 import threading
 import unittest
 import tempfile
+from unittest import mock
 from pathlib import Path
 
 import rsloop
+import rsloop.loop as rsloop_loop
 
 
 def make_tls_contexts() -> tuple[ssl.SSLContext, ssl.SSLContext]:
@@ -825,6 +827,85 @@ class RsloopLoopTests(unittest.TestCase):
             stdout, _ = await proc.communicate()
             self.assertEqual(stdout, b"fallback-ok")
             self.assertEqual(await proc.wait(), 0)
+
+            with tempfile.TemporaryDirectory(prefix="rsloop-subprocess-cwd-") as tmpdir:
+                marker = Path(tmpdir) / "cwd-marker.txt"
+                marker.write_text("cwd-ok")
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-c",
+                    (
+                        "from pathlib import Path; "
+                        "import sys; "
+                        "sys.stdout.write(Path('cwd-marker.txt').read_text())"
+                    ),
+                    stdout=asyncio.subprocess.PIPE,
+                    cwd=tmpdir,
+                )
+                stdout, _ = await proc.communicate()
+                self.assertEqual(stdout, b"cwd-ok")
+                self.assertEqual(await proc.wait(), 0)
+
+        self.run_async(main())
+
+    def test_native_subprocess_dispatch_selection(self) -> None:
+        async def main() -> None:
+            native_calls = 0
+            fallback_calls = 0
+
+            original_spawn = rsloop_loop._rsloop.spawn_subprocess
+            original_popen = rsloop_loop.subprocess.Popen
+
+            def counting_spawn(*args, **kwargs):
+                nonlocal native_calls
+                native_calls += 1
+                return original_spawn(*args, **kwargs)
+
+            def counting_popen(*args, **kwargs):
+                nonlocal fallback_calls
+                fallback_calls += 1
+                return original_popen(*args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    rsloop_loop._rsloop,
+                    "spawn_subprocess",
+                    side_effect=counting_spawn,
+                ),
+                mock.patch.object(
+                    rsloop_loop.subprocess,
+                    "Popen",
+                    side_effect=counting_popen,
+                ),
+            ):
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.exit(0)",
+                )
+                self.assertEqual(await proc.wait(), 0)
+                self.assertEqual(native_calls, 1)
+                self.assertEqual(fallback_calls, 0)
+
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-c",
+                    "import os,sys; sys.exit(0)",
+                    cwd=os.getcwd(),
+                )
+                self.assertEqual(await proc.wait(), 0)
+                self.assertEqual(native_calls, 2)
+                self.assertEqual(fallback_calls, 0)
+
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-c",
+                    "import os,sys; sys.exit(0)",
+                    preexec_fn=lambda: None,
+                )
+                self.assertEqual(await proc.wait(), 0)
+                self.assertEqual(native_calls, 2)
+                self.assertEqual(fallback_calls, 1)
 
         self.run_async(main())
 

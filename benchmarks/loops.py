@@ -3511,6 +3511,21 @@ async def bench_subprocess_exec(count: int) -> None:
             raise RuntimeError("subprocess_exec exited non-zero")
 
 
+async def bench_subprocess_spawn_exit(count: int) -> None:
+    script = "import sys; sys.exit(0)"
+    for _ in range(count):
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            script,
+            stdin=None,
+            stdout=None,
+            stderr=None,
+        )
+        if await proc.wait() != 0:
+            raise RuntimeError("subprocess_spawn_exit exited non-zero")
+
+
 async def bench_subprocess_shell(count: int) -> None:
     payload = b"subprocess-shell"
     script = (
@@ -4135,6 +4150,14 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         default_iterations=64,
         unit="processes",
         func=bench_subprocess_exec,
+    ),
+    "subprocess_spawn_exit": BenchmarkSpec(
+        name="subprocess_spawn_exit",
+        description="Spawn short-lived subprocesses without stdio pipes and wait for exit",
+        category="ipc",
+        default_iterations=64,
+        unit="processes",
+        func=bench_subprocess_spawn_exit,
     ),
     "subprocess_shell": BenchmarkSpec(
         name="subprocess_shell",

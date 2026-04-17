@@ -1492,6 +1492,8 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         for key, value in kwargs.items():
             if key == "env":
                 supported["env"] = value
+            elif key == "cwd":
+                supported["cwd"] = value
             elif key == "restore_signals" and value is True:
                 continue
             elif key == "start_new_session" and value is False:
@@ -1540,6 +1542,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
                     stdout_mode,
                     stderr_mode,
                     env=native_kwargs.get("env"),
+                    cwd=native_kwargs.get("cwd"),
                 )
             else:
                 proc = subprocess.Popen(

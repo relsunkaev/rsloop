@@ -98,6 +98,14 @@ struct SpawnResult {
     stderr_parent: Option<RawFd>,
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe extern "C" {
+    fn posix_spawn_file_actions_addchdir_np(
+        actions: *mut libc::posix_spawn_file_actions_t,
+        path: *const libc::c_char,
+    ) -> libc::c_int;
+}
+
 #[pyfunction]
 #[pyo3(signature = (
     args,
@@ -106,6 +114,7 @@ struct SpawnResult {
     stdout_mode,
     stderr_mode,
     env=None,
+    cwd=None,
 ))]
 pub fn spawn_subprocess(
     py: Python<'_>,
@@ -115,6 +124,7 @@ pub fn spawn_subprocess(
     stdout_mode: &str,
     stderr_mode: &str,
     env: Option<Bound<'_, PyAny>>,
+    cwd: Option<Bound<'_, PyAny>>,
 ) -> PyResult<(Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>)> {
     let stdin_mode = parse_stdio_mode(stdin_mode, false)?;
     let stdout_mode = parse_stdio_mode(stdout_mode, false)?;
@@ -128,7 +138,10 @@ pub fn spawn_subprocess(
 
     let argv = build_argv(py, args, shell)?;
     let envp = build_envp(py, env)?;
-    let spawn = spawn_posix(argv, envp, stdin_mode, stdout_mode, stderr_mode)?;
+    let cwd = cwd
+        .map(|value| cstring_from_value(py, &value, "cwd contains NUL byte"))
+        .transpose()?;
+    let spawn = spawn_posix(argv, envp, cwd, stdin_mode, stdout_mode, stderr_mode)?;
 
     let proc = Py::new(py, NativeSubprocessProcess::new(spawn.pid))?
         .into_bound(py)
@@ -196,6 +209,14 @@ fn build_argv(
     Ok(argv)
 }
 
+fn cstring_from_value(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    nul_message: &str,
+) -> PyResult<CString> {
+    CString::new(to_fs_bytes(py, value)?).map_err(|_| PyValueError::new_err(nul_message.to_owned()))
+}
+
 fn to_fs_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     let os = py.import("os")?;
     os.call_method1("fsencode", (value,))?.extract::<Vec<u8>>()
@@ -204,6 +225,7 @@ fn to_fs_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 fn spawn_posix(
     argv: Vec<CString>,
     envp: Vec<CString>,
+    cwd: Option<CString>,
     stdin_mode: StdioMode,
     stdout_mode: StdioMode,
     stderr_mode: StdioMode,
@@ -226,6 +248,9 @@ fn spawn_posix(
     let stdin_parent = setup_stdin(&mut file_actions, stdin_mode, &mut parent_cleanup)?;
     let stdout_state = setup_stdout(&mut file_actions, stdout_mode, &mut parent_cleanup)?;
     let stderr_parent = setup_stderr(&mut file_actions, stderr_mode, &mut parent_cleanup)?;
+    if let Some(cwd) = cwd.as_ref() {
+        file_actions.add_chdir(cwd)?;
+    }
 
     let mut argv_ptrs = build_ptrs(&argv);
     let mut envp_ptrs = build_ptrs(&envp);
@@ -471,6 +496,27 @@ impl PosixSpawnFileActions {
             Err(PyOSError::new_err(io::Error::from_raw_os_error(rc).to_string()))
         } else {
             Ok(())
+        }
+    }
+
+    fn add_chdir(&mut self, path: &CString) -> PyResult<()> {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let rc = unsafe {
+                posix_spawn_file_actions_addchdir_np(&mut self.0 as *mut _, path.as_ptr())
+            };
+            if rc != 0 {
+                Err(PyOSError::new_err(io::Error::from_raw_os_error(rc).to_string()))
+            } else {
+                Ok(())
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            let _ = path;
+            Err(PyValueError::new_err(
+                "native subprocess cwd is not supported on this platform",
+            ))
         }
     }
 }
