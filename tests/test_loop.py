@@ -37,6 +37,14 @@ def make_tls_contexts() -> tuple[ssl.SSLContext, ssl.SSLContext]:
             "/CN=localhost",
             "-days",
             "1",
+            "-addext",
+            "basicConstraints=critical,CA:FALSE",
+            "-addext",
+            "keyUsage=critical,digitalSignature,keyEncipherment",
+            "-addext",
+            "extendedKeyUsage=serverAuth",
+            "-addext",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1",
         ],
         check=True,
         capture_output=True,
@@ -813,6 +821,101 @@ class RsloopLoopTests(unittest.TestCase):
 
         self.run_async(main())
 
+    def test_native_read_pipe_callbacks_run_on_loop_thread(self) -> None:
+        async def main() -> None:
+            loop = asyncio.get_running_loop()
+            expected_thread_id = getattr(loop, "_thread_id", None)
+            observed: list[tuple[str, int]] = []
+            chunks: list[bytes] = []
+            done = loop.create_future()
+
+            class Protocol(asyncio.Protocol):
+                def data_received(self, data: bytes) -> None:
+                    chunks.append(data)
+                    observed.append(("data_received", threading.get_ident()))
+
+                def connection_lost(self, exc: BaseException | None) -> None:
+                    observed.append(("connection_lost", threading.get_ident()))
+                    if not done.done():
+                        done.set_result(exc)
+
+            read_fd, write_fd = os.pipe()
+            read_file = os.fdopen(read_fd, "rb", buffering=0)
+
+            def writer() -> None:
+                try:
+                    os.write(write_fd, b"hello")
+                    os.write(write_fd, b"-world")
+                finally:
+                    os.close(write_fd)
+
+            transport, _protocol = await loop.connect_read_pipe(Protocol, read_file)
+            writer_task = asyncio.create_task(asyncio.to_thread(writer))
+            try:
+                self.assertIsNone(await asyncio.wait_for(done, 2.0))
+                await asyncio.wait_for(writer_task, 2.0)
+            finally:
+                transport.close()
+
+            self.assertEqual(b"".join(chunks), b"hello-world")
+            self.assertIsNotNone(expected_thread_id)
+            self.assertTrue(observed)
+            self.assertTrue(
+                all(thread_id == expected_thread_id for _, thread_id in observed)
+            )
+
+        self.run_async(main())
+
+    def test_native_write_pipe_callbacks_run_on_loop_thread(self) -> None:
+        async def main() -> None:
+            loop = asyncio.get_running_loop()
+            expected_thread_id = getattr(loop, "_thread_id", None)
+            observed: list[tuple[str, int]] = []
+            read_fd, write_fd = os.pipe()
+            write_file = os.fdopen(write_fd, "wb", buffering=0)
+            read_chunks: list[bytes] = []
+            done = loop.create_future()
+
+            class Protocol(asyncio.Protocol):
+                def connection_made(self, transport: asyncio.BaseTransport) -> None:
+                    observed.append(("connection_made", threading.get_ident()))
+
+                def connection_lost(self, exc: BaseException | None) -> None:
+                    observed.append(("connection_lost", threading.get_ident()))
+                    if not done.done():
+                        done.set_result(exc)
+
+            def reader() -> bytes:
+                try:
+                    while True:
+                        chunk = os.read(read_fd, 4096)
+                        if not chunk:
+                            break
+                        read_chunks.append(chunk)
+                    return b"".join(read_chunks)
+                finally:
+                    os.close(read_fd)
+
+            reader_task = asyncio.create_task(asyncio.to_thread(reader))
+            transport, _protocol = await loop.connect_write_pipe(Protocol, write_file)
+            try:
+                transport.write(b"hello")
+                transport.write(b"-world")
+                transport.close()
+                self.assertIsNone(await asyncio.wait_for(done, 2.0))
+                payload = await asyncio.wait_for(reader_task, 2.0)
+            finally:
+                transport.close()
+
+            self.assertEqual(payload, b"hello-world")
+            self.assertIsNotNone(expected_thread_id)
+            self.assertTrue(observed)
+            self.assertTrue(
+                all(thread_id == expected_thread_id for _, thread_id in observed)
+            )
+
+        self.run_async(main())
+
     def test_native_subprocess_fallback_kwargs(self) -> None:
         async def main() -> None:
             env = os.environ.copy()
@@ -1003,6 +1106,53 @@ class RsloopLoopTests(unittest.TestCase):
                 await server.wait_closed()
 
         self.run_async(main())
+
+    def test_rsloop_tls_context_accepts_generated_v3_cert(self) -> None:
+        RsloopTLSContext = getattr(rsloop._rsloop, "RsloopTLSContext", None)
+        self.assertIsNotNone(RsloopTLSContext)
+
+        tempdir = Path(tempfile.mkdtemp(prefix="rsloop-test-native-tls-"))
+        certfile = tempdir / "cert.pem"
+        keyfile = tempdir / "key.pem"
+        try:
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-keyout",
+                    str(keyfile),
+                    "-out",
+                    str(certfile),
+                    "-subj",
+                    "/CN=localhost",
+                    "-days",
+                    "1",
+                    "-addext",
+                    "basicConstraints=critical,CA:FALSE",
+                    "-addext",
+                    "keyUsage=critical,digitalSignature,keyEncipherment",
+                    "-addext",
+                    "extendedKeyUsage=serverAuth",
+                    "-addext",
+                    "subjectAltName=DNS:localhost,IP:127.0.0.1",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            server_context = RsloopTLSContext.server(
+                certfile.read_bytes(),
+                keyfile.read_bytes(),
+            )
+            self.assertTrue(server_context.is_server)
+        finally:
+            for path in (certfile, keyfile):
+                path.unlink(missing_ok=True)
+            tempdir.rmdir()
 
     def test_tcp_server_runner_shutdown_regression(self) -> None:
         async def handle(

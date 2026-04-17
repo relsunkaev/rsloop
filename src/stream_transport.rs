@@ -23,10 +23,10 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyAny, PyByteArray, PyBytes, PyDict, PyModule, PySlice};
 
 use crate::handles::OneArgHandle;
-use crate::tls::RsloopTLSConn;
 use crate::poller::TokioPoller;
 use crate::scheduler::Scheduler;
 use crate::stream_registry::StreamTransportRegistry;
+use crate::tls::RsloopTLSConn;
 
 const DEFAULT_STREAM_READ_SIZE: usize = 64 * 1024;
 const NATIVE_READEXACTLY_LIMIT: usize = 16 * 1024;
@@ -86,7 +86,10 @@ impl NativeSslCache {
             incoming_write: self.incoming_write.clone_ref(py),
             sslobj_read: self.sslobj_read.clone_ref(py),
             outgoing_read: self.outgoing_read.clone_ref(py),
-            transport_write: self.transport_write.as_ref().map(|value| value.clone_ref(py)),
+            transport_write: self
+                .transport_write
+                .as_ref()
+                .map(|value| value.clone_ref(py)),
             stream_reader: self.stream_reader.as_ref().map(|value| value.clone_ref(py)),
             stream_reader_wakeup_waiter: self
                 .stream_reader_wakeup_waiter
@@ -176,7 +179,11 @@ fn is_rsloop_ssl_protocol(protocol: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(module == "rsloop.sslproto")
 }
 
-fn defer_transport_method(py: Python<'_>, transport: &Bound<'_, StreamTransport>, method: &str) -> PyResult<()> {
+fn defer_transport_method(
+    py: Python<'_>,
+    transport: &Bound<'_, StreamTransport>,
+    method: &str,
+) -> PyResult<()> {
     let loop_obj = PyModule::import(py, "asyncio")?
         .getattr("get_running_loop")?
         .call0()?;
@@ -948,22 +955,34 @@ impl StreamTransport {
             c.protocol = protocol.clone_ref(py);
             let reader_ref = reader.bind(py);
             c.buffer = Some(
-                reader_ref.getattr("_buffer")?.cast_into::<PyByteArray>()?.unbind(),
+                reader_ref
+                    .getattr("_buffer")?
+                    .cast_into::<PyByteArray>()?
+                    .unbind(),
             );
             c.limit = reader_ref.getattr("_limit")?.extract()?;
             c.reader = Some(reader.clone_ref(py));
         }
 
         let transport_any = slf.bind(py).clone().into_any().unbind();
-        reader.bind(py).setattr("readexactly", create_bound_readexactly(py, &transport_any)?)?;
-        reader.bind(py).setattr("readuntil", create_bound_readuntil(py, &transport_any)?)?;
+        reader
+            .bind(py)
+            .setattr("readexactly", create_bound_readexactly(py, &transport_any)?)?;
+        reader
+            .bind(py)
+            .setattr("readuntil", create_bound_readuntil(py, &transport_any)?)?;
 
-        protocol.bind(py).call_method1("connection_made", (&transport_any,))?;
+        protocol
+            .bind(py)
+            .call_method1("connection_made", (&transport_any,))?;
 
         let transports = core.borrow().transports.clone_ref(py);
         let registry = core.borrow().registry.clone_ref(py);
         transports.bind(py).set_item(fd, &transport_any)?;
-        registry.bind(py).borrow_mut().register_inner(fd, core.clone());
+        registry
+            .bind(py)
+            .borrow_mut()
+            .register_inner(fd, core.clone());
 
         // Kick the initial TLS state machine.  For a client connection this
         // drives process_records once with empty incoming, which produces the
@@ -987,7 +1006,6 @@ impl StreamTransport {
         let result = core.borrow_mut().sync_interest(py);
         result
     }
-
 }
 
 impl StreamCore {
@@ -1073,10 +1091,16 @@ impl StreamCore {
         // For rustls connections, drain is not instant if the handshake isn't
         // done yet or there's still plaintext/ciphertext queued.
         if self.rustls_conn.is_some() {
-            let handshake_done = self.rustls_conn.as_ref().map_or(false, |c| c.handshake_done());
+            let handshake_done = self
+                .rustls_conn
+                .as_ref()
+                .map_or(false, |c| c.handshake_done());
             let has_pending = !self.write_queue.is_empty()
                 || self.write_waiting_for_writable
-                || self.rustls_conn.as_ref().map_or(false, |c| !c.outgoing().is_empty());
+                || self
+                    .rustls_conn
+                    .as_ref()
+                    .map_or(false, |c| !c.outgoing().is_empty());
             if !handshake_done || has_pending {
                 return Ok(None); // fall through to slow drain path
             }
@@ -1588,7 +1612,6 @@ impl StreamCore {
     }
 
     pub(crate) fn flush_write_phase(&mut self, py: Python<'_>) -> PyResult<()> {
-
         let queued_before = self.pending_write_bytes;
         let mut phase_sent = 0usize;
         if trace_stream_enabled() {
@@ -2545,7 +2568,10 @@ impl StreamCore {
                 }
                 return Ok(());
             }
-            Ok(n) => { incoming.truncate(start + n); n }
+            Ok(n) => {
+                incoming.truncate(start + n);
+                n
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 incoming.truncate(start);
                 return Ok(());
@@ -2554,7 +2580,11 @@ impl StreamCore {
                 incoming.truncate(start);
                 return self.finish_close(
                     py,
-                    Some(PyRuntimeError::new_err(e.to_string()).into_value(py).into_any()),
+                    Some(
+                        PyRuntimeError::new_err(e.to_string())
+                            .into_value(py)
+                            .into_any(),
+                    ),
                 );
             }
         };
@@ -2565,7 +2595,11 @@ impl StreamCore {
         // and copy for the common (buffered reader) path.
         let buf_ptr = self.buffer.as_ref().map(|b| b.as_ptr());
         let mut plaintext_vec: Vec<u8> = Vec::new();
-        let plaintext_target = if buf_ptr.is_some() { &mut plaintext_vec } else { &mut plaintext_vec };
+        let plaintext_target = if buf_ptr.is_some() {
+            &mut plaintext_vec
+        } else {
+            &mut plaintext_vec
+        };
         let (plain_len, needs_send) = {
             let conn = self.rustls_conn.as_mut().unwrap();
             match conn.process_incoming(plaintext_target) {
@@ -2573,7 +2607,11 @@ impl StreamCore {
                 Err(e) => {
                     return self.finish_close(
                         py,
-                        Some(PyRuntimeError::new_err(format!("TLS error: {e}")).into_value(py).into_any()),
+                        Some(
+                            PyRuntimeError::new_err(format!("TLS error: {e}"))
+                                .into_value(py)
+                                .into_any(),
+                        ),
                     );
                 }
             }
@@ -2611,7 +2649,11 @@ impl StreamCore {
             } else {
                 // Generic protocol path (no reader).
                 let payload = PyBytes::new(py, &plaintext_vec);
-                if let Err(e) = self.protocol.bind(py).call_method1("data_received", (payload,)) {
+                if let Err(e) = self
+                    .protocol
+                    .bind(py)
+                    .call_method1("data_received", (payload,))
+                {
                     return self.finish_close(py, Some(e.into_value(py).into_any()));
                 }
             }
@@ -2625,7 +2667,10 @@ impl StreamCore {
         // If the handshake just completed and there's queued plaintext to send,
         // process it now.  Also resolve any pending drain futures if the queue
         // is empty after this.
-        let handshake_done = self.rustls_conn.as_ref().map_or(false, |c| c.handshake_done());
+        let handshake_done = self
+            .rustls_conn
+            .as_ref()
+            .map_or(false, |c| c.handshake_done());
         if handshake_done && !self.write_queue.is_empty() {
             let queued: Vec<PendingWrite> =
                 std::mem::take(&mut self.write_queue).into_iter().collect();
@@ -2644,7 +2689,10 @@ impl StreamCore {
         if handshake_done
             && self.write_queue.is_empty()
             && !self.write_waiting_for_writable
-            && self.rustls_conn.as_ref().map_or(true, |c| c.outgoing().is_empty())
+            && self
+                .rustls_conn
+                .as_ref()
+                .map_or(true, |c| c.outgoing().is_empty())
         {
             if !self.pending_drains.is_empty() {
                 self.queue_pending_drains(py, None)?;
@@ -2669,7 +2717,9 @@ impl StreamCore {
         match &pending.kind {
             PendingReadKind::Exact(size) => {
                 let size = *size;
-                if buffered < size { return Ok(false); }
+                if buffered < size {
+                    return Ok(false);
+                }
                 let pending = self.pending_read.take().unwrap();
                 let data = self.consume_read_buffer_exact(py, buffer, size)?;
                 reader.setattr("_waiter", py.None())?;
@@ -2679,10 +2729,14 @@ impl StreamCore {
             }
             PendingReadKind::Until { separator, offset } => {
                 let found = find_subsequence_in_bytearray(
-                    buffer, separator, self.read_buffer_offset + *offset)?;
+                    buffer,
+                    separator,
+                    self.read_buffer_offset + *offset,
+                )?;
                 if let Some(index) = found {
                     let sep_len = separator.len();
-                    let consumed = index.checked_sub(self.read_buffer_offset)
+                    let consumed = index
+                        .checked_sub(self.read_buffer_offset)
                         .ok_or_else(|| PyRuntimeError::new_err("bad offset"))?;
                     if consumed > self.limit {
                         let exc = limit_overrun_error(py, consumed, true)?;
@@ -2740,7 +2794,9 @@ impl StreamCore {
                         Err(_) => return Ok(()),
                     }
                 };
-                if needs_send { self.flush_rustls_outgoing(py)?; }
+                if needs_send {
+                    self.flush_rustls_outgoing(py)?;
+                }
                 if plain_len > 0 {
                     if let Some(buf) = self.buffer.as_ref() {
                         let buf_ptr = buf.as_ptr();
@@ -2767,12 +2823,19 @@ impl StreamCore {
     }
 
     fn flush_rustls_outgoing(&mut self, py: Python<'_>) -> PyResult<()> {
-        let conn = match self.rustls_conn.as_mut() { Some(c) => c, None => return Ok(()) };
-        if conn.outgoing().is_empty() { return Ok(()); }
+        let conn = match self.rustls_conn.as_mut() {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        if conn.outgoing().is_empty() {
+            return Ok(());
+        }
         let mut sent_total = 0usize;
         let outgoing_len = conn.outgoing().len();
         loop {
-            if sent_total >= outgoing_len { break; }
+            if sent_total >= outgoing_len {
+                break;
+            }
             match try_send_bytes(self.fd, &conn.outgoing()[sent_total..]) {
                 Ok(0) => break,
                 Ok(n) => sent_total += n,
@@ -2780,13 +2843,21 @@ impl StreamCore {
                 Err(e) => {
                     return self.finish_close(
                         py,
-                        Some(PyRuntimeError::new_err(format!("TLS send: {e}")).into_value(py).into_any()),
+                        Some(
+                            PyRuntimeError::new_err(format!("TLS send: {e}"))
+                                .into_value(py)
+                                .into_any(),
+                        ),
                     );
                 }
             }
         }
         if sent_total > 0 {
-            self.rustls_conn.as_mut().unwrap().outgoing_mut().drain(..sent_total);
+            self.rustls_conn
+                .as_mut()
+                .unwrap()
+                .outgoing_mut()
+                .drain(..sent_total);
         }
         if !self.rustls_conn.as_ref().unwrap().outgoing().is_empty() {
             self.write_waiting_for_writable = true;
@@ -2796,8 +2867,14 @@ impl StreamCore {
     }
 
     fn write_rustls(&mut self, py: Python<'_>, plaintext: &[u8]) -> PyResult<()> {
-        if plaintext.is_empty() { return Ok(()); }
-        if !self.rustls_conn.as_ref().map_or(false, |c| c.handshake_done()) {
+        if plaintext.is_empty() {
+            return Ok(());
+        }
+        if !self
+            .rustls_conn
+            .as_ref()
+            .map_or(false, |c| c.handshake_done())
+        {
             self.write_queue.push_back(PendingWrite {
                 data: PendingWriteData::Owned(plaintext.to_vec()),
                 sent: 0,
@@ -2825,10 +2902,14 @@ impl StreamCore {
         self.write_waiting_for_writable = false;
         self.flush_rustls_outgoing(py)?;
 
-        if self.rustls_conn.as_ref().map_or(false, |c| c.handshake_done())
+        if self
+            .rustls_conn
+            .as_ref()
+            .map_or(false, |c| c.handshake_done())
             && !self.write_queue.is_empty()
         {
-            let queued: Vec<PendingWrite> = std::mem::take(&mut self.write_queue).into_iter().collect();
+            let queued: Vec<PendingWrite> =
+                std::mem::take(&mut self.write_queue).into_iter().collect();
             self.pending_write_bytes = 0;
             for pending in queued {
                 let data: Vec<u8> = match pending.data {
@@ -2844,7 +2925,10 @@ impl StreamCore {
         self.sync_interest(py)?;
 
         if !self.write_waiting_for_writable
-            && self.rustls_conn.as_ref().map_or(true, |c| c.outgoing().is_empty())
+            && self
+                .rustls_conn
+                .as_ref()
+                .map_or(true, |c| c.outgoing().is_empty())
             && self.write_queue.is_empty()
         {
             self.maybe_resume_protocol(py)?;
@@ -2858,7 +2942,6 @@ impl StreamCore {
         }
         Ok(())
     }
-
 }
 
 fn trace_stream_enabled() -> bool {
@@ -3556,7 +3639,9 @@ pub(crate) fn feed_stream_reader_data(
 ) -> PyResult<()> {
     let reader = reader.bind(py);
     if reader.getattr("_eof")?.is_truthy()? {
-        return Err(pyo3::exceptions::PyAssertionError::new_err("feed_data after feed_eof"));
+        return Err(pyo3::exceptions::PyAssertionError::new_err(
+            "feed_data after feed_eof",
+        ));
     }
 
     let buffer = reader.getattr("_buffer")?.cast_into::<PyByteArray>()?;
@@ -3658,15 +3743,15 @@ fn ssl_again_errors(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     static VALUE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
     Ok(VALUE
         .get_or_try_init(py, || -> PyResult<_> {
-            Ok(py.import("asyncio.sslproto")?.getattr("SSLAgainErrors")?.unbind())
+            Ok(py
+                .import("asyncio.sslproto")?
+                .getattr("SSLAgainErrors")?
+                .unbind())
         })?
         .bind(py))
 }
 
-fn build_native_ssl_cache(
-    py: Python<'_>,
-    protocol: &Bound<'_, PyAny>,
-) -> PyResult<NativeSslCache> {
+fn build_native_ssl_cache(py: Python<'_>, protocol: &Bound<'_, PyAny>) -> PyResult<NativeSslCache> {
     let stream_reader = match protocol.getattr("_rsloop_stream_reader") {
         Ok(reader) if !reader.is_none() => Some(reader.unbind()),
         _ => None,
@@ -3676,9 +3761,7 @@ fn build_native_ssl_cache(
         None => None,
     };
     let stream_reader_buffer = match protocol.getattr("_rsloop_stream_reader_buffer") {
-        Ok(buffer) if !buffer.is_none() => {
-            Some(buffer.cast_into::<PyByteArray>()?.unbind())
-        }
+        Ok(buffer) if !buffer.is_none() => Some(buffer.cast_into::<PyByteArray>()?.unbind()),
         _ => None,
     };
     let stream_reader_limit = protocol
@@ -3818,7 +3901,9 @@ fn rsloop_sslproto_process_outgoing_cached(
         if let Some(transport_write) = cache.transport_write.as_ref() {
             transport_write.bind(py).call1((data,))?;
         } else {
-            protocol.getattr("_transport")?.call_method1("write", (data,))?;
+            protocol
+                .getattr("_transport")?
+                .call_method1("write", (data,))?;
         }
     }
     protocol.call_method0("_control_app_writing")?;

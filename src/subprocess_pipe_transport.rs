@@ -2,8 +2,7 @@
 
 use pyo3::prelude::*;
 
-#[derive(FromPyObject)]
-#[derive(Debug)]
+#[derive(FromPyObject, Debug)]
 #[pyclass(module = "rsloop._rsloop", unsendable)]
 pub struct ReadSubprocessPipeProto {
     transport: Py<PyAny>,
@@ -41,9 +40,10 @@ impl ReadSubprocessPipeProto {
             return Ok(());
         }
         self.disconnected = true;
-        self.transport
-            .bind(py)
-            .call_method1("_pipe_connection_lost", (self.fd, exc.unwrap_or_else(|| py.None())))?;
+        self.transport.bind(py).call_method1(
+            "_pipe_connection_lost",
+            (self.fd, exc.unwrap_or_else(|| py.None())),
+        )?;
         Ok(())
     }
 
@@ -59,12 +59,15 @@ impl ReadSubprocessPipeProto {
 
     #[getter]
     fn pipe(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok(self.pipe.as_ref().map(|p| p.clone_ref(py)).unwrap_or_else(|| py.None()))
+        Ok(self
+            .pipe
+            .as_ref()
+            .map(|p| p.clone_ref(py))
+            .unwrap_or_else(|| py.None()))
     }
 }
 
-#[derive(FromPyObject)]
-#[derive(Debug)]
+#[derive(FromPyObject, Debug)]
 #[pyclass(module = "rsloop._rsloop", unsendable)]
 pub struct WriteSubprocessPipeProto {
     transport: Py<PyAny>,
@@ -107,9 +110,10 @@ impl WriteSubprocessPipeProto {
             return Ok(());
         }
         self.disconnected = true;
-        self.transport
-            .bind(py)
-            .call_method1("_pipe_connection_lost", (self.fd, exc.unwrap_or_else(|| py.None())))?;
+        self.transport.bind(py).call_method1(
+            "_pipe_connection_lost",
+            (self.fd, exc.unwrap_or_else(|| py.None())),
+        )?;
         Ok(())
     }
 
@@ -125,6 +129,10 @@ impl WriteSubprocessPipeProto {
 
     #[getter]
     fn pipe(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok(self.pipe.as_ref().map(|p| p.clone_ref(py)).unwrap_or_else(|| py.None()))
+        Ok(self
+            .pipe
+            .as_ref()
+            .map(|p| p.clone_ref(py))
+            .unwrap_or_else(|| py.None()))
     }
 }

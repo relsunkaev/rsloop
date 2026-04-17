@@ -333,7 +333,7 @@ impl<C: ProcessTlsRecords> TlsConnInner<C> {
         // Debug: show first bytes if processing fails
         #[cfg(debug_assertions)]
         let _incoming_preview: Vec<u8> = self.incoming.iter().take(8).cloned().collect();
-        
+
         // Keep driving the state machine until we are truly blocked or done.
         // rustls can emit multiple sequential EncodeTlsData/TransmitTlsData
         // states (e.g. ServerHello, Certificate, CertVerify, Finished) before
@@ -365,12 +365,16 @@ impl<C: ProcessTlsRecords> TlsConnInner<C> {
                 }
                 Ok(ConnectionState::BlockedHandshake) => {
                     // Genuinely need more incoming data.
-                    if discard > 0 { self.incoming.drain(..discard); }
+                    if discard > 0 {
+                        self.incoming.drain(..discard);
+                    }
                     break;
                 }
                 Ok(ConnectionState::WriteTraffic(_)) => {
                     self.handshake_done = true;
-                    if discard > 0 { self.incoming.drain(..discard); }
+                    if discard > 0 {
+                        self.incoming.drain(..discard);
+                    }
                     break;
                 }
                 Ok(ConnectionState::ReadTraffic(mut rt)) => {
@@ -390,10 +394,14 @@ impl<C: ProcessTlsRecords> TlsConnInner<C> {
                             None => break,
                         }
                     }
-                    if discard > 0 { self.incoming.drain(..discard); }
+                    if discard > 0 {
+                        self.incoming.drain(..discard);
+                    }
                     if !made_progress {
                         consecutive_no_progress += 1;
-                        if consecutive_no_progress >= 2 { break; }
+                        if consecutive_no_progress >= 2 {
+                            break;
+                        }
                     } else {
                         consecutive_no_progress = 0;
                     }
@@ -401,7 +409,9 @@ impl<C: ProcessTlsRecords> TlsConnInner<C> {
                 }
                 Ok(ConnectionState::PeerClosed) | Ok(ConnectionState::Closed) => {
                     self.peer_closed = true;
-                    if discard > 0 { self.incoming.drain(..discard); }
+                    if discard > 0 {
+                        self.incoming.drain(..discard);
+                    }
                     break;
                 }
                 Err(e) => {
@@ -411,20 +421,28 @@ impl<C: ProcessTlsRecords> TlsConnInner<C> {
                     ));
                 }
                 Ok(_) => {
-                    if discard > 0 { self.incoming.drain(..discard); }
+                    if discard > 0 {
+                        self.incoming.drain(..discard);
+                    }
                     consecutive_no_progress += 1;
-                    if consecutive_no_progress >= 2 { break; }
+                    if consecutive_no_progress >= 2 {
+                        break;
+                    }
                     continue;
                 }
             }
 
-            if discard > 0 { self.incoming.drain(..discard); }
+            if discard > 0 {
+                self.incoming.drain(..discard);
+            }
 
             if !made_progress {
                 consecutive_no_progress += 1;
                 // Allow more passes for EncodeTlsData/TransmitTlsData but
                 // cap to avoid spinning indefinitely.
-                if consecutive_no_progress >= 32 { break; }
+                if consecutive_no_progress >= 32 {
+                    break;
+                }
             } else {
                 consecutive_no_progress = 0;
             }
@@ -515,7 +533,12 @@ impl<C: ProcessTlsRecords> TlsConnInner<C> {
         // One more loop: process any post-handshake records (e.g. NewSessionTicket)
         // to reach WriteTraffic.
         for _ in 0..8 {
-            enum EncryptStep { Done, Retry, Blocked, Error(io::Error) }
+            enum EncryptStep {
+                Done,
+                Retry,
+                Blocked,
+                Error(io::Error),
+            }
             let outcome2 = {
                 let status = self.conn.process_records(&mut self.incoming);
                 let discard2 = status.discard;
@@ -525,33 +548,65 @@ impl<C: ProcessTlsRecords> TlsConnInner<C> {
                         let needed = plaintext.len() + 300;
                         self.outgoing.resize(start + needed, 0);
                         match wt.encrypt(plaintext, &mut self.outgoing[start..]) {
-                            Ok(n) => { self.outgoing.truncate(start + n); EncryptStep::Done }
+                            Ok(n) => {
+                                self.outgoing.truncate(start + n);
+                                EncryptStep::Done
+                            }
                             Err(EncryptError::InsufficientSize(e)) => {
                                 self.outgoing.truncate(start);
                                 self.outgoing.resize(start + e.required_size, 0);
                                 match wt.encrypt(plaintext, &mut self.outgoing[start..]) {
-                                    Ok(n) => { self.outgoing.truncate(start + n); EncryptStep::Done }
-                                    Err(e2) => EncryptStep::Error(io::Error::new(io::ErrorKind::Other, format!("TLS encrypt: {e2:?}")))
+                                    Ok(n) => {
+                                        self.outgoing.truncate(start + n);
+                                        EncryptStep::Done
+                                    }
+                                    Err(e2) => EncryptStep::Error(io::Error::new(
+                                        io::ErrorKind::Other,
+                                        format!("TLS encrypt: {e2:?}"),
+                                    )),
                                 }
                             }
-                            Err(e) => EncryptStep::Error(io::Error::new(io::ErrorKind::Other, format!("TLS encrypt: {e:?}")))
+                            Err(e) => EncryptStep::Error(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("TLS encrypt: {e:?}"),
+                            )),
                         }
                     }
                     Ok(ConnectionState::EncodeTlsData(mut enc)) => {
                         match encode_into_outgoing(&mut enc, &mut self.outgoing) {
-                            Ok(()) => if discard2 > 0 { EncryptStep::Retry } else { EncryptStep::Blocked },
+                            Ok(()) => {
+                                if discard2 > 0 {
+                                    EncryptStep::Retry
+                                } else {
+                                    EncryptStep::Blocked
+                                }
+                            }
                             Err(e) => EncryptStep::Error(e),
                         }
                     }
-                    Ok(ConnectionState::TransmitTlsData(tls)) => { tls.done(); EncryptStep::Retry }
-                    Ok(ConnectionState::ReadTraffic(_)) => if discard2 > 0 { EncryptStep::Retry } else { EncryptStep::Blocked },
+                    Ok(ConnectionState::TransmitTlsData(tls)) => {
+                        tls.done();
+                        EncryptStep::Retry
+                    }
+                    Ok(ConnectionState::ReadTraffic(_)) => {
+                        if discard2 > 0 {
+                            EncryptStep::Retry
+                        } else {
+                            EncryptStep::Blocked
+                        }
+                    }
                     Ok(ConnectionState::BlockedHandshake) | Ok(_) => EncryptStep::Blocked,
-                    Err(e) => EncryptStep::Error(io::Error::new(io::ErrorKind::InvalidData, format!("TLS error: {e}"))),
+                    Err(e) => EncryptStep::Error(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("TLS error: {e}"),
+                    )),
                 };
                 (discard2, step)
             };
             let (discard2, step) = outcome2;
-            if discard2 > 0 { self.incoming.drain(..discard2); }
+            if discard2 > 0 {
+                self.incoming.drain(..discard2);
+            }
             match step {
                 EncryptStep::Done => return Ok(()),
                 EncryptStep::Error(e) => return Err(e),
@@ -560,7 +615,10 @@ impl<C: ProcessTlsRecords> TlsConnInner<C> {
             }
         }
 
-        Err(io::Error::new(io::ErrorKind::WouldBlock, "TLS not in write-traffic state"))
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "TLS not in write-traffic state",
+        ))
     }
 
     /// Run one step of the TLS state machine even when incoming is empty.

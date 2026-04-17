@@ -1,6 +1,6 @@
 use std::future::Future;
-use std::time::Duration;
 use std::io;
+use std::time::Duration;
 
 use pyo3::prelude::*;
 use pyo3::IntoPyObjectExt;
@@ -78,10 +78,9 @@ pub fn register_waitpid_exit_callback<'py>(
             Err(_) => return,
         };
         Python::attach(move |py| {
-            let _ = loop_obj.bind(py).call_method1(
-                "call_soon_threadsafe",
-                (callback.bind(py), returncode),
-            );
+            let _ = loop_obj
+                .bind(py)
+                .call_method1("call_soon_threadsafe", (callback.bind(py), returncode));
         });
     });
     Ok(())

@@ -3,6 +3,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -11,9 +12,24 @@ sys.path.insert(0, str(ROOT / "benchmarks"))
 
 import loops  # noqa: E402
 import native_sample  # noqa: E402
+import revision_ab  # noqa: E402
 
 
 class BenchmarkProfileParsingTests(unittest.TestCase):
+    def test_real_profile_is_the_shared_default(self) -> None:
+        self.assertEqual(loops.DEFAULT_PROFILE, "real")
+        self.assertEqual(revision_ab.DEFAULT_PROFILE, "real")
+
+    def test_selected_benchmarks_uses_real_profile_gate(self) -> None:
+        selected = loops.selected_benchmarks(
+            SimpleNamespace(benchmark="all", profile=loops.DEFAULT_PROFILE)
+        )
+
+        self.assertEqual(
+            [spec.name for spec in selected],
+            loops.PROFILE_BENCHMARKS["real"],
+        )
+
     def test_get_loop_factory_uses_rsloop_factory(self) -> None:
         with mock.patch.object(loops.rsloop, "new_event_loop", return_value=object()) as new_loop:
             factory = loops.get_loop_factory("rsloop")
@@ -23,7 +39,16 @@ class BenchmarkProfileParsingTests(unittest.TestCase):
     def test_parse_runtime_profile_preserves_all_run_channels(self) -> None:
         stderr = "\n".join(
             [
-                "RSLOOP_PROFILE_SCHED_JSON " + json.dumps({"iterations": 1}),
+                "RSLOOP_PROFILE_SCHED_JSON "
+                + json.dumps(
+                    {
+                        "iterations": 1,
+                        "completion_breakdown": {
+                            "socket_future_result": 2,
+                            "socket_future_exception": 1,
+                        },
+                    }
+                ),
                 "RSLOOP_PROFILE_STREAM_JSON " + json.dumps({"events": [], "dropped": 0}),
                 "RSLOOP_PROFILE_ONEARG_JSON " + json.dumps({"callbacks": []}),
                 "BENCH_PROFILE_PY_STREAM_JSON " + json.dumps({"totals": {}}),
@@ -47,6 +72,10 @@ class BenchmarkProfileParsingTests(unittest.TestCase):
         self.assertIn("app_phase_runs", profile)
         self.assertNotIn("scheduler", profile)
         self.assertNotIn("stream", profile)
+        self.assertEqual(
+            profile["scheduler_runs"][0]["completion_breakdown"]["socket_future_result"],
+            2,
+        )
 
     def test_profile_runtime_enables_onearg_channel_for_rsloop_children(self) -> None:
         spec = loops.BENCHMARKS["call_soon"]

@@ -20,8 +20,9 @@ use crate::handles::{
     take_one_arg_profile_json, NativeHandleKind,
 };
 use crate::loop_api::LoopApi;
+use crate::pipe_registry::{PipeCompletionDrainStats, PipeTransportRegistry};
 use crate::poller::TokioPoller;
-use crate::socket_registry::SocketStateRegistry;
+use crate::socket_registry::{SocketCompletionDrainStats, SocketStateRegistry};
 use crate::stream_registry::{CompletionDrainStats, StreamTransportRegistry};
 use crate::stream_transport::take_profile_stream_json;
 
@@ -82,6 +83,7 @@ struct PhaseStats {
     ready_handles: u64,
     fd_events: u64,
     stream_fd_hits: u64,
+    pipe_fd_hits: u64,
     socket_fd_hits: u64,
     generic_fd_hits: u64,
     ready_local_items: u64,
@@ -105,6 +107,7 @@ struct PhaseStats {
 struct TickStats {
     fd_events: Vec<u32>,
     stream_fd_hits: Vec<u32>,
+    pipe_fd_hits: Vec<u32>,
     socket_fd_hits: Vec<u32>,
     generic_fd_hits: Vec<u32>,
     ready_handles: Vec<u32>,
@@ -129,6 +132,7 @@ struct TickStats {
 struct TickSample {
     fd_events: u32,
     stream_fd_hits: u32,
+    pipe_fd_hits: u32,
     socket_fd_hits: u32,
     generic_fd_hits: u32,
     ready_handles: u32,
@@ -155,6 +159,14 @@ struct CompletionBreakdown {
     port_future_exception: u64,
     port_future_result_us: u64,
     port_future_exception_us: u64,
+    socket_future_result: u64,
+    socket_future_exception: u64,
+    socket_future_result_us: u64,
+    socket_future_exception_us: u64,
+    pipe_data_received: u64,
+    pipe_connection_lost: u64,
+    pipe_data_received_us: u64,
+    pipe_connection_lost_us: u64,
     stream_read_result: u64,
     stream_read_exception: u64,
     stream_future_result: u64,
@@ -177,6 +189,7 @@ impl PhaseStats {
         self.ready_handles += tick.ready_handles as u64;
         self.fd_events += tick.fd_events as u64;
         self.stream_fd_hits += tick.stream_fd_hits as u64;
+        self.pipe_fd_hits += tick.pipe_fd_hits as u64;
         self.socket_fd_hits += tick.socket_fd_hits as u64;
         self.generic_fd_hits += tick.generic_fd_hits as u64;
         self.ready_local_items += tick.ready_local_items as u64;
@@ -189,6 +202,7 @@ impl PhaseStats {
         self.completion_items += tick.completion_items as u64;
         self.tick_stats.fd_events.push(tick.fd_events);
         self.tick_stats.stream_fd_hits.push(tick.stream_fd_hits);
+        self.tick_stats.pipe_fd_hits.push(tick.pipe_fd_hits);
         self.tick_stats.socket_fd_hits.push(tick.socket_fd_hits);
         self.tick_stats.generic_fd_hits.push(tick.generic_fd_hits);
         self.tick_stats.ready_handles.push(tick.ready_handles);
@@ -226,6 +240,20 @@ impl PhaseStats {
         self.completion_breakdown.stream_read_exception_us += drained.read_exception_us;
         self.completion_breakdown.stream_future_result_us += drained.future_result_us;
         self.completion_breakdown.stream_future_exception_us += drained.future_exception_us;
+    }
+
+    fn record_socket_completion_stats(&mut self, drained: &SocketCompletionDrainStats) {
+        self.completion_breakdown.socket_future_result += drained.future_result as u64;
+        self.completion_breakdown.socket_future_exception += drained.future_exception as u64;
+        self.completion_breakdown.socket_future_result_us += drained.future_result_us;
+        self.completion_breakdown.socket_future_exception_us += drained.future_exception_us;
+    }
+
+    fn record_pipe_completion_stats(&mut self, drained: &PipeCompletionDrainStats) {
+        self.completion_breakdown.pipe_data_received += drained.data_received as u64;
+        self.completion_breakdown.pipe_connection_lost += drained.connection_lost as u64;
+        self.completion_breakdown.pipe_data_received_us += drained.data_received_us;
+        self.completion_breakdown.pipe_connection_lost_us += drained.connection_lost_us;
     }
 
     fn record_port_completion(&mut self, is_err: bool, elapsed: Duration) {
@@ -340,7 +368,7 @@ impl Scheduler {
             .store(usize::from(stopping), AtomicOrdering::Release);
     }
 
-    #[pyo3(signature = (loop_obj, native_api, poller, completion_port, fd_registry, stream_registry, socket_registry, stopping, clock_resolution, debug, slow_callback_duration))]
+    #[pyo3(signature = (loop_obj, native_api, poller, completion_port, fd_registry, stream_registry, pipe_registry, socket_registry, stopping, clock_resolution, debug, slow_callback_duration))]
     fn run_once(
         &self,
         py: Python<'_>,
@@ -350,6 +378,7 @@ impl Scheduler {
         completion_port: PyRef<'_, CompletionPort>,
         fd_registry: Option<Py<FdCallbackRegistry>>,
         stream_registry: Option<Py<StreamTransportRegistry>>,
+        pipe_registry: Option<Py<PipeTransportRegistry>>,
         socket_registry: Option<Py<SocketStateRegistry>>,
         stopping: bool,
         clock_resolution: f64,
@@ -371,6 +400,7 @@ impl Scheduler {
             native_api.as_ref(),
             fd_registry.as_ref(),
             stream_registry.as_ref(),
+            pipe_registry.as_ref(),
             socket_registry.as_ref(),
             stopping,
             clock_resolution,
@@ -386,7 +416,7 @@ impl Scheduler {
         )
     }
 
-    #[pyo3(signature = (loop_obj, native_api, poller, completion_port, fd_registry, stream_registry, socket_registry, clock_resolution, debug, slow_callback_duration))]
+    #[pyo3(signature = (loop_obj, native_api, poller, completion_port, fd_registry, stream_registry, pipe_registry, socket_registry, clock_resolution, debug, slow_callback_duration))]
     fn run_forever_native(
         &self,
         py: Python<'_>,
@@ -396,6 +426,7 @@ impl Scheduler {
         completion_port: PyRef<'_, CompletionPort>,
         fd_registry: Option<Py<FdCallbackRegistry>>,
         stream_registry: Option<Py<StreamTransportRegistry>>,
+        pipe_registry: Option<Py<PipeTransportRegistry>>,
         socket_registry: Option<Py<SocketStateRegistry>>,
         clock_resolution: f64,
         debug: bool,
@@ -425,6 +456,7 @@ impl Scheduler {
                 native_api.as_ref(),
                 fd_registry.as_ref(),
                 stream_registry.as_ref(),
+                pipe_registry.as_ref(),
                 socket_registry.as_ref(),
                 false,
                 clock_resolution,
@@ -449,7 +481,7 @@ impl Scheduler {
 
         if profiling {
             eprintln!(
-                "rsloop scheduler phases iterations={} direct_waits={} poll_waits={} completion_items={} ready_handles={} fd_events={} stream_fd_hits={} socket_fd_hits={} generic_fd_hits={} ready_local_items={} ready_remote_items={} select={:.6}s fd_dispatch={:.6}s completions={:.6}s timers={:.6}s ready={:.6}s writes={:.6}s",
+                "rsloop scheduler phases iterations={} direct_waits={} poll_waits={} completion_items={} ready_handles={} fd_events={} stream_fd_hits={} pipe_fd_hits={} socket_fd_hits={} generic_fd_hits={} ready_local_items={} ready_remote_items={} select={:.6}s fd_dispatch={:.6}s completions={:.6}s timers={:.6}s ready={:.6}s writes={:.6}s",
                 stats.iterations,
                 stats.direct_waits,
                 stats.poll_waits,
@@ -457,6 +489,7 @@ impl Scheduler {
                 stats.ready_handles,
                 stats.fd_events,
                 stats.stream_fd_hits,
+                stats.pipe_fd_hits,
                 stats.socket_fd_hits,
                 stats.generic_fd_hits,
                 stats.ready_local_items,
@@ -497,6 +530,7 @@ impl Scheduler {
         native_api: Option<&Py<LoopApi>>,
         fd_registry: Option<&Py<FdCallbackRegistry>>,
         stream_registry: Option<&Py<StreamTransportRegistry>>,
+        pipe_registry: Option<&Py<PipeTransportRegistry>>,
         socket_registry: Option<&Py<SocketStateRegistry>>,
         stopping: bool,
         clock_resolution: f64,
@@ -595,6 +629,8 @@ impl Scheduler {
             if let Some(registry) = stream_registry {
                 let stream_registry = registry.bind(py);
                 let stream_registry = stream_registry.borrow();
+                let pipe_registry = pipe_registry.map(|registry| registry.bind(py));
+                let pipe_registry = pipe_registry.as_ref().map(|registry| registry.borrow());
                 let socket_registry = socket_registry.map(|registry| registry.bind(py));
                 let socket_registry = socket_registry.as_ref().map(|registry| registry.borrow());
                 generic_fd_events.clear();
@@ -616,6 +652,12 @@ impl Scheduler {
                             continue;
                         }
                     }
+                    if let Some(pipe_registry) = pipe_registry.as_ref() {
+                        if pipe_registry.dispatch_one(py, fd, mask)? {
+                            tick.pipe_fd_hits += 1;
+                            continue;
+                        }
+                    }
                     tick.generic_fd_hits += 1;
                     generic_fd_events.push((fd, mask));
                 }
@@ -628,9 +670,11 @@ impl Scheduler {
                         &mut generic_ready_handles,
                     )?;
                 }
-            } else if let Some(socket_registry) = socket_registry {
-                let socket_registry = socket_registry.bind(py);
-                let socket_registry = socket_registry.borrow();
+            } else if socket_registry.is_some() || pipe_registry.is_some() {
+                let pipe_registry = pipe_registry.map(|registry| registry.bind(py));
+                let pipe_registry = pipe_registry.as_ref().map(|registry| registry.borrow());
+                let socket_registry = socket_registry.map(|registry| registry.bind(py));
+                let socket_registry = socket_registry.as_ref().map(|registry| registry.borrow());
                 generic_fd_events.clear();
                 for (fd, mask) in fd_events.iter().copied() {
                     tick.fd_events += 1;
@@ -640,12 +684,20 @@ impl Scheduler {
                         }
                         continue;
                     }
-                    if !socket_registry.dispatch_one(py, fd, mask)? {
-                        tick.generic_fd_hits += 1;
-                        generic_fd_events.push((fd, mask));
-                    } else {
-                        tick.socket_fd_hits += 1;
+                    if let Some(socket_registry) = socket_registry.as_ref() {
+                        if socket_registry.dispatch_one(py, fd, mask)? {
+                            tick.socket_fd_hits += 1;
+                            continue;
+                        }
                     }
+                    if let Some(pipe_registry) = pipe_registry.as_ref() {
+                        if pipe_registry.dispatch_one(py, fd, mask)? {
+                            tick.pipe_fd_hits += 1;
+                            continue;
+                        }
+                    }
+                    tick.generic_fd_hits += 1;
+                    generic_fd_events.push((fd, mask));
                 }
                 if !generic_fd_events.is_empty() {
                     collect_generic_fd_events(
@@ -696,6 +748,36 @@ impl Scheduler {
             if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
                 let elapsed = started.elapsed();
                 stats.record_stream_completion_stats(&drained);
+                stats.completions += elapsed;
+                tick.completions_us += elapsed.as_micros() as u64;
+            }
+        }
+
+        if let Some(registry) = socket_registry {
+            let started = stats.as_ref().map(|_| Instant::now());
+            let drained = registry
+                .bind(py)
+                .borrow()
+                .drain_completion_queue(py, stats.is_some())?;
+            tick.completion_items += drained.total;
+            if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
+                let elapsed = started.elapsed();
+                stats.record_socket_completion_stats(&drained);
+                stats.completions += elapsed;
+                tick.completions_us += elapsed.as_micros() as u64;
+            }
+        }
+
+        if let Some(registry) = pipe_registry {
+            let started = stats.as_ref().map(|_| Instant::now());
+            let drained = registry
+                .bind(py)
+                .borrow()
+                .drain_completion_queue(py, stats.is_some())?;
+            tick.completion_items += drained.total;
+            if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
+                let elapsed = started.elapsed();
+                stats.record_pipe_completion_stats(&drained);
                 stats.completions += elapsed;
                 tick.completions_us += elapsed.as_micros() as u64;
             }
@@ -781,6 +863,22 @@ impl Scheduler {
                         .unwrap_or_default();
                     stats.ready += elapsed;
                     tick.ready_us += elapsed.as_micros() as u64;
+                }
+            }
+        }
+        if let Some(registry) = socket_registry {
+            if registry.bind(py).borrow().has_completions() {
+                let started = stats.as_ref().map(|_| Instant::now());
+                let drained = registry
+                    .bind(py)
+                    .borrow()
+                    .drain_completion_queue(py, stats.is_some())?;
+                tick.completion_items += drained.total;
+                if let (Some(stats), Some(started)) = (stats.as_deref_mut(), started) {
+                    let elapsed = started.elapsed();
+                    stats.record_socket_completion_stats(&drained);
+                    stats.completions += elapsed;
+                    tick.completions_us += elapsed.as_micros() as u64;
                 }
             }
         }
@@ -915,7 +1013,7 @@ fn scheduler_profile_json(stats: &PhaseStats) -> String {
     out.push('{');
     let _ = write!(
         out,
-        "\"iterations\":{},\"direct_waits\":{},\"poll_waits\":{},\"completion_items\":{},\"ready_handles\":{},\"fd_events\":{},\"stream_fd_hits\":{},\"socket_fd_hits\":{},\"generic_fd_hits\":{},\"ready_local_items\":{},\"ready_remote_items\":{},\"ready_zero_arg\":{},\"ready_one_arg\":{},\"ready_handle_native\":{},\"ready_future_native\":{},\"ready_python\":{},\"phase_seconds\":{{\"select\":{:.6},\"fd_dispatch\":{:.6},\"completions\":{:.6},\"timers\":{:.6},\"ready\":{:.6},\"writes\":{:.6}}},\"completion_breakdown\":{{\"port_future_result\":{},\"port_future_exception\":{},\"port_future_result_us\":{},\"port_future_exception_us\":{},\"stream_read_result\":{},\"stream_read_exception\":{},\"stream_future_result\":{},\"stream_future_exception\":{},\"stream_read_result_us\":{},\"stream_read_exception_us\":{},\"stream_future_result_us\":{},\"stream_future_exception_us\":{}}},\"ticks\":{{",
+        "\"iterations\":{},\"direct_waits\":{},\"poll_waits\":{},\"completion_items\":{},\"ready_handles\":{},\"fd_events\":{},\"stream_fd_hits\":{},\"pipe_fd_hits\":{},\"socket_fd_hits\":{},\"generic_fd_hits\":{},\"ready_local_items\":{},\"ready_remote_items\":{},\"ready_zero_arg\":{},\"ready_one_arg\":{},\"ready_handle_native\":{},\"ready_future_native\":{},\"ready_python\":{},\"phase_seconds\":{{\"select\":{:.6},\"fd_dispatch\":{:.6},\"completions\":{:.6},\"timers\":{:.6},\"ready\":{:.6},\"writes\":{:.6}}},\"completion_breakdown\":{{\"port_future_result\":{},\"port_future_exception\":{},\"port_future_result_us\":{},\"port_future_exception_us\":{},\"socket_future_result\":{},\"socket_future_exception\":{},\"socket_future_result_us\":{},\"socket_future_exception_us\":{},\"pipe_data_received\":{},\"pipe_connection_lost\":{},\"pipe_data_received_us\":{},\"pipe_connection_lost_us\":{},\"stream_read_result\":{},\"stream_read_exception\":{},\"stream_future_result\":{},\"stream_future_exception\":{},\"stream_read_result_us\":{},\"stream_read_exception_us\":{},\"stream_future_result_us\":{},\"stream_future_exception_us\":{}}},\"ticks\":{{",
         stats.iterations,
         stats.direct_waits,
         stats.poll_waits,
@@ -923,6 +1021,7 @@ fn scheduler_profile_json(stats: &PhaseStats) -> String {
         stats.ready_handles,
         stats.fd_events,
         stats.stream_fd_hits,
+        stats.pipe_fd_hits,
         stats.socket_fd_hits,
         stats.generic_fd_hits,
         stats.ready_local_items,
@@ -942,6 +1041,14 @@ fn scheduler_profile_json(stats: &PhaseStats) -> String {
         stats.completion_breakdown.port_future_exception,
         stats.completion_breakdown.port_future_result_us,
         stats.completion_breakdown.port_future_exception_us,
+        stats.completion_breakdown.socket_future_result,
+        stats.completion_breakdown.socket_future_exception,
+        stats.completion_breakdown.socket_future_result_us,
+        stats.completion_breakdown.socket_future_exception_us,
+        stats.completion_breakdown.pipe_data_received,
+        stats.completion_breakdown.pipe_connection_lost,
+        stats.completion_breakdown.pipe_data_received_us,
+        stats.completion_breakdown.pipe_connection_lost_us,
         stats.completion_breakdown.stream_read_result,
         stats.completion_breakdown.stream_read_exception,
         stats.completion_breakdown.stream_future_result,
@@ -954,6 +1061,8 @@ fn scheduler_profile_json(stats: &PhaseStats) -> String {
     append_distribution_json(&mut out, "fd_events", &stats.tick_stats.fd_events);
     out.push(',');
     append_distribution_json(&mut out, "stream_fd_hits", &stats.tick_stats.stream_fd_hits);
+    out.push(',');
+    append_distribution_json(&mut out, "pipe_fd_hits", &stats.tick_stats.pipe_fd_hits);
     out.push(',');
     append_distribution_json(&mut out, "socket_fd_hits", &stats.tick_stats.socket_fd_hits);
     out.push(',');

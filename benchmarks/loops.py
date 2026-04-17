@@ -2266,6 +2266,14 @@ def tls_contexts(*, native_rsloop: bool = True) -> tuple[Any, Any]:
             "/CN=localhost",
             "-days",
             "1",
+            "-addext",
+            "basicConstraints=critical,CA:FALSE",
+            "-addext",
+            "keyUsage=critical,digitalSignature,keyEncipherment",
+            "-addext",
+            "extendedKeyUsage=serverAuth",
+            "-addext",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1",
         ],
         check=True,
         capture_output=True,
@@ -4321,6 +4329,8 @@ PROFILE_BENCHMARKS = {
     "full": list(BENCHMARKS),
 }
 
+DEFAULT_PROFILE = "real"
+
 
 def run_once(
     loop_name: str,
@@ -4785,7 +4795,7 @@ def main() -> None:
         "--benchmark", choices=[*BENCHMARKS.keys(), "all"], default="all"
     )
     parser.add_argument(
-        "--profile", choices=sorted(PROFILE_BENCHMARKS), default="default"
+        "--profile", choices=sorted(PROFILE_BENCHMARKS), default=DEFAULT_PROFILE
     )
     parser.add_argument("--iterations", type=int, default=None)
     parser.add_argument("--repeats", type=int, default=7)

@@ -26,10 +26,10 @@ The harness is designed to make comparisons harder to dismiss:
 
 ### Useful commands
 
-Run the default profile across all loops:
+Run the default workload gate across all loops:
 
 ```bash
-.venv/bin/python benchmarks/loops.py --loop all --profile default --repeats 5 --warmups 1
+.venv/bin/python benchmarks/loops.py --loop all --repeats 5 --warmups 1
 ```
 
 Run the full suite and save structured output:
@@ -64,6 +64,17 @@ Run a stricter, paired comparison with explicit retry policy:
   --warmups 2 \
   --child-retries 1 \
   --output benchmarks/out/full-paired.json
+```
+
+Run the faster balanced iteration set when you intentionally want the older
+micro/control-plane mix:
+
+```bash
+.venv/bin/python benchmarks/loops.py \
+  --loop all \
+  --profile default \
+  --repeats 5 \
+  --warmups 1
 ```
 
 List available scenarios:
@@ -122,19 +133,19 @@ Run an interleaved current-vs-`HEAD` revision comparison for rsloop itself:
 
 ```bash
 .venv/bin/python benchmarks/revision_ab.py \
-  --benchmark asgi_json_echo \
+  --benchmark all \
   --repeats 3 \
   --warmups 1 \
   --profile-runtime \
   --profile-sslproto \
-  --output benchmarks/out/asgi-json-revision-ab.json
+  --output benchmarks/out/real-revision-ab.json
 ```
 
 ### Profiles
 
 - `smoke`: fast sanity checks
-- `default`: balanced comparison set for routine iteration
-- `real`: app-shaped and subsystem-gate scenarios used to decide whether a change is worth keeping
+- `default`: faster balanced comparison set for routine micro/control-plane iteration
+- `real`: default app-shaped and subsystem-gate scenarios used to decide whether a change is worth keeping
 - `full`: all runnable scenarios, including heavier mixed-payload stream cases
 - The expanded `full` profile also includes control-plane task/future/timer storms, AF_UNIX raw-socket cases, datagram endpoint and `sock_sendto` / `sock_recvfrom` coverage, pipe and subprocess churn, signal handler churn, HTTP/1.1 request/response cases, TLS handshakes, `sock_sendfile()` transfers, websocket workloads, and application-shaped request/response cases.
 - `start_tls_upgrade` exercises plaintext-to-TLS upgrades via `StreamWriter.start_tls()`.

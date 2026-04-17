@@ -176,11 +176,7 @@ fn parse_stdio_mode(mode: &str, allow_stdout: bool) -> PyResult<StdioMode> {
     }
 }
 
-fn build_argv(
-    py: Python<'_>,
-    args: Bound<'_, PyAny>,
-    shell: bool,
-) -> PyResult<Vec<CString>> {
+fn build_argv(py: Python<'_>, args: Bound<'_, PyAny>, shell: bool) -> PyResult<Vec<CString>> {
     if shell {
         let command = to_fs_bytes(py, &args)?;
         return Ok(vec![
@@ -233,14 +229,18 @@ fn spawn_posix(
     let mut file_actions = std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
     let rc = unsafe { libc::posix_spawn_file_actions_init(file_actions.as_mut_ptr()) };
     if rc != 0 {
-        return Err(PyOSError::new_err(io::Error::from_raw_os_error(rc).to_string()));
+        return Err(PyOSError::new_err(
+            io::Error::from_raw_os_error(rc).to_string(),
+        ));
     }
     let mut file_actions = PosixSpawnFileActions(unsafe { file_actions.assume_init() });
 
     let mut attr = std::mem::MaybeUninit::<libc::posix_spawnattr_t>::uninit();
     let rc = unsafe { libc::posix_spawnattr_init(attr.as_mut_ptr()) };
     if rc != 0 {
-        return Err(PyOSError::new_err(io::Error::from_raw_os_error(rc).to_string()));
+        return Err(PyOSError::new_err(
+            io::Error::from_raw_os_error(rc).to_string(),
+        ));
     }
     let mut attr = PosixSpawnAttr(unsafe { attr.assume_init() });
     let mut parent_cleanup = Vec::new();
@@ -281,7 +281,9 @@ fn spawn_posix(
         if let Some(fd) = stderr_parent {
             let _ = close_fd(fd);
         }
-        return Err(PyOSError::new_err(io::Error::from_raw_os_error(rc).to_string()));
+        return Err(PyOSError::new_err(
+            io::Error::from_raw_os_error(rc).to_string(),
+        ));
     }
 
     Ok(SpawnResult {
@@ -318,9 +320,7 @@ fn setup_stdin(
             parent_cleanup.push(read_fd);
             Ok(Some(write_fd))
         }
-        StdioMode::Stdout => Err(PyValueError::new_err(
-            "stdin cannot use stdout redirection",
-        )),
+        StdioMode::Stdout => Err(PyValueError::new_err("stdin cannot use stdout redirection")),
     }
 }
 
@@ -330,17 +330,13 @@ fn setup_stdout(
     parent_cleanup: &mut Vec<RawFd>,
 ) -> PyResult<StdoutState> {
     match mode {
-        StdioMode::Inherit => Ok(StdoutState {
-            parent_fd: None,
-        }),
+        StdioMode::Inherit => Ok(StdoutState { parent_fd: None }),
         StdioMode::DevNull => {
             let fd = open_devnull(libc::O_WRONLY)?;
             file_actions.add_dup2(fd, libc::STDOUT_FILENO)?;
             file_actions.add_close(fd)?;
             parent_cleanup.push(fd);
-            Ok(StdoutState {
-                parent_fd: None,
-            })
+            Ok(StdoutState { parent_fd: None })
         }
         StdioMode::Pipe => {
             let (read_fd, write_fd) = make_pipe()?;
@@ -420,10 +416,12 @@ fn build_envp(py: Python<'_>, env: Option<Bound<'_, PyAny>>) -> PyResult<Vec<CSt
 }
 
 fn build_ptrs(values: &[CString]) -> Vec<*mut libc::c_char> {
-    let mut ptrs = values.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
+    let mut ptrs = values
+        .iter()
+        .map(|value| value.as_ptr())
+        .collect::<Vec<_>>();
     ptrs.push(std::ptr::null());
-    ptrs
-        .into_iter()
+    ptrs.into_iter()
         .map(|ptr| ptr.cast_mut())
         .collect::<Vec<*mut libc::c_char>>()
 }
@@ -484,7 +482,9 @@ impl PosixSpawnFileActions {
     fn add_dup2(&mut self, from: RawFd, to: RawFd) -> PyResult<()> {
         let rc = unsafe { libc::posix_spawn_file_actions_adddup2(&mut self.0 as *mut _, from, to) };
         if rc != 0 {
-            Err(PyOSError::new_err(io::Error::from_raw_os_error(rc).to_string()))
+            Err(PyOSError::new_err(
+                io::Error::from_raw_os_error(rc).to_string(),
+            ))
         } else {
             Ok(())
         }
@@ -493,7 +493,9 @@ impl PosixSpawnFileActions {
     fn add_close(&mut self, fd: RawFd) -> PyResult<()> {
         let rc = unsafe { libc::posix_spawn_file_actions_addclose(&mut self.0 as *mut _, fd) };
         if rc != 0 {
-            Err(PyOSError::new_err(io::Error::from_raw_os_error(rc).to_string()))
+            Err(PyOSError::new_err(
+                io::Error::from_raw_os_error(rc).to_string(),
+            ))
         } else {
             Ok(())
         }
@@ -506,7 +508,9 @@ impl PosixSpawnFileActions {
                 posix_spawn_file_actions_addchdir_np(&mut self.0 as *mut _, path.as_ptr())
             };
             if rc != 0 {
-                Err(PyOSError::new_err(io::Error::from_raw_os_error(rc).to_string()))
+                Err(PyOSError::new_err(
+                    io::Error::from_raw_os_error(rc).to_string(),
+                ))
             } else {
                 Ok(())
             }

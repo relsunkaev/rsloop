@@ -139,7 +139,11 @@ impl SubprocessTransport {
 
     fn _pipe_data_received(&mut self, py: Python<'_>, fd: i32, data: Py<PyAny>) -> PyResult<()> {
         self.assert_loop_thread(py)?;
-        let callback = self.protocol.bind(py).getattr("pipe_data_received")?.unbind();
+        let callback = self
+            .protocol
+            .bind(py)
+            .getattr("pipe_data_received")?
+            .unbind();
         let fd_obj = fd.into_py_any(py)?;
         self.call_or_queue(py, PendingCall::TwoArgs(callback, fd_obj, data))?;
         Ok(())
@@ -164,7 +168,11 @@ impl SubprocessTransport {
         }
         self.closed = true;
 
-        let loop_closed = self.loop_obj.bind(py).call_method0("is_closed")?.extract::<bool>()?;
+        let loop_closed = self
+            .loop_obj
+            .bind(py)
+            .call_method0("is_closed")?
+            .extract::<bool>()?;
         if !loop_closed {
             for (fd, proto) in self.pipes.iter() {
                 if let Ok(pipe) = proto.bind(py).getattr("pipe") {
@@ -277,7 +285,11 @@ impl SubprocessTransport {
     fn wakeup_waiters(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(returncode) = self.returncode {
             for waiter in self.exit_waiters.drain(..) {
-                if !waiter.bind(py).call_method0("cancelled")?.extract::<bool>()? {
+                if !waiter
+                    .bind(py)
+                    .call_method0("cancelled")?
+                    .extract::<bool>()?
+                {
                     let _ = waiter.call_method1(py, "set_result", (returncode,));
                 }
             }

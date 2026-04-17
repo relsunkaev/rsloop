@@ -13,6 +13,8 @@ from typing import Any
 
 import loops as harness
 
+DEFAULT_PROFILE = harness.DEFAULT_PROFILE
+
 
 def run(cmd: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -123,7 +125,7 @@ def emit_summary(payload: dict[str, Any]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark", choices=[*harness.BENCHMARKS.keys(), "all"], default="all")
-    parser.add_argument("--profile", choices=sorted(harness.PROFILE_BENCHMARKS), default="default")
+    parser.add_argument("--profile", choices=sorted(harness.PROFILE_BENCHMARKS), default=DEFAULT_PROFILE)
     parser.add_argument("--iterations", type=int, default=None)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)

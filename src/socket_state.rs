@@ -29,10 +29,23 @@ struct PendingAccept {
     future: Py<PyAny>,
 }
 
+struct PendingRecvFrom {
+    future: Py<PyAny>,
+    size: usize,
+}
+
+struct PendingRecvFromInto {
+    future: Py<PyAny>,
+    buffer: Py<PyAny>,
+    nbytes: usize,
+}
+
 enum PendingRead {
     Recv(PendingRecv),
     RecvInto(PendingRecvInto),
     Accept(PendingAccept),
+    RecvFrom(PendingRecvFrom),
+    RecvFromInto(PendingRecvFromInto),
 }
 
 impl PendingRead {
@@ -41,6 +54,8 @@ impl PendingRead {
             Self::Recv(op) => &op.future,
             Self::RecvInto(op) => &op.future,
             Self::Accept(op) => &op.future,
+            Self::RecvFrom(op) => &op.future,
+            Self::RecvFromInto(op) => &op.future,
         }
     }
 }
@@ -52,8 +67,39 @@ struct PendingSend {
     sent: usize,
 }
 
+struct PendingSendTo {
+    future: Py<PyAny>,
+    data: Py<PyAny>,
+    address: Py<PyAny>,
+}
+
+enum PendingWrite {
+    Send(PendingSend),
+    SendTo(PendingSendTo),
+}
+
+impl PendingWrite {
+    fn future(&self) -> &Py<PyAny> {
+        match self {
+            Self::Send(op) => &op.future,
+            Self::SendTo(op) => &op.future,
+        }
+    }
+}
+
 struct PendingConnect {
     future: Py<PyAny>,
+}
+
+pub(crate) enum SocketCompletion {
+    FutureResult {
+        future: Py<PyAny>,
+        value: Py<PyAny>,
+    },
+    FutureException {
+        future: Py<PyAny>,
+        exception: Py<PyAny>,
+    },
 }
 
 pub(crate) type SocketCoreRef = Rc<RefCell<SocketCore>>;
@@ -65,7 +111,7 @@ pub(crate) struct SocketCore {
     registry: Py<SocketStateRegistry>,
     read_buffer: Vec<u8>,
     reads: VecDeque<PendingRead>,
-    writes: VecDeque<PendingSend>,
+    writes: VecDeque<PendingWrite>,
     connects: VecDeque<PendingConnect>,
     closed: bool,
 }
@@ -142,6 +188,32 @@ impl SocketState {
         self.core.borrow().sync_interest(py)
     }
 
+    fn enqueue_recvfrom(&mut self, py: Python<'_>, future: Py<PyAny>, size: usize) -> PyResult<()> {
+        self.core
+            .borrow_mut()
+            .reads
+            .push_back(PendingRead::RecvFrom(PendingRecvFrom { future, size }));
+        self.core.borrow().sync_interest(py)
+    }
+
+    fn enqueue_recvfrom_into(
+        &mut self,
+        py: Python<'_>,
+        future: Py<PyAny>,
+        buffer: Py<PyAny>,
+        nbytes: usize,
+    ) -> PyResult<()> {
+        self.core
+            .borrow_mut()
+            .reads
+            .push_back(PendingRead::RecvFromInto(PendingRecvFromInto {
+                future,
+                buffer,
+                nbytes,
+            }));
+        self.core.borrow().sync_interest(py)
+    }
+
     fn enqueue_sendall(
         &mut self,
         py: Python<'_>,
@@ -158,12 +230,33 @@ impl SocketState {
             }
             return Ok(());
         }
-        self.core.borrow_mut().writes.push_back(PendingSend {
-            future,
-            data: buffer,
-            len: data_len,
-            sent,
-        });
+        self.core
+            .borrow_mut()
+            .writes
+            .push_back(PendingWrite::Send(PendingSend {
+                future,
+                data: buffer,
+                len: data_len,
+                sent,
+            }));
+        self.core.borrow().sync_interest(py)
+    }
+
+    fn enqueue_sendto(
+        &mut self,
+        py: Python<'_>,
+        future: Py<PyAny>,
+        data: Py<PyAny>,
+        address: Py<PyAny>,
+    ) -> PyResult<()> {
+        self.core
+            .borrow_mut()
+            .writes
+            .push_back(PendingWrite::SendTo(PendingSendTo {
+                future,
+                data,
+                address,
+            }));
         self.core.borrow().sync_interest(py)
     }
 
@@ -206,11 +299,7 @@ impl SocketCore {
                             else {
                                 unreachable!("recv variant changed while queued");
                             };
-                            if !future_done(py, &op.future)? {
-                                op.future
-                                    .bind(py)
-                                    .call_method1("set_result", (payload.bind(py),))?;
-                            }
+                            self.queue_result(py, op.future, payload)?;
                         }
                         Ok(n) => {
                             let payload =
@@ -220,11 +309,7 @@ impl SocketCore {
                             else {
                                 unreachable!("recv variant changed while queued");
                             };
-                            if !future_done(py, &op.future)? {
-                                op.future
-                                    .bind(py)
-                                    .call_method1("set_result", (payload.bind(py),))?;
-                            }
+                            self.queue_result(py, op.future, payload)?;
                         }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                         Err(err) => {
@@ -233,12 +318,13 @@ impl SocketCore {
                             else {
                                 unreachable!("recv variant changed while queued");
                             };
-                            if !future_done(py, &op.future)? {
-                                op.future.bind(py).call_method1(
-                                    "set_exception",
-                                    (PyRuntimeError::new_err(err.to_string()).into_value(py),),
-                                )?;
-                            }
+                            self.queue_exception(
+                                py,
+                                op.future,
+                                PyRuntimeError::new_err(err.to_string())
+                                    .into_value(py)
+                                    .into(),
+                            )?;
                         }
                     }
                 }
@@ -249,9 +335,11 @@ impl SocketCore {
                         else {
                             unreachable!("recv_into variant changed while queued");
                         };
-                        if !future_done(py, &op.future)? {
-                            op.future.bind(py).call_method1("set_result", (0,))?;
-                        }
+                        self.queue_result(
+                            py,
+                            op.future,
+                            0_i32.into_pyobject(py)?.unbind().into_any(),
+                        )?;
                     }
                     Ok(n) => {
                         let PendingRead::RecvInto(op) =
@@ -259,9 +347,7 @@ impl SocketCore {
                         else {
                             unreachable!("recv_into variant changed while queued");
                         };
-                        if !future_done(py, &op.future)? {
-                            op.future.bind(py).call_method1("set_result", (n,))?;
-                        }
+                        self.queue_result(py, op.future, n.into_pyobject(py)?.unbind().into_any())?;
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                     Err(err) => {
@@ -270,12 +356,13 @@ impl SocketCore {
                         else {
                             unreachable!("recv_into variant changed while queued");
                         };
-                        if !future_done(py, &op.future)? {
-                            op.future.bind(py).call_method1(
-                                "set_exception",
-                                (PyRuntimeError::new_err(err.to_string()).into_value(py),),
-                            )?;
-                        }
+                        self.queue_exception(
+                            py,
+                            op.future,
+                            PyRuntimeError::new_err(err.to_string())
+                                .into_value(py)
+                                .into(),
+                        )?;
                     }
                 },
                 PendingRead::Accept(_) => match accept_socket(py, &self.sock) {
@@ -284,11 +371,7 @@ impl SocketCore {
                         else {
                             unreachable!("accept variant changed while queued");
                         };
-                        if !future_done(py, &op.future)? {
-                            op.future
-                                .bind(py)
-                                .call_method1("set_result", (payload.bind(py),))?;
-                        }
+                        self.queue_result(py, op.future, payload)?;
                     }
                     Err(err)
                         if err.is_instance_of::<PyBlockingIOError>(py)
@@ -301,11 +384,61 @@ impl SocketCore {
                         else {
                             unreachable!("accept variant changed while queued");
                         };
-                        if !future_done(py, &op.future)? {
-                            op.future
-                                .bind(py)
-                                .call_method1("set_exception", (err.into_value(py),))?;
+                        self.queue_exception(py, op.future, err.into_value(py).into())?;
+                    }
+                },
+                PendingRead::RecvFrom(op) => {
+                    match self.sock.bind(py).call_method1("recvfrom", (op.size,)) {
+                        Ok(payload) => {
+                            let PendingRead::RecvFrom(op) =
+                                self.reads.pop_front().expect("front above")
+                            else {
+                                unreachable!("recvfrom variant changed while queued");
+                            };
+                            self.queue_result(py, op.future, payload.unbind())?;
                         }
+                        Err(err)
+                            if err.is_instance_of::<PyBlockingIOError>(py)
+                                || err.is_instance_of::<PyInterruptedError>(py) =>
+                        {
+                            break;
+                        }
+                        Err(err) => {
+                            let PendingRead::RecvFrom(op) =
+                                self.reads.pop_front().expect("front above")
+                            else {
+                                unreachable!("recvfrom variant changed while queued");
+                            };
+                            self.queue_exception(py, op.future, err.into_value(py).into())?;
+                        }
+                    }
+                }
+                PendingRead::RecvFromInto(op) => match self
+                    .sock
+                    .bind(py)
+                    .call_method1("recvfrom_into", (op.buffer.bind(py), op.nbytes))
+                {
+                    Ok(payload) => {
+                        let PendingRead::RecvFromInto(op) =
+                            self.reads.pop_front().expect("front above")
+                        else {
+                            unreachable!("recvfrom_into variant changed while queued");
+                        };
+                        self.queue_result(py, op.future, payload.unbind())?;
+                    }
+                    Err(err)
+                        if err.is_instance_of::<PyBlockingIOError>(py)
+                            || err.is_instance_of::<PyInterruptedError>(py) =>
+                    {
+                        break;
+                    }
+                    Err(err) => {
+                        let PendingRead::RecvFromInto(op) =
+                            self.reads.pop_front().expect("front above")
+                        else {
+                            unreachable!("recvfrom_into variant changed while queued");
+                        };
+                        self.queue_exception(py, op.future, err.into_value(py).into())?;
                     }
                 },
             }
@@ -326,61 +459,109 @@ impl SocketCore {
             match socket_error(self.fd) {
                 Ok(0) => {
                     let op = self.connects.pop_front().expect("front above");
-                    if !future_done(py, &op.future)? {
-                        op.future
-                            .bind(py)
-                            .call_method1("set_result", (py.None(),))?;
-                    }
+                    self.queue_result(py, op.future, py.None())?;
                 }
                 Ok(err) => {
                     let op = self.connects.pop_front().expect("front above");
-                    if !future_done(py, &op.future)? {
-                        op.future.bind(py).call_method1(
-                            "set_exception",
-                            (pyo3::exceptions::PyOSError::new_err(err),),
-                        )?;
-                    }
+                    self.queue_exception(
+                        py,
+                        op.future,
+                        pyo3::exceptions::PyOSError::new_err(err)
+                            .into_value(py)
+                            .into(),
+                    )?;
                 }
                 Err(err) => {
                     let op = self.connects.pop_front().expect("front above");
-                    if !future_done(py, &op.future)? {
-                        op.future.bind(py).call_method1(
-                            "set_exception",
-                            (PyRuntimeError::new_err(err.to_string()).into_value(py),),
-                        )?;
-                    }
+                    self.queue_exception(
+                        py,
+                        op.future,
+                        PyRuntimeError::new_err(err.to_string())
+                            .into_value(py)
+                            .into(),
+                    )?;
                 }
             }
         }
 
-        while let Some(op) = self.writes.front_mut() {
-            if future_done(py, &op.future)? {
+        while let Some(op) = self.writes.front() {
+            if future_done(py, op.future())? {
                 self.writes.pop_front();
                 continue;
             }
-            match send_from_buffer(py, self.fd, &op.data, op.sent, op.len)? {
-                Ok(0) => break,
-                Ok(n) => {
-                    op.sent += n;
-                    if op.sent == op.len {
-                        let op = self.writes.pop_front().expect("front above");
-                        if !future_done(py, &op.future)? {
-                            op.future
-                                .bind(py)
-                                .call_method1("set_result", (py.None(),))?;
+            let mut pop_front = false;
+            match self.writes.front_mut().expect("front above") {
+                PendingWrite::Send(op) => {
+                    match send_from_buffer(py, self.fd, &op.data, op.sent, op.len)? {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            op.sent += n;
+                            if op.sent == op.len {
+                                pop_front = true;
+                            }
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(err) => {
+                            let PendingWrite::Send(op) =
+                                self.writes.pop_front().expect("front above")
+                            else {
+                                unreachable!("send variant changed while queued");
+                            };
+                            self.queue_exception(
+                                py,
+                                op.future,
+                                PyRuntimeError::new_err(err.to_string())
+                                    .into_value(py)
+                                    .into(),
+                            )?;
+                            continue;
                         }
                     }
                 }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                Err(err) => {
-                    let op = self.writes.pop_front().expect("front above");
-                    if !future_done(py, &op.future)? {
-                        op.future.bind(py).call_method1(
-                            "set_exception",
-                            (PyRuntimeError::new_err(err.to_string()).into_value(py),),
+                PendingWrite::SendTo(op) => match self
+                    .sock
+                    .bind(py)
+                    .call_method1("sendto", (op.data.bind(py), op.address.bind(py)))
+                {
+                    Ok(sent) => {
+                        let sent = sent.extract::<usize>()?;
+                        let PendingWrite::SendTo(op) =
+                            self.writes.pop_front().expect("front above")
+                        else {
+                            unreachable!("sendto variant changed while queued");
+                        };
+                        self.queue_result(
+                            py,
+                            op.future,
+                            sent.into_pyobject(py)?.unbind().into_any(),
                         )?;
+                        if sent == 0 {
+                            break;
+                        }
+                        continue;
                     }
-                }
+                    Err(err)
+                        if err.is_instance_of::<PyBlockingIOError>(py)
+                            || err.is_instance_of::<PyInterruptedError>(py) =>
+                    {
+                        break;
+                    }
+                    Err(err) => {
+                        let PendingWrite::SendTo(op) =
+                            self.writes.pop_front().expect("front above")
+                        else {
+                            unreachable!("sendto variant changed while queued");
+                        };
+                        self.queue_exception(py, op.future, err.into_value(py).into())?;
+                        continue;
+                    }
+                },
+            }
+            if pop_front {
+                let PendingWrite::Send(op) = self.writes.pop_front().expect("front above") else {
+                    unreachable!("send variant changed while queued");
+                };
+                self.queue_result(py, op.future, py.None())?;
             }
         }
 
@@ -406,8 +587,8 @@ impl SocketCore {
             }
         }
         for op in self.writes.drain(..) {
-            if !future_done(py, &op.future)? {
-                op.future.bind(py).call_method0("cancel")?;
+            if !future_done(py, op.future())? {
+                op.future().bind(py).call_method0("cancel")?;
             }
         }
         for op in self.connects.drain(..) {
@@ -425,6 +606,33 @@ impl SocketCore {
             .bind(py)
             .borrow()
             .set_interest_inner(self.fd, readable, writable)?;
+        Ok(())
+    }
+
+    fn queue_result(&self, py: Python<'_>, future: Py<PyAny>, value: Py<PyAny>) -> PyResult<()> {
+        if future_done(py, &future)? {
+            return Ok(());
+        }
+        self.registry
+            .bind(py)
+            .borrow()
+            .queue_completion(SocketCompletion::FutureResult { future, value });
+        Ok(())
+    }
+
+    fn queue_exception(
+        &self,
+        py: Python<'_>,
+        future: Py<PyAny>,
+        exception: Py<PyAny>,
+    ) -> PyResult<()> {
+        if future_done(py, &future)? {
+            return Ok(());
+        }
+        self.registry
+            .bind(py)
+            .borrow()
+            .queue_completion(SocketCompletion::FutureException { future, exception });
         Ok(())
     }
 }

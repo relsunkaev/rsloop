@@ -37,6 +37,7 @@ from .sslproto import RsloopSSLProtocol
 
 logger = _selector_events.logger
 _RUST_READ_PIPE_TRANSPORT = getattr(_rsloop, "ReadPipeTransport", None)
+_RUST_WRITE_PIPE_TRANSPORT = getattr(_rsloop, "WritePipeTransport", None)
 _ORIGINAL_STREAMWRITER = _streams.StreamWriter
 _ORIGINAL_STREAMREADER_READEXACTLY = _streams.StreamReader.readexactly
 _ORIGINAL_STREAMREADER_READUNTIL = _streams.StreamReader.readuntil
@@ -533,6 +534,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         self._native_api = _rsloop.LoopApi(self, self._scheduler, self._debug)
         self._fd_registry = _rsloop.FdCallbackRegistry()
         self._stream_registry = _rsloop.StreamTransportRegistry()
+        self._pipe_registry = _rsloop.PipeTransportRegistry()
         self._socket_registry = _rsloop.SocketStateRegistry()
         self._signal_handlers: dict[int, _events.Handle] = {}
         self._unix_server_sockets: dict[socket.socket, int] = {}
@@ -891,6 +893,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
             self._rsloop_completion_port,
             self._fd_registry,
             self._stream_registry,
+            self._pipe_registry,
             self._socket_registry,
             self._stopping,
             self._clock_resolution,
@@ -915,6 +918,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
                     self._rsloop_completion_port,
                     self._fd_registry,
                     self._stream_registry,
+                    self._pipe_registry,
                     self._socket_registry,
                     self._clock_resolution,
                     self._debug,
@@ -944,7 +948,7 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
                 continue
             target(payload)
 
-    def _rsloop_socket_state(self, sock: socket.socket) -> _SocketState:
+    def _rsloop_socket_state(self, sock: socket.socket) -> Any:
         fd = sock.fileno()
         state = self._rsloop_socket_states.get(fd)
         if state is not None and state.sock is not sock:
@@ -1121,13 +1125,11 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         except (BlockingIOError, InterruptedError):
             pass
         future = self.create_future()
-        fd = sock.fileno()
-        self._ensure_fd_no_transport(fd)
-        handle = self._add_reader(fd, self._sock_recvfrom, future, sock, bufsize)
-        future.add_done_callback(
-            functools.partial(self._sock_read_done, fd, handle=handle)
-        )
-        return await future
+        self._rsloop_socket_state(sock).enqueue_recvfrom(future, bufsize)
+        try:
+            return await future
+        finally:
+            future = None
 
     async def sock_recvfrom_into(
         self, sock: socket.socket, buf: Any, nbytes: int = 0
@@ -1141,16 +1143,14 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
             return sock.recvfrom_into(buf, nbytes)
         except (BlockingIOError, InterruptedError):
             pass
+        view = self._byte_view(buf, writable=True)
         future = self.create_future()
-        fd = sock.fileno()
-        self._ensure_fd_no_transport(fd)
-        handle = self._add_reader(
-            fd, self._sock_recvfrom_into, future, sock, buf, nbytes
-        )
-        future.add_done_callback(
-            functools.partial(self._sock_read_done, fd, handle=handle)
-        )
-        return await future
+        self._rsloop_socket_state(sock).enqueue_recvfrom_into(future, view, nbytes)
+        try:
+            return await future
+        finally:
+            future = None
+            view = None
 
     async def sock_sendto(
         self, sock: socket.socket, data: bytes | bytearray | memoryview, address: Any
@@ -1158,82 +1158,18 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         _base_events._check_ssl_socket(sock)
         if self._debug and sock.gettimeout() != 0:
             raise ValueError("the socket must be non-blocking")
+        view = self._byte_view(data)
         try:
-            return sock.sendto(data, address)
+            return sock.sendto(view, address)
         except (BlockingIOError, InterruptedError):
             pass
         future = self.create_future()
-        fd = sock.fileno()
-        self._ensure_fd_no_transport(fd)
-        handle = self._add_writer(fd, self._sock_sendto, future, sock, data, address)
-        future.add_done_callback(
-            functools.partial(self._sock_write_done, fd, handle=handle)
-        )
-        return await future
-
-    def _sock_read_done(
-        self, fd: int, fut: asyncio.Future[Any], handle: _events.Handle | None = None
-    ) -> None:
-        if handle is None or not handle.cancelled():
-            self.remove_reader(fd)
-
-    def _sock_write_done(
-        self, fd: int, fut: asyncio.Future[Any], handle: _events.Handle | None = None
-    ) -> None:
-        if handle is None or not handle.cancelled():
-            self.remove_writer(fd)
-
-    def _sock_recvfrom(
-        self, fut: asyncio.Future[Any], sock: socket.socket, bufsize: int
-    ) -> None:
-        if fut.done():
-            return
+        self._rsloop_socket_state(sock).enqueue_sendto(future, view, address)
         try:
-            result = sock.recvfrom(bufsize)
-        except (BlockingIOError, InterruptedError):
-            return
-        except (SystemExit, KeyboardInterrupt):
-            raise
-        except BaseException as exc:
-            fut.set_exception(exc)
-        else:
-            fut.set_result(result)
-
-    def _sock_recvfrom_into(
-        self, fut: asyncio.Future[Any], sock: socket.socket, buf: Any, bufsize: int
-    ) -> None:
-        if fut.done():
-            return
-        try:
-            result = sock.recvfrom_into(buf, bufsize)
-        except (BlockingIOError, InterruptedError):
-            return
-        except (SystemExit, KeyboardInterrupt):
-            raise
-        except BaseException as exc:
-            fut.set_exception(exc)
-        else:
-            fut.set_result(result)
-
-    def _sock_sendto(
-        self,
-        fut: asyncio.Future[Any],
-        sock: socket.socket,
-        data: bytes | bytearray | memoryview,
-        address: Any,
-    ) -> None:
-        if fut.done():
-            return
-        try:
-            n = sock.sendto(data, address)
-        except (BlockingIOError, InterruptedError):
-            return
-        except (SystemExit, KeyboardInterrupt):
-            raise
-        except BaseException as exc:
-            fut.set_exception(exc)
-        else:
-            fut.set_result(n)
+            return await future
+        finally:
+            future = None
+            view = None
 
     def _sock_add_cancellation_callback(
         self, fut: asyncio.Future[Any], sock: socket.socket
@@ -1456,6 +1392,10 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         waiter: asyncio.Future[Any] | None = None,
         extra: dict[str, Any] | None = None,
     ) -> asyncio.Transport:
+        if _RUST_WRITE_PIPE_TRANSPORT is not None:
+            transport = _RUST_WRITE_PIPE_TRANSPORT(self, pipe, protocol, extra)
+            transport.activate(waiter)
+            return transport
         return RsloopWritePipeTransport(self, pipe, protocol, waiter, extra)
 
     def _native_subprocess_stdio_mode(
@@ -2031,6 +1971,9 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
             for state in socket_states.values():
                 state.close()
             socket_states.clear()
+        pipe_registry = getattr(self, "_pipe_registry", None)
+        if pipe_registry is not None:
+            pipe_registry.clear()
         completion_port = getattr(self, "_rsloop_completion_port", None)
         if completion_port is not None:
             self._poller.set_interest(completion_port.fileno(), False, False)
