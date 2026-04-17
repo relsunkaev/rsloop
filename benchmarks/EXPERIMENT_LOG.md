@@ -1725,3 +1725,182 @@ hop or a repeated protocol lookup. The remaining credible directions are:
 - Decision: kept
 - Artifacts:
   - [`benchmarks/out/subprocess_spawn_exit-cwd-rerun.json`](out/subprocess_spawn_exit-cwd-rerun.json)
+
+### 63. Loop-owned native pipe registry and unified pipe transport state
+
+- Area:
+  - [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+  - [`src/pipe_registry.rs`](../src/pipe_registry.rs)
+  - [`src/pipe_transport.rs`](../src/pipe_transport.rs)
+  - [`src/socket_state.rs`](../src/socket_state.rs)
+  - [`src/subprocess_pipe_transport.rs`](../src/subprocess_pipe_transport.rs)
+  - [`tests/test_loop.py`](../tests/test_loop.py)
+- Change:
+  - move `connect_read_pipe()`, `connect_write_pipe()`, and subprocess stdio
+    pipes onto a loop-owned native registry instead of stdlib
+    `_UnixReadPipeTransport` / `_UnixWritePipeTransport`
+  - keep cross-thread pipe completions and subprocess watcher notifications as
+    loop-thread state transitions, matching the execution-model invariant
+  - share the same native transport/control-plane machinery across explicit
+    pipe APIs and subprocess stdio instead of maintaining separate Python and
+    Rust ownership boundaries
+- Rationale:
+  - earlier entries showed the remaining `pipe_write` gap was dominated by
+    stdlib pipe transport bookkeeping, while the spawn-boundary work in entries
+    60-62 had already pushed `subprocess_exec` close to parity
+  - the next real cut was therefore not another micro-optimization around
+    `writev`, but removing the stdlib pipe transport boundary entirely
+- Functional result:
+  - `./.venv/bin/maturin develop --release` passed
+  - `./.venv/bin/python -m unittest discover -s tests -p 'test*.py' -v`
+    passed (`37` tests)
+  - focused loop-thread ordering / dispatch coverage for native pipes and
+    subprocess callbacks remained green
+- Benchmark rerun (real profile, 5 repeats, 1 warmup, baseline `uvloop`):
+  - `pipe_write`: rsloop `0.637x`, paired `0.622x`, wins `5/5`
+  - `subprocess_exec`: rsloop `0.982x`, paired `0.999x`, wins `3/5`
+  - `tls_http1_keepalive`: rsloop `0.816x`, paired `0.822x`, wins `4/5`
+  - `asgi_json_echo`: rsloop `1.024x`, paired `1.016x`, wins `2/5`
+  - `http1_keepalive_small`: rsloop `1.017x`, paired `1.022x`, wins `1/5`
+  - remaining laggards:
+    - `asgi_streaming`: paired `1.055x`
+    - `grpc_like_unary`: paired `1.085x`
+    - `http1_connect_per_request`: paired `1.100x`
+    - `udp_datagram_endpoint`: paired `1.102x`
+    - `http1_streaming_response`: paired `1.111x`
+- Conclusion:
+  - this experiment worked for the paths it actually targeted: removing the
+    stdlib pipe boundary made `pipe_write` decisively faster than `uvloop` and
+    kept `subprocess_exec` effectively at parity
+  - it also improved one adjacent real workload (`tls_http1_keepalive`),
+    consistent with less control-plane churn around shared native I/O state
+  - it did not close the remaining HTTP/ASGI/datagram/connect gaps because
+    those costs live outside the pipe/subprocess transport boundary
+- Decision: kept
+- Artifacts:
+  - [`benchmarks/out/real-post-51cce36.json`](out/real-post-51cce36.json)
+
+### 64. Make `real` the shared default benchmark gate
+
+- Area:
+  - [`benchmarks/loops.py`](../benchmarks/loops.py)
+  - [`benchmarks/README.md`](../benchmarks/README.md)
+  - [`tests/test_benchmarks.py`](../tests/test_benchmarks.py)
+- Change:
+  - promote the app-shaped `real` profile to the default benchmark profile
+  - add tests that pin the default/profile-selection behavior so future runs do
+    not silently fall back to the older balanced micro/control-plane mix
+- Rationale:
+  - several earlier experiments looked attractive on narrower or looser runs
+    and then failed once they were held against the real-workload set
+  - making `real` the default reduces the chance of keeping benchmark-shaped
+    wins that do not survive the broader gate
+- Functional result:
+  - `./.venv/bin/python -m unittest tests.test_benchmarks -v` passed
+- Performance result:
+  - this is measurement-discipline infrastructure, not a runtime speedup by
+    itself
+  - its value is that the kept pipe-registry change above was validated against
+    the harder default gate instead of an easier micro-heavy profile
+- Conclusion:
+  - worked as intended for benchmark discipline
+  - not a performance optimization on its own, but it prevents misleading
+    keep/revert decisions
+- Decision: kept as benchmark infrastructure
+
+### 65. Native datagram transport plus transport-owned datagram queueing
+
+- Area:
+  - [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+  - `python/rsloop/datagram_transport.py` (experiment-only, reverted)
+  - [`src/socket_state.rs`](../src/socket_state.rs)
+  - [`tests/test_loop.py`](../tests/test_loop.py)
+- Change:
+  - replace stdlib `_SelectorDatagramTransport` with an rsloop-owned datagram
+    transport that drives read/write loops through the loop-owned socket state
+  - teach the Rust socket-state path to handle datagram read/write queueing more
+    natively for benchmark-shaped IPv4/IPv6 address tuples
+- Rationale:
+  - entry 34 showed that swapping only the transport wrapper was too shallow,
+    so the next cut tried to move both the transport boundary and the queued
+    datagram control path onto rsloop-owned machinery
+- Functional result:
+  - the first version hung under sustained traffic because connected UDP
+    transports were still calling `sendto()` on already-connected sockets
+  - after fixing that correctness issue, the focused datagram repro completed
+    and the benchmark lane finished normally
+  - the implementation was then reverted after measurement
+- Benchmark rerun (real profile, 5 repeats, 1 warmup, baseline `uvloop`):
+  - `udp_datagram_endpoint`: rsloop `2.043x`, paired `2.049x`, wins `0/5`
+- Conclusion:
+  - this did not help; it made the datagram endpoint path dramatically slower
+    than the existing baseline
+  - the extra Python transport tasks plus the new queueing/control path were
+    worse than the stdlib transport boundary for this workload
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/udp-datagram-inline-accept.json`](out/udp-datagram-inline-accept.json)
+
+### 66. Task-driven native accept loop via `sock_accept()`
+
+- Area:
+  - [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+- Change:
+  - replace `_add_reader(... sock.accept() ...)` server readiness handling with a
+    loop-owned accept task that repeatedly awaits `sock_accept()` and hands
+    accepted sockets back into the existing connection setup path
+- Rationale:
+  - entry 11 showed that broader accept-driver rewrites were too disruptive, so
+    this retry narrowed the change to just the readiness/accept boundary while
+    preserving the existing protocol and transport creation path
+- Functional result:
+  - implementation built and passed the full test suite
+  - the implementation was then reverted after measurement
+- Benchmark rerun (real profile, 5 repeats, 1 warmup, baseline `uvloop`):
+  - `http1_connect_per_request`: rsloop `1.106x`, paired `1.106x`, wins `0/5`
+- Conclusion:
+  - the narrower accept loop did not move the connection-heavy HTTP benchmark
+    in a useful direction
+  - the control-plane change was effectively flat to slightly negative, so it
+    did not justify widening the serving path
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/http1-connect-accept-loop.json`](out/http1-connect-accept-loop.json)
+
+### 67. Narrow non-TLS inline write flush for mid-sized queued chunks
+
+- Area:
+  - [`src/stream_transport.rs`](../src/stream_transport.rs)
+- Change:
+  - after queue coalescing, try a one-shot immediate flush for already-connected
+    plain streams when the queued front chunk falls in a mid-sized range, with
+    the goal of helping streaming/RPC paths without reopening the older tiny
+    write regressions
+- Rationale:
+  - the remaining app-shaped gaps were concentrated in `writer.write(...);
+    await writer.drain()` streaming/RPC cases, and earlier broad write/drain
+    experiments had already shown that global fast paths were too blunt
+- Functional result:
+  - `./.venv/bin/maturin develop --release` passed
+  - `./.venv/bin/python -m unittest discover -s tests -p 'test*.py' -v`
+    passed
+  - the implementation was then reverted after measurement
+- Benchmark reruns (real profile, 5 repeats, 1 warmup, baseline `uvloop`):
+  - `http1_streaming_response`: rsloop `1.122x`, paired `1.123x`, wins `0/5`
+  - `asgi_streaming`: rsloop `1.117x`, paired `1.117x`, wins `0/5`
+  - `grpc_like_unary`: rsloop `1.117x`, paired `1.112x`, wins `0/5`
+  - guard rails:
+    - `http1_keepalive_small`: rsloop `1.012x`, paired `1.014x`, wins `0/5`
+    - `asgi_json_echo`: rsloop `1.016x`, paired `1.016x`, wins `0/5`
+- Conclusion:
+  - this did not improve the intended streaming/RPC workloads and in practice
+    made them slightly worse
+  - the guard rails stayed roughly flat, which means the cut was narrow enough,
+    but still not useful enough to keep
+- Decision: reverted
+- Artifacts:
+  - [`benchmarks/out/http1-streaming-inline-write.json`](out/http1-streaming-inline-write.json)
+  - [`benchmarks/out/asgi-streaming-inline-write.json`](out/asgi-streaming-inline-write.json)
+  - [`benchmarks/out/grpc-like-inline-write.json`](out/grpc-like-inline-write.json)
+  - [`benchmarks/out/http1-keepalive-small-inline-write.json`](out/http1-keepalive-small-inline-write.json)
+  - [`benchmarks/out/asgi-json-echo-inline-write.json`](out/asgi-json-echo-inline-write.json)
