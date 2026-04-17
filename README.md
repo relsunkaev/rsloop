@@ -35,3 +35,13 @@ Rsloop now implements the event-loop contract by plugging a Tokio-backed selecto
 The Rust/Python future bridge APIs now resolve through a loop-owned completion port instead of calling back into `asyncio` directly from Tokio worker threads.
 
 For Python 3.14+ the preferred entrypoint is `rsloop.run(...)`, which uses `asyncio.Runner(loop_factory=RsloopEventLoop)` instead of the deprecated global policy API.
+
+## Execution model invariant
+
+Rsloop runs Python and Rust async work on the same loop runtime boundary:
+
+- A given `RsloopEventLoop` has one loop-owning thread.
+- Rust worker or watcher threads must not resolve Python futures directly.
+- Cross-runtime completions (`await` Python futures from Rust, `await` Rust futures from Python) are always marshaled onto the loop thread first.
+
+This invariant is what keeps callback ordering and asyncio compatibility stable while allowing Rust-side execution.

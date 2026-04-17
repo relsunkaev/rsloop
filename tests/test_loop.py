@@ -587,13 +587,21 @@ class RsloopLoopTests(unittest.TestCase):
             proc = await asyncio.create_subprocess_exec(
                 sys.executable,
                 "-c",
-                "import sys; data = sys.stdin.buffer.read(); sys.stdout.buffer.write(data[::-1])",
+                (
+                    "import sys; "
+                    "data = sys.stdin.buffer.read(); "
+                    "sys.stdout.buffer.write(data[::-1]); "
+                    "sys.stderr.buffer.write(b'err')"
+                ),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _stderr = await proc.communicate(b"abc123")
+            stdout, stderr = await proc.communicate(b"abc123")
             self.assertEqual(stdout, b"321cba")
+            self.assertEqual(stderr, b"err")
             self.assertEqual(await proc.wait(), 0)
+            self.assertEqual(proc.returncode, 0)
 
             shell_proc = await asyncio.create_subprocess_shell(
                 "printf shell-ok",
@@ -602,6 +610,221 @@ class RsloopLoopTests(unittest.TestCase):
             shell_stdout, _stderr = await shell_proc.communicate()
             self.assertEqual(shell_stdout, b"shell-ok")
             self.assertEqual(await shell_proc.wait(), 0)
+
+            merged_proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    "sys.stdout.buffer.write(b'out'); "
+                    "sys.stderr.buffer.write(b'err')"
+                ),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            merged_stdout, merged_stderr = await merged_proc.communicate()
+            self.assertEqual(merged_stdout, b"outerr")
+            self.assertIsNone(merged_stderr)
+            self.assertEqual(await merged_proc.wait(), 0)
+
+            bare_proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import sys; sys.exit(0)",
+            )
+            self.assertIsNone(bare_proc.stdin)
+            self.assertIsNone(bare_proc.stdout)
+            self.assertIsNone(bare_proc.stderr)
+            self.assertEqual(await bare_proc.wait(), 0)
+
+            failed_proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.write('x'); sys.stderr.write('y'); sys.exit(7)",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            failed_stdout, failed_stderr = await failed_proc.communicate()
+            self.assertEqual(failed_stdout, b"x")
+            self.assertEqual(failed_stderr, b"y")
+            self.assertEqual(await failed_proc.wait(), 7)
+            self.assertEqual(failed_proc.returncode, 7)
+
+            terminate_proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import time; time.sleep(30)",
+            )
+            terminate_proc.terminate()
+            terminate_rc = await terminate_proc.wait()
+            self.assertNotEqual(terminate_rc, 0)
+
+            kill_proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import time; time.sleep(30)",
+            )
+            kill_proc.kill()
+            kill_rc = await kill_proc.wait()
+            self.assertNotEqual(kill_rc, 0)
+
+            no_input_proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    "data = sys.stdin.buffer.read(); "
+                    "sys.stdout.buffer.write(b'none' if not data else data)"
+                ),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+            )
+            no_input_stdout, _ = await no_input_proc.communicate()
+            self.assertEqual(no_input_stdout, b"none")
+            self.assertEqual(await no_input_proc.wait(), 0)
+
+            close_proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import time; time.sleep(30)",
+                stdout=asyncio.subprocess.PIPE,
+            )
+            close_proc._transport.close()
+            close_rc = await close_proc.wait()
+            self.assertIsInstance(close_rc, int)
+
+        self.run_async(main())
+
+    def test_native_subprocess_protocol_ordering(self) -> None:
+        async def main() -> None:
+            loop = asyncio.get_running_loop()
+            events: list[str] = []
+            done = loop.create_future()
+
+            class Protocol(asyncio.SubprocessProtocol):
+                def connection_made(self, transport: asyncio.BaseTransport) -> None:
+                    events.append("connection_made")
+
+                def pipe_data_received(self, fd: int, data: bytes) -> None:
+                    events.append(f"pipe_data_received:{fd}:{data.decode()}")
+
+                def pipe_connection_lost(
+                    self, fd: int, exc: BaseException | None
+                ) -> None:
+                    events.append(f"pipe_connection_lost:{fd}")
+
+                def process_exited(self) -> None:
+                    events.append("process_exited")
+
+                def connection_lost(self, exc: BaseException | None) -> None:
+                    events.append("connection_lost")
+                    if not done.done():
+                        done.set_result(None)
+
+            transport, _ = await loop.subprocess_exec(
+                Protocol,
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    "sys.stdout.write('out'); "
+                    "sys.stdout.flush(); "
+                    "sys.stderr.write('err'); "
+                    "sys.stderr.flush()"
+                ),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await done
+            await transport._wait()
+
+            self.assertLess(events.index("connection_made"), events.index("process_exited"))
+            self.assertLess(events.index("process_exited"), events.index("connection_lost"))
+            self.assertTrue(
+                any(event.startswith("pipe_data_received:1:") for event in events)
+            )
+            self.assertTrue(
+                any(event.startswith("pipe_data_received:2:") for event in events)
+            )
+            self.assertIn("pipe_connection_lost:1", events)
+            self.assertIn("pipe_connection_lost:2", events)
+            self.assertEqual(events.count("pipe_connection_lost:1"), 1)
+            self.assertEqual(events.count("pipe_connection_lost:2"), 1)
+
+        self.run_async(main())
+
+    def test_native_subprocess_callbacks_run_on_loop_thread(self) -> None:
+        async def main() -> None:
+            loop = asyncio.get_running_loop()
+            expected_thread_id = getattr(loop, "_thread_id", None)
+            event_threads: list[tuple[str, int]] = []
+            waiter_thread_id: asyncio.Future[int] = loop.create_future()
+            done = loop.create_future()
+
+            class Protocol(asyncio.SubprocessProtocol):
+                transport: asyncio.Transport | None = None
+
+                def connection_made(self, transport: asyncio.BaseTransport) -> None:
+                    self.transport = transport  # type: ignore[assignment]
+                    event_threads.append(("connection_made", threading.get_ident()))
+                    wait_future = transport._wait()  # type: ignore[attr-defined]
+
+                    def on_wait_done(_future: asyncio.Future[int]) -> None:
+                        if not waiter_thread_id.done():
+                            waiter_thread_id.set_result(threading.get_ident())
+
+                    wait_future.add_done_callback(on_wait_done)
+
+                def pipe_data_received(self, fd: int, data: bytes) -> None:
+                    event_threads.append((f"pipe_data_received:{fd}", threading.get_ident()))
+
+                def pipe_connection_lost(
+                    self, fd: int, exc: BaseException | None
+                ) -> None:
+                    event_threads.append((f"pipe_connection_lost:{fd}", threading.get_ident()))
+
+                def process_exited(self) -> None:
+                    event_threads.append(("process_exited", threading.get_ident()))
+
+                def connection_lost(self, exc: BaseException | None) -> None:
+                    event_threads.append(("connection_lost", threading.get_ident()))
+                    if not done.done():
+                        done.set_result(None)
+
+            await loop.subprocess_exec(
+                Protocol,
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.write('ok\\n')",
+                stdout=asyncio.subprocess.PIPE,
+            )
+
+            await asyncio.wait_for(done, 2.0)
+            observed_waiter_thread_id = await asyncio.wait_for(waiter_thread_id, 2.0)
+
+            self.assertIsNotNone(expected_thread_id)
+            self.assertTrue(event_threads)
+            self.assertTrue(
+                all(thread_id == expected_thread_id for _, thread_id in event_threads)
+            )
+            self.assertEqual(observed_waiter_thread_id, expected_thread_id)
+
+        self.run_async(main())
+
+    def test_native_subprocess_fallback_kwargs(self) -> None:
+        async def main() -> None:
+            env = os.environ.copy()
+            env["RSLOOP_SUBPROCESS_FALLBACK"] = "fallback-ok"
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import os,sys; sys.stdout.write(os.environ['RSLOOP_SUBPROCESS_FALLBACK'])",
+                stdout=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, _ = await proc.communicate()
+            self.assertEqual(stdout, b"fallback-ok")
+            self.assertEqual(await proc.wait(), 0)
 
         self.run_async(main())
 

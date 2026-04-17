@@ -11,11 +11,17 @@ mod handles;
 #[cfg(unix)]
 mod loop_api;
 #[cfg(unix)]
+mod native_subprocess;
+#[cfg(unix)]
 mod poller;
 #[cfg(unix)]
 mod pipe_transport;
 #[cfg(unix)]
+mod subprocess_pipe_transport;
+#[cfg(unix)]
 mod scheduler;
+#[cfg(unix)]
+mod subprocess_transport;
 #[cfg(unix)]
 mod socket_registry;
 #[cfg(unix)]
@@ -40,11 +46,19 @@ use handles::{make_handle, FutureHandle, Handle, OneArgHandle, ZeroArgHandle};
 #[cfg(unix)]
 use loop_api::LoopApi;
 #[cfg(unix)]
+use native_subprocess::{spawn_subprocess, NativePipeEndpoint, NativeSubprocessProcess};
+#[cfg(unix)]
 use poller::TokioPoller;
 #[cfg(unix)]
 use pipe_transport::ReadPipeTransport;
 #[cfg(unix)]
+use subprocess_pipe_transport::{
+    ReadSubprocessPipeProto, WriteSubprocessPipeProto,
+};
+#[cfg(unix)]
 use scheduler::Scheduler;
+#[cfg(unix)]
+use subprocess_transport::SubprocessTransport;
 #[cfg(unix)]
 use socket_registry::SocketStateRegistry;
 #[cfg(unix)]
@@ -81,6 +95,12 @@ fn _rsloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(unix)]
     m.add_class::<LoopApi>()?;
     #[cfg(unix)]
+    m.add_class::<NativePipeEndpoint>()?;
+    #[cfg(unix)]
+    m.add_class::<NativeSubprocessProcess>()?;
+    #[cfg(unix)]
+    m.add_function(wrap_pyfunction!(spawn_subprocess, m)?)?;
+    #[cfg(unix)]
     m.add_class::<StreamTransport>()?;
     #[cfg(unix)]
     m.add_class::<ReadPipeTransport>()?;
@@ -92,6 +112,12 @@ fn _rsloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TokioPoller>()?;
     #[cfg(unix)]
     m.add_class::<Scheduler>()?;
+    #[cfg(unix)]
+    m.add_class::<SubprocessTransport>()?;
+    #[cfg(unix)]
+    m.add_class::<ReadSubprocessPipeProto>()?;
+    #[cfg(unix)]
+    m.add_class::<WriteSubprocessPipeProto>()?;
     #[cfg(unix)]
     m.add_class::<SocketStateRegistry>()?;
     #[cfg(unix)]

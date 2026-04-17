@@ -13,6 +13,7 @@ import socket
 import threading
 import sys
 import ssl
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from asyncio import base_events as _base_events
 from asyncio import constants as _constants
@@ -36,7 +37,6 @@ from .sslproto import RsloopSSLProtocol
 
 logger = _selector_events.logger
 _RUST_READ_PIPE_TRANSPORT = getattr(_rsloop, "ReadPipeTransport", None)
-_RUST_WAITPID_REGISTER = None
 _ORIGINAL_STREAMWRITER = _streams.StreamWriter
 _ORIGINAL_STREAMREADER_READEXACTLY = _streams.StreamReader.readexactly
 _ORIGINAL_STREAMREADER_READUNTIL = _streams.StreamReader.readuntil
@@ -1458,6 +1458,49 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
     ) -> asyncio.Transport:
         return RsloopWritePipeTransport(self, pipe, protocol, waiter, extra)
 
+    def _native_subprocess_stdio_mode(
+        self, value: Any, *, allow_stdout: bool = False
+    ) -> str | None:
+        if value is None:
+            return "inherit"
+        if value == subprocess.PIPE:
+            return "pipe"
+        if value == subprocess.DEVNULL:
+            return "devnull"
+        if allow_stdout and value == subprocess.STDOUT:
+            return "stdout"
+        return None
+
+    def _native_subprocess_spec(
+        self,
+        stdin: Any,
+        stdout: Any,
+        stderr: Any,
+        bufsize: int,
+        kwargs: dict[str, Any],
+    ) -> tuple[str, str, str, dict[str, Any]] | None:
+        if bufsize != 0:
+            return None
+
+        stdin_mode = self._native_subprocess_stdio_mode(stdin)
+        stdout_mode = self._native_subprocess_stdio_mode(stdout)
+        stderr_mode = self._native_subprocess_stdio_mode(stderr, allow_stdout=True)
+        if stdin_mode is None or stdout_mode is None or stderr_mode is None:
+            return None
+
+        supported: dict[str, Any] = {}
+        for key, value in kwargs.items():
+            if key == "env":
+                supported["env"] = value
+            elif key == "restore_signals" and value is True:
+                continue
+            elif key == "start_new_session" and value is False:
+                continue
+            else:
+                return None
+
+        return stdin_mode, stdout_mode, stderr_mode, supported
+
     async def _make_subprocess_transport(
         self,
         protocol: asyncio.BaseProtocol,
@@ -1470,45 +1513,116 @@ class RsloopEventLoop(_base_events.BaseEventLoop):
         extra: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> asyncio.Transport:
+        if __debug__:
+            assert (
+                self._thread_id is not None and threading.get_ident() == self._thread_id
+            ), "subprocess transport creation must run on the loop thread"
         waiter = self.create_future()
-        transport = _unix_events._UnixSubprocessTransport(
-            self,
-            protocol,
-            args,
-            shell,
-            stdin,
-            stdout,
-            stderr,
-            bufsize,
-            waiter=waiter,
-            extra=extra,
-            **kwargs,
-        )
-        if (
-            _RUST_WAITPID_REGISTER is not None
-            and not (hasattr(os, "pidfd_open") and _unix_events.can_use_pidfd())
-        ):
-            _RUST_WAITPID_REGISTER(self, transport.get_pid(), transport)
-        else:
+        transport: Any | None = None
+        proc: Any | None = None
+        stdin_pipe: Any | None = None
+        stdout_pipe: Any | None = None
+        stderr_pipe: Any | None = None
+        try:
+            native_spec = self._native_subprocess_spec(
+                stdin,
+                stdout,
+                stderr,
+                bufsize,
+                kwargs,
+            )
+            if native_spec is not None and hasattr(_rsloop, "spawn_subprocess"):
+                stdin_mode, stdout_mode, stderr_mode, native_kwargs = native_spec
+                proc, stdin_pipe, stdout_pipe, stderr_pipe = _rsloop.spawn_subprocess(
+                    args,
+                    shell,
+                    stdin_mode,
+                    stdout_mode,
+                    stderr_mode,
+                    env=native_kwargs.get("env"),
+                )
+            else:
+                proc = subprocess.Popen(
+                    args,
+                    shell=shell,
+                    stdin=stdin,
+                    stdout=stdout,
+                    stderr=stderr,
+                    bufsize=bufsize,
+                    **kwargs,
+                )
+                stdin_pipe = proc.stdin
+                stdout_pipe = proc.stdout
+                stderr_pipe = proc.stderr
+            transport = _rsloop.SubprocessTransport(self, protocol, proc, extra)
             self._watcher.add_child_handler(
-                transport.get_pid(),
+                proc.pid,
                 self._child_watcher_callback,
                 transport,
             )
+
+            if stdin_pipe is not None:
+                _, pipe = await self.connect_write_pipe(
+                    lambda transport=transport: _rsloop.WriteSubprocessPipeProto(transport, 0),
+                    stdin_pipe,
+                )
+                transport._set_pipe_proto(0, pipe)
+
+            if stdout_pipe is not None:
+                _, pipe = await self.connect_read_pipe(
+                    lambda transport=transport: _rsloop.ReadSubprocessPipeProto(transport, 1),
+                    stdout_pipe,
+                )
+                transport._set_pipe_proto(1, pipe)
+
+            if stderr_pipe is not None:
+                _, pipe = await self.connect_read_pipe(
+                    lambda transport=transport: _rsloop.ReadSubprocessPipeProto(transport, 2),
+                    stderr_pipe,
+                )
+                transport._set_pipe_proto(2, pipe)
+
+            self.call_soon(protocol.connection_made, transport)
+            transport._connection_made()
+            self.call_soon(_futures._set_result_unless_cancelled, waiter, None)
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as exc:
+            if transport is not None:
+                transport.close()
+            else:
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                for pipe in (stdin_pipe, stdout_pipe, stderr_pipe):
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except Exception:
+                            pass
+            if not waiter.cancelled():
+                waiter.set_exception(exc)
+
         try:
             await waiter
         except (SystemExit, KeyboardInterrupt):
             raise
         except BaseException:
-            transport.close()
-            await transport._wait()
+            if transport is not None:
+                transport.close()
+                await transport._wait()
             raise
+        assert transport is not None
         return transport
 
     def _child_watcher_callback(self, pid: int, returncode: int, transp: Any) -> None:
         if self._thread_id is not None and threading.get_ident() == self._thread_id:
             transp._process_exited(returncode)
             return
+        # Invariant: watcher worker threads never update subprocess transport
+        # state directly; they notify the owning loop thread first.
         self.call_soon_threadsafe(transp._process_exited, returncode)
 
     def _make_ssl_transport(

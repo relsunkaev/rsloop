@@ -1635,3 +1635,37 @@ hop or a repeated protocol lookup. The remaining credible directions are:
   - [`benchmarks/out/ab_vectorcall_tcp_echo_1b.json`](out/ab_vectorcall_tcp_echo_1b.json)
   - [`benchmarks/out/ab_vectorcall_tcp_echo_parallel.json`](out/ab_vectorcall_tcp_echo_parallel.json)
   - [`benchmarks/out/ab_vectorcall_tcp_rpc.json`](out/ab_vectorcall_tcp_rpc.json)
+
+### 60. Native subprocess spawn boundary via `posix_spawn`
+
+- Area:
+  - [`python/rsloop/loop.py`](../python/rsloop/loop.py)
+  - [`src/native_subprocess.rs`](../src/native_subprocess.rs)
+  - [`src/lib.rs`](../src/lib.rs)
+  - [`tests/test_loop.py`](../tests/test_loop.py)
+- Change:
+  - add `_rsloop.spawn_subprocess(...)` backed by native `posix_spawnp`
+  - create subprocess stdio pipes natively and hand the parent ends back as
+    lightweight endpoint objects that only expose `fileno()` and `close()`
+  - keep the existing rsloop subprocess transport, watcher delivery, and pipe
+    transport callback ordering intact on the loop thread
+  - use the native path only for the common benchmark-shaped surface; fall back
+    to Python `subprocess.Popen(...)` for unsupported kwargs
+- Rationale:
+  - runtime profiles and the no-pipe spawn probe showed the remaining
+    `subprocess_exec` gap was already present before pipe traffic mattered, so
+    the spawn boundary itself was the next real subsystem cut
+- Functional result:
+  - `./.venv/bin/maturin develop --release` passed
+  - `./.venv/bin/python -m unittest tests.test_loop.RsloopLoopTests.test_native_subprocess_pipes tests.test_loop.RsloopLoopTests.test_native_subprocess_protocol_ordering tests.test_loop.RsloopLoopTests.test_native_subprocess_callbacks_run_on_loop_thread tests.test_loop.RsloopLoopTests.test_native_subprocess_fallback_kwargs` passed
+- Benchmark rerun (5 repeats, 1 warmup, baseline `uvloop`):
+  - `subprocess_exec`: `1.122x -> 1.001x`, paired `1.121x -> 1.002x`, wins `0/5 -> 1/5`
+  - `subprocess_shell`: `1.099x -> 0.992x`, paired `1.078x -> 0.983x`, wins `0/5 -> 4/5`
+- Conclusion:
+  - this is the first subprocess change that materially closes the gap
+  - the spawn boundary, not pipe callback cleanup, was the dominant remaining
+    cost
+- Decision: kept
+- Artifacts:
+  - [`benchmarks/out/subprocess_exec-native-spawn-rerun.json`](out/subprocess_exec-native-spawn-rerun.json)
+  - [`benchmarks/out/subprocess_shell-native-spawn-rerun.json`](out/subprocess_shell-native-spawn-rerun.json)
